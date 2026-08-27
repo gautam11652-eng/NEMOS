@@ -1,0 +1,72 @@
+from __future__ import annotations
+import os
+from dataclasses import dataclass
+from math import isfinite
+from pathlib import Path
+
+def _int(name: str, default: int, lo: int, hi: int) -> int:
+    try: value = int(os.getenv(name, default))
+    except (TypeError, ValueError): value = default
+    return max(lo, min(hi, value))
+
+def _bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    return default if v is None else v.lower() in {"1", "true", "yes", "on"}
+
+def _float(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(hi, value)) if isfinite(value) else default
+
+@dataclass(frozen=True)
+class Settings:
+    host: str
+    port: int
+    interface: str | None
+    db_path: Path
+    api_token: str | None
+    capture_enabled: bool
+    max_traffic: int
+    max_alerts: int
+    batch_size: int
+    flush_seconds: float
+    dashboard_limit: int
+    log_level: str
+    trusted_hosts: tuple[str, ...] = ()
+    @property
+    def remote(self): return self.host not in {"127.0.0.1","localhost","::1"}
+
+def load_settings(base: Path | None = None) -> Settings:
+    base = (base or Path.cwd()).resolve()
+    data = base / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    try:
+        data.chmod(0o700)
+    except OSError:
+        # Some filesystems/platforms do not support POSIX mode changes.
+        pass
+    host = os.getenv("NEMOS_HOST","127.0.0.1").strip()
+    token = os.getenv("NEMOS_API_TOKEN") or None
+    trusted_raw = os.getenv("NEMOS_TRUSTED_HOSTS", "")
+    trusted_hosts = tuple(sorted({h.strip() for h in trusted_raw.split(",") if h.strip()}))
+    s = Settings(
+        host, _int("NEMOS_PORT",5000,1,65535),
+        os.getenv("NEMOS_INTERFACE") or None,
+        Path(os.getenv("NEMOS_DB",str(data/"nemos.db"))).expanduser(),
+        token, _bool("NEMOS_CAPTURE",True),
+        _int("NEMOS_MAX_TRAFFIC",100_000,1000,2_000_000),
+        _int("NEMOS_MAX_ALERTS",10_000,100,500_000),
+        _int("NEMOS_DB_BATCH",250,1,5000),
+        _float("NEMOS_DB_FLUSH_SECONDS", 0.5, 0.01, 60.0),
+        _int("NEMOS_DASHBOARD_LIMIT",100,10,500),
+        os.getenv("NEMOS_LOG_LEVEL","INFO").upper(),
+        trusted_hosts,
+    )
+    if s.remote and not s.api_token:
+        raise ValueError("Remote bind requires NEMOS_API_TOKEN; keep host=127.0.0.1 for local use.")
+    if s.remote and s.host in {"0.0.0.0", "::", "*"} and not s.trusted_hosts:
+        raise ValueError("Wildcard remote bind requires NEMOS_TRUSTED_HOSTS")
+    if s.flush_seconds <= 0: raise ValueError("NEMOS_DB_FLUSH_SECONDS must be > 0")
+    return s

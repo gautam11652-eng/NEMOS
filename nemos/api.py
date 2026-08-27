@@ -1,0 +1,627 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import threading
+import ipaddress
+import json
+import time
+from typing import Any
+from urllib.parse import urlsplit
+
+from flask import Flask, jsonify, render_template, request
+
+from .config import Settings
+from .database import connect
+from .models import TrafficEvent
+from .intelligence import summarize_incident
+from .attack import catalog as attack_catalog, enrich_alert, technique_metadata
+
+from .version import VERSION
+_ALLOWED_PROTOCOLS = {"TCP", "UDP", "DNS", "ICMP", "ARP", "IP", "OTHER"}
+
+
+def _bounded_limit(value: Any, default: int, minimum: int = 1, maximum: int = 500) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, minimum), maximum)
+
+
+def _port(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("port must be an integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = int(value.strip(), 10)
+        except ValueError as exc:
+            raise ValueError("port must be an integer") from exc
+    else:
+        raise ValueError("port must be an integer")
+    if not 0 < parsed <= 65535:
+        raise ValueError("port out of range")
+    return parsed
+
+
+def _packet_size(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("packet size must be an integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = int(value.strip(), 10)
+        except ValueError as exc:
+            raise ValueError("packet size must be an integer") from exc
+    else:
+        raise ValueError("packet size must be an integer")
+    if not 0 <= parsed <= 65535:
+        raise ValueError("packet size out of range")
+    return parsed
+
+
+def _valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _host(value: str) -> bool:
+    return isinstance(value, str) and len(value) <= 64 and _valid_ip(value)
+
+
+def _dashboard_etag(c, limit: int, capture_state: dict[str, Any] | None = None) -> str:
+    """Build a stable change token for both telemetry and sensor state.
+
+    Database writes advance ``revision``. Capture state is included as well so
+    a sensor failure/recovery (or a dropped-packet counter change) is visible
+    to a dashboard even when SQLite telemetry has not changed.
+    """
+    row = c.execute("SELECT revision FROM telemetry_stats WHERE id=1").fetchone()
+    revision = int(row[0] or 0) if row else 0
+    state = {
+        "revision": revision,
+        "limit": limit,
+        "capture": {
+            "state": (capture_state or {}).get("state"),
+            "running": bool((capture_state or {}).get("running")),
+            "packets_seen": int((capture_state or {}).get("packets_seen") or 0),
+            "error": (capture_state or {}).get("error"),
+        },
+    }
+    digest = hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f'"{digest}"'
+
+
+def _read_stats(c) -> dict[str, int]:
+    """Read cached telemetry counters with a safe zero-state fallback."""
+    row = c.execute(
+        "SELECT packets,tcp,udp,icmp,dns,threats,critical FROM telemetry_stats WHERE id=1"
+    ).fetchone()
+    if row is None:
+        return {
+            "packets": 0, "tcp": 0, "udp": 0, "icmp": 0,
+            "dns": 0, "threats": 0, "critical": 0,
+        }
+    return {key: int(row[key] or 0) for key in row.keys()}
+
+
+def _enrich_alert_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [enrich_alert(row) for row in rows]
+
+
+def create_app(settings: Settings, writer, capture=None) -> Flask:
+    app = Flask(__name__, template_folder="templates", static_folder="static")
+    app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
+    # Flask 3.x trusted-host protection. Keep local aliases usable for the
+    # default loopback deployment while rejecting arbitrary Host headers.
+    trusted = set(settings.trusted_hosts)
+    if not settings.remote:
+        trusted.update({"127.0.0.1", "localhost", "[::1]", "::1"})
+    elif not trusted and settings.host not in {"0.0.0.0", "::", "*"}:
+        trusted.add(settings.host)
+    if trusted:
+        app.config["TRUSTED_HOSTS"] = sorted(trusted)
+    token = settings.api_token
+
+    # Small in-process cache for the assembled dashboard snapshot. The
+    # telemetry revision is the authoritative invalidation signal; the cache
+    # therefore removes repeated SQLite reads when multiple browser clients
+    # request the same unchanged dashboard state. Keep it tiny because the
+    # payload contains recent telemetry and can be moderately large.
+    dashboard_cache: dict[tuple[str, int], dict[str, Any]] = {}
+    dashboard_cache_lock = threading.Lock()
+    dashboard_cache_limit = 4
+
+    def auth() -> bool:
+        if not token:
+            return True
+        supplied = request.headers.get("X-NEMOS-Token", "")
+        return hmac.compare_digest(supplied, token)
+
+    def same_origin_state_change() -> bool:
+        """Reject browser cross-site writes when no API token is configured.
+
+        Local mode intentionally has no credential prompt, but mutating localhost
+        endpoints should not be writable by an unrelated web page. Non-browser
+        clients generally omit these headers and remain compatible.
+        """
+        if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            return True
+        if token:
+            return True
+        fetch_site = request.headers.get("Sec-Fetch-Site", "").lower()
+        if fetch_site == "cross-site":
+            return False
+        origin = request.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            parsed = urlsplit(origin)
+            request_origin = urlsplit(request.host_url)
+            return (parsed.scheme, parsed.netloc) == (request_origin.scheme, request_origin.netloc)
+        except ValueError:
+            return False
+
+    @app.before_request
+    def guard():
+        # Health is intentionally public so service monitors can check liveness.
+        if request.path.startswith("/api/") and request.path != "/api/health" and not auth():
+            return jsonify(ok=False, error="authentication required"), 401
+        if request.path.startswith("/api/") and not same_origin_state_change():
+            return jsonify(ok=False, error="cross-site request blocked"), 403
+
+    @app.after_request
+    def headers(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(),microphone=(),geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'self'; object-src 'none'; "
+            "frame-ancestors 'self'; form-action 'self'; style-src 'self'; "
+            "script-src 'self'; connect-src 'self'"
+        )
+        # API responses must not be cached because they can contain live
+        # telemetry or authenticated data. Static dashboard assets are safe to
+        # cache briefly and are intentionally kept separate from API caching.
+        if request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "public, max-age=300"
+        else:
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/")
+    def index():
+        return render_template("index.html", version=VERSION, token_configured=bool(token))
+
+    @app.get("/api/health")
+    def health():
+        response = jsonify(status="online", service="NEMOS", version=VERSION, timestamp=time.time())
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/api/dashboard")
+    def dashboard():
+        limit = _bounded_limit(request.args.get("limit"), settings.dashboard_limit, 10, 500)
+        c = connect(settings.db_path)
+        try:
+            capture_state = capture.status() if capture is not None else {
+                "state": "not_configured",
+                "running": False,
+                "interface": settings.interface or "default",
+                "packets_seen": 0,
+                "last_packet": None,
+                "error": None,
+            }
+            etag = _dashboard_etag(c, limit, capture_state)
+            if request.headers.get("If-None-Match") == etag:
+                return ("", 304, {"ETag": etag, "Cache-Control": "no-store"})
+
+            cache_key = (etag, limit)
+            with dashboard_cache_lock:
+                cached = dashboard_cache.get(cache_key)
+            if cached is not None:
+                response = jsonify(**cached)
+                response.set_etag(etag.strip('"'))
+                return response
+
+            stats = _read_stats(c)
+            alerts = _enrich_alert_rows([
+                dict(row)
+                for row in c.execute(
+                    """SELECT id,timestamp,threat,category,source,severity,risk_score,
+                              confidence,reason,technique,incident_id,acknowledged
+                       FROM alerts ORDER BY id DESC LIMIT ?""",
+                    (limit,),
+                )
+            ])
+            traffic = [
+                dict(row)
+                for row in c.execute(
+                    """SELECT id,timestamp,source,destination,source_port,destination_port,
+                              protocol,packet_size,flags
+                       FROM traffic ORDER BY id DESC LIMIT ?""",
+                    (limit,),
+                )
+            ]
+            incidents = [
+                dict(row)
+                for row in c.execute(
+                    """SELECT incident_id, MAX(id) last_id, MIN(timestamp) first_seen,
+                              MAX(timestamp) last_seen, COUNT(*) alert_count,
+                              MAX(risk_score) max_risk,
+                          CASE
+                              WHEN SUM(CASE WHEN severity='CRITICAL' THEN 1 ELSE 0 END) > 0 THEN 'CRITICAL'
+                              WHEN SUM(CASE WHEN severity='HIGH' THEN 1 ELSE 0 END) > 0 THEN 'HIGH'
+                              WHEN SUM(CASE WHEN severity='MEDIUM' THEN 1 ELSE 0 END) > 0 THEN 'MEDIUM'
+                              ELSE 'LOW'
+                          END severity,
+                              GROUP_CONCAT(DISTINCT threat) threats,
+                              GROUP_CONCAT(DISTINCT source) sources
+                       FROM alerts WHERE incident_id <> ''
+                       GROUP BY incident_id ORDER BY last_id DESC LIMIT ?""",
+                    (min(limit, 50),),
+                )
+            ]
+            # Host summaries are maintained incrementally by the writer, avoiding
+            # full-table GROUP BY scans on every dashboard poll.
+            host_rows = c.execute(
+                "SELECT host,packets,alert_count,critical_count,max_risk,last_alert FROM host_stats ORDER BY max_risk DESC, critical_count DESC, packets DESC, host ASC LIMIT ?",
+                (min(limit, 50),),
+            ).fetchall()
+            hosts = []
+            for row in host_rows:
+                ac = int(row["alert_count"] or 0)
+                mr = int(row["max_risk"] or 0)
+                cc = int(row["critical_count"] or 0)
+                hosts.append({"host": row["host"], "packets": int(row["packets"] or 0), "alert_count": ac,
+                              "critical_count": cc, "max_risk": mr,
+                              "risk_score": min(100, mr + min(20, ac * 4) + min(10, cc * 5)),
+                              "last_alert": row["last_alert"]})
+            payload = {
+                "stats": stats,
+                "alerts": alerts,
+                "traffic": traffic,
+                "incidents": incidents,
+                "hosts": hosts[:min(limit, 50)],
+                "capture": capture_state,
+            }
+            with dashboard_cache_lock:
+                dashboard_cache[cache_key] = payload
+                while len(dashboard_cache) > dashboard_cache_limit:
+                    dashboard_cache.pop(next(iter(dashboard_cache)))
+            response = jsonify(**payload)
+            response.set_etag(etag.strip('"'))
+            return response
+        finally:
+            c.close()
+
+    @app.get("/api/status")
+    def status():
+        capture_state = capture.status() if capture is not None else {"state": "not_configured", "running": False, "interface": settings.interface or "default", "packets_seen": 0, "last_packet": None, "error": None}
+        return jsonify(ok=True, version=VERSION, capture=capture_state, writer=writer.metrics())
+
+    @app.get("/api/metrics")
+    def metrics():
+        """Return writer health/backpressure metrics; protected by API auth."""
+        return jsonify(writer=writer.metrics())
+
+    @app.get("/api/stats")
+    def stats():
+        c = connect(settings.db_path)
+        try:
+            return jsonify(_read_stats(c))
+        finally:
+            c.close()
+
+    @app.get("/api/alerts")
+    def alerts():
+        limit = _bounded_limit(request.args.get("limit"), 100)
+        c = connect(settings.db_path)
+        try:
+            return jsonify(_enrich_alert_rows([
+                dict(x) for x in c.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,))
+            ]))
+        finally:
+            c.close()
+
+    @app.get("/api/incidents")
+    def incidents():
+        limit = _bounded_limit(request.args.get("limit"), 50, 1, 200)
+        c = connect(settings.db_path)
+        try:
+            rows = c.execute(
+                """SELECT incident_id, MAX(id) last_id, MIN(timestamp) first_seen,
+                          MAX(timestamp) last_seen, COUNT(*) alert_count,
+                          MAX(risk_score) max_risk,
+                          GROUP_CONCAT(DISTINCT threat) threats,
+                          GROUP_CONCAT(DISTINCT source) sources
+                   FROM alerts WHERE incident_id <> ''
+                   GROUP BY incident_id ORDER BY last_id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            if not rows:
+                return jsonify([])
+
+            # Fetch the selected incident evidence in one bounded query instead
+            # of issuing one SQL query per incident (N+1 query pattern).
+            incident_ids = [row["incident_id"] for row in rows]
+            placeholders = ",".join("?" for _ in incident_ids)
+            evidence_rows = c.execute(
+                f"""WITH ranked AS (
+                       SELECT id,incident_id,threat,source,severity,risk_score,confidence,
+                              technique,evidence,
+                              ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY id ASC) AS rn
+                       FROM alerts
+                       WHERE incident_id IN ({placeholders})
+                   )
+                   SELECT id,incident_id,threat,source,severity,risk_score,confidence,technique,evidence
+                   FROM ranked
+                   WHERE rn <= 200
+                   ORDER BY id ASC""",
+                incident_ids,
+            ).fetchall()
+            grouped: dict[str, list[dict[str, Any]]] = {incident_id: [] for incident_id in incident_ids}
+            for evidence in evidence_rows:
+                bucket = grouped.get(evidence["incident_id"])
+                if bucket is not None and len(bucket) < 200:
+                    bucket.append(enrich_alert(dict(evidence)))
+
+            result = []
+            for row in rows:
+                incident_id = row["incident_id"]
+                detail_rows = grouped.get(incident_id, [])
+                if not detail_rows:
+                    continue
+                summary = summarize_incident(incident_id, detail_rows)
+                item = dict(row)
+                item.update(summary.as_dict())
+                item.pop("incident_id", None)
+                item["incident_id"] = summary.incident_id
+                result.append(item)
+            return jsonify(result)
+        finally:
+            c.close()
+
+    @app.get("/api/hosts")
+    def hosts():
+        """Return bounded host risk summaries from the maintained host index."""
+        limit = _bounded_limit(request.args.get("limit"), 25, 1, 100)
+        c = connect(settings.db_path)
+        try:
+            rows = c.execute(
+                """SELECT host,packets,alert_count,critical_count,max_risk,last_alert
+                   FROM host_stats
+                   ORDER BY max_risk DESC, critical_count DESC, packets DESC, host ASC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            result = []
+            for row in rows:
+                alert_count = int(row["alert_count"] or 0)
+                max_risk = int(row["max_risk"] or 0)
+                critical = int(row["critical_count"] or 0)
+                # Explainable bounded host risk; this is triage priority, not a verdict.
+                risk = min(100, max_risk + min(20, alert_count * 4) + min(10, critical * 5))
+                result.append({
+                    "host": row["host"],
+                    "packets": int(row["packets"] or 0),
+                    "alert_count": alert_count,
+                    "critical_count": critical,
+                    "max_risk": max_risk,
+                    "risk_score": risk,
+                    "last_alert": row["last_alert"],
+                })
+            return jsonify(result)
+        finally:
+            c.close()
+
+    @app.get("/api/incidents/<incident_id>")
+    def incident_detail(incident_id: str):
+        if not incident_id or len(incident_id) > 64 or any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for ch in incident_id):
+            return jsonify(ok=False, error="invalid incident id"), 400
+        c = connect(settings.db_path)
+        try:
+            rows = _enrich_alert_rows([dict(row) for row in c.execute(
+                """SELECT id,timestamp,threat,category,source,severity,risk_score,confidence,
+                          reason,technique,incident_id,acknowledged,evidence
+                   FROM alerts WHERE incident_id=? ORDER BY id ASC LIMIT 200""",
+                (incident_id,),
+            )])
+            if not rows:
+                return jsonify(ok=False, error="incident not found"), 404
+            summary = summarize_incident(incident_id, rows)
+            # Keep the enriched object used by the dashboard while also exposing
+            # the summary fields at the top level for API clients that consumed
+            # the original incident-detail response shape.
+            summary_data = summary.as_dict()
+            return jsonify(**summary_data, incident=summary_data, alerts=rows)
+        finally:
+            c.close()
+
+    @app.get("/api/hosts/<host>")
+    def host_detail(host: str):
+        """Return a bounded investigation view for one validated IP host."""
+        if not _host(host):
+            return jsonify(ok=False, error="invalid host"), 400
+        c = connect(settings.db_path)
+        try:
+            alerts_rows = _enrich_alert_rows([dict(row) for row in c.execute(
+                """SELECT id,timestamp,threat,category,source,severity,risk_score,confidence,
+                          reason,technique,incident_id,acknowledged,evidence
+                   FROM alerts WHERE source=? ORDER BY id DESC LIMIT 100""", (host,)
+            )])
+            traffic_rows = [dict(row) for row in c.execute(
+                """SELECT id,timestamp,source,destination,source_port,destination_port,
+                          protocol,packet_size,flags FROM traffic
+                   WHERE source=? OR destination=? ORDER BY id DESC LIMIT 100""", (host, host)
+            )]
+            if not alerts_rows and not traffic_rows:
+                return jsonify(ok=False, error="host not found"), 404
+            summary = summarize_incident(
+                f"HOST-{host}", alerts_rows
+            ) if alerts_rows else None
+            incidents = sorted({r["incident_id"] for r in alerts_rows if r.get("incident_id")})
+            protocol_counts: dict[str, int] = {}
+            for event in traffic_rows:
+                protocol = str(event.get("protocol") or "OTHER")
+                protocol_counts[protocol] = protocol_counts.get(protocol, 0) + 1
+            top_protocol = max(protocol_counts, key=protocol_counts.get) if protocol_counts else None
+            return jsonify(
+                host=host,
+                triage=(summary.as_dict() if summary else {"risk_score": 0, "severity": "LOW", "confidence": 0, "recommendations": []}),
+                incidents=incidents[:50],
+                alerts=alerts_rows,
+                traffic=traffic_rows,
+                top_protocol=top_protocol,
+            )
+        finally:
+            c.close()
+
+
+    @app.get("/api/alerts/<int:alert_id>")
+    def alert_detail(alert_id: int):
+        c = connect(settings.db_path)
+        try:
+            row = c.execute(
+                """SELECT id,timestamp,threat,category,source,severity,risk_score,confidence,
+                          reason,technique,incident_id,acknowledged,evidence
+                   FROM alerts WHERE id=?""", (alert_id,)
+            ).fetchone()
+            if not row:
+                return jsonify(ok=False, error="alert not found"), 404
+            return jsonify(alert=enrich_alert(dict(row)))
+        finally:
+            c.close()
+
+
+    @app.get("/api/techniques")
+    def techniques():
+        """Return the detector's conservative ATT&CK catalog plus observed counts."""
+        c = connect(settings.db_path)
+        try:
+            rows = c.execute(
+                "SELECT technique, COUNT(*) AS count FROM alerts WHERE technique <> '' GROUP BY technique"
+            ).fetchall()
+            counts = {str(row["technique"]): int(row["count"] or 0) for row in rows}
+            observed = []
+            for item in attack_catalog():
+                item = dict(item)
+                item["count"] = counts.get(item["technique_id"], 0)
+                observed.append(item)
+
+            unmapped_rows = c.execute(
+                "SELECT threat, COUNT(*) AS count FROM alerts WHERE technique = '' GROUP BY threat ORDER BY count DESC, threat ASC"
+            ).fetchall()
+            unmapped = [
+                {
+                    "threat": row["threat"],
+                    "count": int(row["count"] or 0),
+                    "signal": enrich_alert({"threat": row["threat"], "technique": ""})["signal"],
+                }
+                for row in unmapped_rows
+            ]
+            return jsonify(techniques=observed, unmapped=unmapped)
+        finally:
+            c.close()
+
+    @app.get("/api/traffic")
+    def traffic():
+        limit = _bounded_limit(request.args.get("limit"), 100)
+        c = connect(settings.db_path)
+        try:
+            return jsonify([dict(x) for x in c.execute("SELECT * FROM traffic ORDER BY id DESC LIMIT ?", (limit,))])
+        finally:
+            c.close()
+
+    @app.post("/api/packet")
+    def packet():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify(ok=False, error="JSON object required"), 400
+
+        try:
+            source = str(data.get("source") or data.get("src_ip") or "").strip()
+            destination = str(data.get("destination") or data.get("dst_ip") or "").strip()
+            protocol = str(data.get("protocol") or "OTHER").upper().strip()
+            if not source or not destination:
+                return jsonify(ok=False, error="source and destination required"), 400
+            if not _valid_ip(source) or not _valid_ip(destination):
+                return jsonify(ok=False, error="source and destination must be valid IP addresses"), 400
+            if protocol not in _ALLOWED_PROTOCOLS:
+                return jsonify(ok=False, error="unsupported protocol"), 400
+
+            timestamp = str(data.get("timestamp") or data.get("time") or "").strip()
+            if not timestamp:
+                from .models import utc_now
+                timestamp = utc_now()
+            if len(timestamp) > 64:
+                return jsonify(ok=False, error="timestamp too long"), 400
+            flags = str(data.get("flags", ""))[:32]
+            event = TrafficEvent(
+                timestamp, source, destination, protocol,
+                _port(data.get("source_port")),
+                _port(data.get("destination_port")),
+                _packet_size(data.get("packet_size", 0)), flags,
+            )
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="invalid packet fields"), 400
+
+        return (jsonify(ok=True), 202) if writer.submit_traffic(event) else (
+            jsonify(ok=False, error="write queue full"),
+            503,
+        )
+
+    @app.post("/api/alerts/<int:alert_id>/ack")
+    def ack(alert_id: int):
+        c = connect(settings.db_path)
+        try:
+            with c:
+                if c.execute("UPDATE alerts SET acknowledged=1 WHERE id=?", (alert_id,)).rowcount == 0:
+                    return jsonify(ok=False, error="not found"), 404
+                c.execute("UPDATE telemetry_stats SET revision=revision+1 WHERE id=1")
+            return jsonify(ok=True)
+        finally:
+            c.close()
+
+    @app.post("/api/alerts/clear")
+    def clear():
+        c = connect(settings.db_path)
+        try:
+            with c:
+                c.execute("DELETE FROM alerts")
+                c.execute("UPDATE telemetry_stats SET threats=0, critical=0, revision=revision+1 WHERE id=1")
+                c.execute("UPDATE host_stats SET alert_count=0, critical_count=0, max_risk=0, last_alert=NULL")
+            return jsonify(ok=True)
+        finally:
+            c.close()
+
+    @app.errorhandler(413)
+    def too_large(_):
+        return jsonify(ok=False, error="request too large"), 413
+
+    @app.errorhandler(404)
+    def not_found(_):
+        if request.path.startswith("/api/"):
+            return jsonify(ok=False, error="not found"), 404
+        return "Not found", 404
+
+    @app.errorhandler(405)
+    def method_not_allowed(_):
+        return jsonify(ok=False, error="method not allowed"), 405
+
+    @app.errorhandler(500)
+    def internal_error(_):
+        return jsonify(ok=False, error="internal server error"), 500
+
+    return app

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nemos"
+version = "3.2.8"
+description = "Defensive network monitoring and intrusion detection platform"
+requires-python = ">=3.10"
+license = {text = "GPL-2.0-only"}
+dependencies = [
+  "Flask==3.1.3",
+  "Scapy==2.7.0",
+  "waitress==3.0.2",
+]
+
+[project.scripts]
+nemos = "main:main"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["nemos*"]
+
+[tool.setuptools.package-data]
+nemos = ["templates/*.html", "static/*.css", "static/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

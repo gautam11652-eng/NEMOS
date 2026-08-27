@@ -1,0 +1,10 @@
+GNU GENERAL PUBLIC LICENSE
+Version 2, June 1991
+
+NEMOS is distributed under the GNU General Public License, version 2.
+See https://www.gnu.org/licenses/old-licenses/gpl-2.0.html for the full license text.
+
+Copyright (c) 2026 NEMOS contributors.
+
+This project depends on Scapy, which is licensed under GPL-2.0-only.
+The full Scapy license is available from the Scapy project distribution.
