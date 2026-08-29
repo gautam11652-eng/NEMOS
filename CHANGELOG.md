@@ -1,12 +1,5 @@
 # Changelog
 
-## 3.2.8
-
-- Added a small in-process dashboard snapshot cache keyed by the telemetry revision/ETag, avoiding repeated SQLite reads for unchanged dashboard state.
-- Added composite alert indexes for incident-oriented dashboard/API queries.
-- Fixed legacy-database migration ordering so indexes referencing additive alert columns are created only after those columns exist.
-- Preserved bounded dashboard caching and ETag semantics; no live API data is persisted in the cache beyond the current process.
-
 ## 3.2.7
 
 - Optimized SQLite retention maintenance to avoid full-table telemetry and host-stat recounts after every prune.
@@ -193,3 +186,13 @@
 - Added cadence-limited baseline sampling to reduce baseline drift during bursts.
 - Added explainable sigma-deviation evidence to behavioural alerts.
 - Added bounded profile storage and configurable behavioural settings.
+
+## Dashboard polish — 2026-08-30
+
+- Replaced the broken Risk Distribution board with a deterministic Security Posture panel.
+- Reworked the dashboard into a restrained dark SOC interface with clearer hierarchy and denser operational information.
+- Expanded the MITRE ATT&CK section to show the complete conservative NEMOS catalog, observed counts, tactics, descriptions, and unmapped behavioral signals.
+- Added Telegram configuration/status visibility without exposing the bot token.
+- Added a compact creator panel for Gautam with the NEMOS GitHub repository and contact email.
+- Corrected NEMOS branding to `Network Exposure Monitoring & Operations System` throughout the dashboard.
+- Preserved existing incident, host, network, acknowledgement, evidence-export, and polling workflows.

@@ -505,15 +505,6 @@ def create_app(settings: Settings, writer, capture=None) -> Flask:
             c.close()
 
 
-    @app.get("/api/telegram")
-    def telegram_status():
-        """Expose safe Telegram configuration status without revealing secrets."""
-        import os
-        token_value = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        masked = ("••••" + chat_id[-4:]) if len(chat_id) > 4 else (chat_id or "")
-        return jsonify(configured=bool(token_value and chat_id), chat_id=masked)
-
     @app.get("/api/techniques")
     def techniques():
         """Return the detector's conservative ATT&CK catalog plus observed counts."""

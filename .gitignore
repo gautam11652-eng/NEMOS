@@ -16,3 +16,10 @@ build/
 htmlcov/
 coverage.xml
 reports/
+.env
+.venv/
+__pycache__/
+*.pyc
+data/*.db
+data/*.sqlite*
+.pytest_cache/

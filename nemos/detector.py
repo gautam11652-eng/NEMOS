@@ -34,6 +34,7 @@ class DetectionConfig:
     baseline_min_events: int = 20
     baseline_sigma_threshold: float = 3.0
     baseline_sample_interval: float = 5.0
+    baseline_extreme_sigma: float = 6.0
     min_confidence: int = 55
 
     @classmethod
@@ -59,6 +60,7 @@ class DetectionConfig:
             baseline_min_samples=integer("NEMOS_BEHAVIOR_MIN_SAMPLES", defaults.baseline_min_samples, 2, 1000),
             baseline_sigma_threshold=real("NEMOS_BEHAVIOR_SIGMA", defaults.baseline_sigma_threshold, 1.0, 10.0),
             baseline_sample_interval=real("NEMOS_BEHAVIOR_SAMPLE_SECONDS", defaults.baseline_sample_interval, 0.0, 300.0),
+            baseline_extreme_sigma=real("NEMOS_BEHAVIOR_EXTREME_SIGMA", defaults.baseline_extreme_sigma, 3.0, 15.0),
         )
 
 
@@ -261,6 +263,9 @@ class ThreatDetector:
             and behavior.ready
             and len(bucket) >= self.cfg.baseline_min_events
             and behavior.anomaly_score >= 55
+            and (
+                max(behavior.deviations.values(), default=0.0) >= self.cfg.baseline_sigma_threshold
+            )
         ):
             strongest = max(behavior.deviations.values(), default=0.0)
             add(

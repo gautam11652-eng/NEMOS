@@ -91,18 +91,54 @@ class AdaptiveBehaviorProfiler:
         deviations = {}
         weighted = []
         names = ("rate", "bytes_rate", "unique_destinations", "unique_ports")
+        # An EW variance can legitimately be zero during a stable warm-up
+        # (for example, a host sending the same HTTPS packet pattern). A
+        # zero variance must NOT turn a harmless one-unit change into an
+        # effectively infinite z-score. Use a feature-specific noise floor
+        # derived from the baseline magnitude. This keeps the model
+        # deterministic while making it tolerant of normal jitter.
+        floors = {
+            "rate": max(0.50, abs(means[0]) * 0.20),
+            "bytes_rate": max(256.0, abs(means[1]) * 0.20),
+            "unique_destinations": max(1.0, abs(means[2]) * 0.25),
+            "unique_ports": max(1.0, abs(means[3]) * 0.25),
+        }
         for name, value, mean, var in zip(names, values, means, vars_):
-            sd = sqrt(max(var, 1e-6))
-            z = abs(value - mean) / sd if sd > 0 else 0.0
+            sd = max(sqrt(max(var, 0.0)), floors[name])
+            z = abs(value - mean) / sd
             deviations[name] = round(z, 3)
             weighted.append(min(6.0, z))
 
         self._seed_or_update(p, values)
         p.samples += 1
         strongest = max(weighted) if weighted else 0.0
-        anomaly_score = min(100, int(45 + strongest * 10))
-        confidence = min(98, int(50 + strongest * 8 + min(20, p.samples)))
-        ready = strongest >= self.sigma_threshold
+
+        # Do not treat a single noisy feature as hostile behaviour. Rate and
+        # byte-rate are related, so the strongest signal must be supported by
+        # another independent dimension (destination or port diversity),
+        # unless the deviation is extreme.
+        independent = [
+            deviations.get("rate", 0.0),
+            deviations.get("unique_destinations", 0.0),
+            deviations.get("unique_ports", 0.0),
+        ]
+        independent.sort(reverse=True)
+        support = independent[1] if len(independent) > 1 else 0.0
+        threshold = self.sigma_threshold
+        ready = (
+            strongest >= threshold
+            and (support >= threshold * 0.75 or strongest >= threshold + 2.0)
+        )
+
+        # Score is intentionally conservative: reaching CRITICAL requires a
+        # genuinely large deviation, not merely crossing the alert threshold.
+        score = 45 + strongest * 7
+        if support >= threshold:
+            score += 8
+        if strongest >= threshold + 2.0 and support >= threshold * 0.75:
+            score += 7
+        anomaly_score = min(100, int(score))
+        confidence = min(98, int(50 + strongest * 6 + support * 3 + min(20, p.samples)))
         return BehaviorResult(ready, anomaly_score, confidence, deviations, baseline_before)
 
     def _seed_or_update(self, p: _Profile, values: Iterable[float]) -> None:

@@ -37,6 +37,23 @@ class APITests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json["stats"]["packets"], 0)
 
+    def test_telegram_status_does_not_expose_token(self):
+        import os
+        old_token, old_chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+        try:
+            os.environ["TELEGRAM_BOT_TOKEN"] = "super-secret-token"
+            os.environ["TELEGRAM_CHAT_ID"] = "123456789"
+            r = self.client.get("/api/telegram")
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.json["configured"])
+            self.assertEqual(r.json["chat_id"], "••••6789")
+            self.assertNotIn("super-secret-token", r.get_data(as_text=True))
+        finally:
+            if old_token is None: os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            else: os.environ["TELEGRAM_BOT_TOKEN"] = old_token
+            if old_chat is None: os.environ.pop("TELEGRAM_CHAT_ID", None)
+            else: os.environ["TELEGRAM_CHAT_ID"] = old_chat
+
     def test_techniques_endpoint_exposes_conservative_attack_catalog(self):
         r = self.client.get("/api/techniques")
         self.assertEqual(r.status_code, 200)

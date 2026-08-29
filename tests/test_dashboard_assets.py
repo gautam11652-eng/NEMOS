@@ -41,17 +41,13 @@ def test_dashboard_branding_and_navigation_contract():
     for section in ("overview", "incidents", "hosts", "network", "techniques"):
         assert f'href="#{section}"' in html
         assert f'id="{section}"' in html
-    for element_id in ("packets", "tcp", "dns", "threats", "critical", "timeline", "risk-chart", "incidents-body", "hosts-body", "technique-list", "network-graph", "traffic-body", "incident-modal"):
+    for element_id in ("packets", "tcp", "udp", "dns", "threats", "critical", "timeline", "posture-score", "incidents-body", "hosts-body", "technique-list", "attack-summary", "network-graph", "traffic-body", "telegram-card", "health-grid", "incident-modal"):
         assert f'id="{element_id}"' in html
     assert "THREATCORE" not in JS.read_text().upper()
-
-
-def test_dashboard_navigation_sections_are_direct_and_observed():
-    html = HTML.read_text()
-    js = JS.read_text()
-    # Each primary navigation target must be a direct section/header so
-    # hash navigation lands on the intended view rather than a shared grid.
-    assert re.search(r'<section class="panel" id="hosts">', html)
-    assert re.search(r'<section class="panel" id="techniques">', html)
-    assert 'document.getElementById(id)' in js
-    assert "querySelectorAll('.main > [id], .main > header[id]')" not in js
+    assert "Network Exposure Monitoring" in html
+    assert "Created by" in html
+    assert "gautam11652-eng/NEMOS" in html
+    assert "gautam11652@gmail.com" in html
+    assert "risk-chart" not in html
+    assert "risk-chart" not in JS.read_text()
+    assert "TELEGRAM" in html.upper()

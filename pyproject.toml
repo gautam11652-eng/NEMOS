@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nemos"
-version = "3.2.8"
+version = "3.2.7"
 description = "Defensive network monitoring and intrusion detection platform"
 requires-python = ">=3.10"
 license = {text = "GPL-2.0-only"}
