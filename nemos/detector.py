@@ -92,11 +92,19 @@ class ThreatDetector:
         )
         self.incidents: OrderedDict[str, tuple[str, float]] = OrderedDict()
 
-    def process(self, e: TrafficEvent, ptype: str = "") -> list[Alert]:
+    def process(self, e: TrafficEvent, ptype: str = "", now: float | None = None) -> list[Alert]:
+        """Evaluate one event against the deterministic rules.
+
+        ``now`` overrides the monotonic clock. Live capture leaves it unset;
+        replay and tests pass the event's own timeline so a window means
+        simulated seconds rather than wall-clock ones. Without it, replaying an
+        hour of traffic in a second puts every event inside a single window and
+        manufactures findings.
+        """
         if not self._ip(e.source) or not self._ip(e.destination):
             return []
 
-        now = time.monotonic()
+        now = time.monotonic() if now is None else now
         bucket = self._bucket(e.source)
         bucket.append({
             "t": now,
@@ -136,7 +144,7 @@ class ThreatDetector:
                 technique: str = "", confidence: int | None = None, **kw: Any) -> None:
             alert = self._emit(
                 e.source, threat, category, score, reason, technique,
-                confidence=confidence, **kw,
+                confidence=confidence, now=now, **kw,
             )
             if alert:
                 out.append(alert)
@@ -290,7 +298,7 @@ class ThreatDetector:
 
         return out
 
-    def observe_arp(self, ip: str, mac: str) -> Alert | None:
+    def observe_arp(self, ip: str, mac: str, now: float | None = None) -> Alert | None:
         if not self._ip(ip) or not mac:
             return None
         mac = mac.lower().strip()
@@ -304,7 +312,7 @@ class ThreatDetector:
                 ip, "ARP_MAPPING_CHANGE", "NETWORK_MANIPULATION", 75,
                 f"ARP mapping changed {old} -> {mac}", "T1557.002",
                 evidence={"old_mac": old, "new_mac": mac},
-                confidence=88,
+                confidence=88, now=now,
             )
         return None
 
@@ -321,9 +329,9 @@ class ThreatDetector:
 
     def _emit(self, source: str, threat: str, category: str, score: int,
               reason: str, technique: str = "", confidence: int | None = None,
-              **kw: Any) -> Alert | None:
+              now: float | None = None, **kw: Any) -> Alert | None:
         key = (source, threat)
-        now = time.monotonic()
+        now = time.monotonic() if now is None else now
         previous = self.last.get(key)
         if previous is not None and now - previous < self.cfg.cooldown:
             self.last.move_to_end(key)

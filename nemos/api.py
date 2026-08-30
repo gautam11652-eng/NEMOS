@@ -122,7 +122,7 @@ def _enrich_alert_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [enrich_alert(row) for row in rows]
 
 
-def create_app(settings: Settings, writer, capture=None, notifier=None) -> Flask:
+def create_app(settings: Settings, writer, capture=None, notifier=None, analysis=None) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
     # Flask 3.x trusted-host protection. Keep local aliases usable for the
@@ -347,6 +347,10 @@ def create_app(settings: Settings, writer, capture=None, notifier=None) -> Flask
         return jsonify(
             ok=True, version=VERSION, capture=capture_state,
             writer=writer.metrics(), notifications=_notification_state(),
+            analysis=(analysis.status() if analysis is not None else {
+                "enabled": False,
+                "reason": "windowed flow analysis is disabled",
+            }),
         )
 
     @app.get("/api/metrics")
@@ -606,6 +610,102 @@ def create_app(settings: Settings, writer, capture=None, notifier=None) -> Flask
         finally:
             c.close()
 
+
+    def _analysis_unavailable():
+        return jsonify(
+            ok=False,
+            error="windowed flow analysis is not enabled",
+            hint="set NEMOS_ANALYSIS=true and restart",
+        ), 503
+
+    @app.get("/api/flows")
+    def flows():
+        """Recent unidirectional flows.
+
+        ``active=true`` returns the in-memory table (flows still open in the
+        current window); the default reads completed flows from storage.
+        Direction is preserved: a row is one direction of a conversation.
+        """
+        limit = _bounded_limit(request.args.get("limit"), 100, 1, 500)
+        if request.args.get("active", "").lower() in ("1", "true", "yes"):
+            if analysis is None:
+                return _analysis_unavailable()
+            return jsonify(analysis.active_flows(limit))
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        source = request.args.get("source", "").strip()
+        if source:
+            if not _host(source):
+                return jsonify(ok=False, error="source must be a valid IP address"), 400
+            clauses.append("source = ?")
+            params.append(source)
+        destination = request.args.get("destination", "").strip()
+        if destination:
+            if not _host(destination):
+                return jsonify(ok=False, error="destination must be a valid IP address"), 400
+            clauses.append("destination = ?")
+            params.append(destination)
+        protocol = request.args.get("protocol", "").strip().upper()
+        if protocol:
+            if protocol not in _ALLOWED_PROTOCOLS:
+                return jsonify(ok=False, error="unsupported protocol"), 400
+            clauses.append("protocol = ?")
+            params.append(protocol)
+
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        c = connect(settings.db_path)
+        try:
+            return jsonify([dict(row) for row in c.execute(
+                f"""SELECT id,first_timestamp,last_timestamp,source,destination,
+                           source_port,destination_port,protocol,packets,bytes,
+                           duration,packets_per_second,bytes_per_second,
+                           mean_packet_size,stddev_packet_size,syn,ack,fin,rst,interface
+                    FROM flows{where} ORDER BY id DESC LIMIT ?""",
+                params,
+            )])
+        finally:
+            c.close()
+
+    @app.get("/api/analysis")
+    def analysis_status():
+        """Windowed-analysis and model health."""
+        if analysis is None:
+            return _analysis_unavailable()
+        return jsonify(analysis.status())
+
+    @app.get("/api/anomalies")
+    def anomalies():
+        """Recent fused assessments, each with the arithmetic behind its score."""
+        if analysis is None:
+            return _analysis_unavailable()
+        limit = _bounded_limit(request.args.get("limit"), 50, 1, 200)
+        return jsonify(analysis.recent_assessments(limit))
+
+    @app.get("/api/windows")
+    def windows():
+        """Recent completed analysis windows."""
+        if analysis is None:
+            return _analysis_unavailable()
+        limit = _bounded_limit(request.args.get("limit"), 10, 1, 50)
+        return jsonify(analysis.recent_windows(limit))
+
+    @app.get("/api/baselines")
+    def baselines():
+        """Per-host statistical baseline states."""
+        if analysis is None:
+            return _analysis_unavailable()
+        limit = _bounded_limit(request.args.get("limit"), 50, 1, 200)
+        return jsonify(analysis.baselines(limit))
+
+    @app.get("/api/baselines/<host>")
+    def baseline_detail(host: str):
+        if not _host(host):
+            return jsonify(ok=False, error="invalid host"), 400
+        if analysis is None:
+            return _analysis_unavailable()
+        return jsonify(analysis.baseline_for(host))
 
     @app.get("/api/notifications")
     def notification_status():

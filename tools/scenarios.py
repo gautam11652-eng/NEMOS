@@ -64,23 +64,46 @@ def _event(offset: float, source: str, destination: str, protocol: str,
 
 
 def normal_traffic(seed: int = 1, hosts: int = 6, seconds: float = 60.0) -> Scenario:
-    """Ordinary workstation behaviour: a few servers, common ports, mixed sizes."""
+    """Ordinary workstation behaviour: a few servers, common ports, mixed sizes.
+
+    Deliberately paced below the detector's own thresholds. An earlier version
+    sent a connection every 0.05-0.6s, which put a single host over the
+    ``service_burst`` threshold of 40 connections per 10s window and made
+    "normal" traffic trip a rule. The honest fix was to generate traffic that
+    is actually normal, not to raise the detector's threshold until the demo
+    looked good.
+
+    Connection setup and teardown are included so the training corpus carries
+    real variance in the TCP flag features rather than leaving them constant.
+    """
     rng = random.Random(seed)
     events: list[tuple[float, TrafficEvent]] = []
     for host_index in range(hosts):
         source = f"{INTERNAL}.{10 + host_index}"
         t = rng.uniform(0, 2)
         while t < seconds:
-            destination = f"{SERVERS}.{rng.choice([10, 11, 12, 20])}"
-            dport = rng.choice([443, 443, 443, 80, 22, 53])
-            if dport == 53:
+            choice = rng.random()
+            if choice < 0.12:
+                # DNS lookup.
                 events.append(_event(t, source, f"{SERVERS}.53", "DNS",
                                      rng.randint(30000, 60000), 53, rng.randint(70, 300)))
+            elif choice < 0.18:
+                # Occasional UDP service traffic, e.g. time sync.
+                events.append(_event(t, source, f"{SERVERS}.20", "UDP",
+                                     rng.randint(30000, 60000), 123, rng.randint(76, 200)))
             else:
+                # A short TCP session: setup, a little data, teardown.
+                destination = f"{SERVERS}.{rng.choice([10, 11, 12, 20])}"
+                dport = rng.choice([443, 443, 443, 80, 22])
                 sport = rng.randint(30000, 60000)
-                events.append(_event(t, source, destination, "TCP", sport, dport,
-                                     rng.randint(200, 1400), rng.choice(["PA", "A", "PA"])))
-            t += rng.uniform(0.05, 0.6)
+                events.append(_event(t, source, destination, "TCP", sport, dport, 60, "S"))
+                for i in range(rng.randint(1, 4)):
+                    events.append(_event(t + 0.01 * (i + 1), source, destination, "TCP",
+                                         sport, dport, rng.randint(200, 1400), "PA"))
+                if rng.random() < 0.7:
+                    events.append(_event(t + 0.06, source, destination, "TCP",
+                                         sport, dport, 60, "FA"))
+            t += rng.uniform(0.8, 3.0)
     events.sort(key=lambda item: item[0])
     return Scenario(
         "normal_traffic",

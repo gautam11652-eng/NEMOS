@@ -37,6 +37,7 @@ class BatchWriter:
         max_queue: int = 50_000,
         max_traffic: int = 100_000,
         max_alerts: int = 10_000,
+        max_flows: int = 200_000,
         alert_reserve: int | None = None,
         alert_submit_timeout: float = 0.05,
     ):
@@ -51,6 +52,7 @@ class BatchWriter:
         self.flush_seconds = flush_seconds
         self.max_traffic = max_traffic
         self.max_alerts = max_alerts
+        self.max_flows = max_flows
         self.alert_submit_timeout = alert_submit_timeout
         reserve_default = max(1, min(max_queue // 10, 2048))
         self.alert_reserve = reserve_default if alert_reserve is None else alert_reserve
@@ -108,6 +110,14 @@ class BatchWriter:
 
     def submit_traffic(self, event: TrafficEvent) -> bool:
         return self._submit(Item("traffic", event.as_dict()), is_alert=False)
+
+    def submit_flow(self, flow: dict) -> bool:
+        """Queue one aggregated unidirectional flow.
+
+        Treated like traffic for backpressure: flows are telemetry, and under
+        sustained overload telemetry is dropped before security findings.
+        """
+        return self._submit(Item("flow", flow), is_alert=False)
 
     def submit_alert(self, alert: Alert) -> bool:
         return self._submit(Item("alert", alert.as_dict()), is_alert=True)
@@ -257,9 +267,25 @@ class BatchWriter:
     def _flush(self, c: sqlite3.Connection, items: list[Item]) -> bool:
         traffic_rows = []
         alert_rows = []
+        flow_rows = []
         for item in items:
             p = item.payload
-            if item.kind == "traffic":
+            if item.kind == "flow":
+                flow_rows.append((
+                    p.get("first_timestamp") or "", p.get("last_timestamp") or "",
+                    p["source"], p["destination"], p.get("source_port"),
+                    p.get("destination_port"), p["protocol"],
+                    int(p.get("packets") or 0), int(p.get("bytes") or 0),
+                    float(p.get("duration") or 0.0),
+                    float(p.get("packets_per_second") or 0.0),
+                    float(p.get("bytes_per_second") or 0.0),
+                    float(p.get("mean_packet_size") or 0.0),
+                    float(p.get("stddev_packet_size") or 0.0),
+                    int(p.get("syn") or 0), int(p.get("ack") or 0),
+                    int(p.get("fin") or 0), int(p.get("rst") or 0),
+                    p.get("interface") or "",
+                ))
+            elif item.kind == "traffic":
                 traffic_rows.append(
                     (
                         p["timestamp"], p["source"], p["destination"], p["source_port"],
@@ -294,6 +320,12 @@ class BatchWriter:
                             "INSERT INTO alerts(timestamp,threat,category,source,severity,risk_score,confidence,reason,ports_scanned,packets,destinations,ports,window_seconds,technique,incident_id,evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             alert_rows,
                         )
+                    if flow_rows:
+                        c.executemany(
+                            "INSERT INTO flows(first_timestamp,last_timestamp,source,destination,source_port,destination_port,protocol,packets,bytes,duration,packets_per_second,bytes_per_second,mean_packet_size,stddev_packet_size,syn,ack,fin,rst,interface) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            flow_rows,
+                        )
+                    self._prune_flows(c)
                     traffic_pruned = self._prune_traffic(c)
                     alerts_pruned = self._prune_alerts(c)
                     if traffic_pruned or alerts_pruned:
@@ -513,6 +545,20 @@ class BatchWriter:
             "dns": int(row[4] or 0),
             "host_counts": host_counts,
         }
+
+    def _prune_flows(self, c: sqlite3.Connection) -> None:
+        """Bound the flow table by row count, like traffic and alerts.
+
+        Flows feed no cached counters, so pruning is a plain delete with no
+        delta bookkeeping to keep in step.
+        """
+        if self.max_flows <= 0:
+            return
+        cutoff = c.execute(
+            "SELECT id FROM flows ORDER BY id DESC LIMIT 1 OFFSET ?", (self.max_flows,)
+        ).fetchone()
+        if cutoff is not None:
+            c.execute("DELETE FROM flows WHERE id <= ?", (int(cutoff[0]),))
 
     def _prune_alerts(self, c: sqlite3.Connection):
         if self.max_alerts <= 0:

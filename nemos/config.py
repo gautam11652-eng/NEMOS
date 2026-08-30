@@ -35,6 +35,12 @@ class Settings:
     dashboard_limit: int
     log_level: str
     trusted_hosts: tuple[str, ...] = ()
+    # Windowed flow analysis and ML anomaly detection.
+    analysis_enabled: bool = True
+    analysis_window: float = 10.0
+    max_flows: int = 20_000
+    persist_flows: bool = True
+    model_dir: Path | None = None
     @property
     def remote(self): return self.host not in {"127.0.0.1","localhost","::1"}
 
@@ -63,6 +69,11 @@ def load_settings(base: Path | None = None) -> Settings:
         _int("NEMOS_DASHBOARD_LIMIT",100,10,500),
         os.getenv("NEMOS_LOG_LEVEL","INFO").upper(),
         trusted_hosts,
+        _bool("NEMOS_ANALYSIS", True),
+        _float("NEMOS_ANALYSIS_WINDOW", 10.0, 1.0, 300.0),
+        _int("NEMOS_MAX_FLOWS", 20_000, 100, 1_000_000),
+        _bool("NEMOS_PERSIST_FLOWS", True),
+        Path(os.getenv("NEMOS_MODEL_DIR", str(data/"model"))).expanduser(),
     )
     if s.remote and not s.api_token:
         raise ValueError("Remote bind requires NEMOS_API_TOKEN; keep host=127.0.0.1 for local use.")

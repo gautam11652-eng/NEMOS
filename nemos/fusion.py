@@ -49,7 +49,7 @@ from .behavioral import (
     STATE_NO_BASELINE,
     BehaviorResult,
 )
-from .ml import BAND_NORMAL, AnomalyResult
+from .ml import BAND_NORMAL, BAND_SUSPICIOUS, AnomalyResult
 
 LAYER_RULES = "rules"
 LAYER_BASELINE = "baseline"
@@ -63,10 +63,18 @@ ML_MAX_CONTRIBUTION = 25
 BASELINE_MAX_CONTRIBUTION = 15
 CORROBORATION_BONUS = 10
 
-#: Baseline state to its contribution.
+#: Baseline state to its contribution when supporting a rule finding.
 BASELINE_CONTRIBUTION = {
     STATE_HIGHLY_DEVIATING: BASELINE_MAX_CONTRIBUTION,
     STATE_DEVIATING: 8,
+}
+
+#: Baseline state to risk when it is the *only* evidence. Higher than the
+#: supporting contribution above, because here it must carry the finding on its
+#: own rather than nudge one that already exists.
+STATISTICAL_BASELINE_RISK = {
+    STATE_HIGHLY_DEVIATING: 55,
+    STATE_DEVIATING: 35,
 }
 
 #: Verdict wording. Deliberately describes what was observed rather than
@@ -152,15 +160,43 @@ def severity_for(risk: int) -> str:
 
 
 def _ml_contribution(anomaly_score: int) -> int:
-    """Scale the anomaly score above the NORMAL band into a bounded bonus.
+    """Corroboration bonus for an anomaly score, on top of a rule finding.
 
-    Below ``BAND_NORMAL`` the model considers the window ordinary and
-    contributes nothing at all -- not a small amount, nothing.
+    This is the *supporting* role: a rule has already established a specific
+    behaviour and the model agrees the window is unusual. Below
+    ``BAND_NORMAL`` the model considers the window ordinary and contributes
+    nothing at all -- not a small amount, nothing.
     """
     if anomaly_score < BAND_NORMAL:
         return 0
     span = max(1, 100 - BAND_NORMAL)
     return int(round(ML_MAX_CONTRIBUTION * (anomaly_score - BAND_NORMAL) / span))
+
+
+def _statistical_risk(anomaly_score: int | None, baseline_state: str) -> int:
+    """Risk when statistics are the *only* evidence, with no rule finding.
+
+    A separate mapping from :func:`_ml_contribution`, because the two answer
+    different questions. As a bonus, any deviation above the NORMAL band adds
+    something. As the sole basis for an alert, it must not: a window sitting in
+    the merely-SUSPICIOUS band is the ordinary jitter of real traffic, and
+    alerting on it produces noise that trains operators to ignore the sensor.
+
+    So nothing below ``BAND_SUSPICIOUS`` contributes at all, and the two
+    statistical views are combined with ``max`` rather than a sum -- an unusual
+    window and a deviating host are usually two views of one underlying change,
+    and adding them would double-count it.
+    """
+    ml_part = 0
+    if anomaly_score is not None and anomaly_score >= BAND_SUSPICIOUS:
+        span = max(1, 100 - BAND_SUSPICIOUS)
+        ml_part = int(round(45 + (STATISTICAL_CEILING - 45)
+                            * (anomaly_score - BAND_SUSPICIOUS) / span))
+    baseline_part = STATISTICAL_BASELINE_RISK.get(baseline_state, 0)
+    if not ml_part and not baseline_part:
+        return 0
+    both = ml_part > 0 and baseline_part > 0
+    return min(STATISTICAL_CEILING, max(ml_part, baseline_part) + (CORROBORATION_BONUS if both else 0))
 
 
 def _ml_reasons(result: AnomalyResult) -> tuple[str, ...]:
@@ -289,21 +325,27 @@ def assess(source: str,
 
     # --- combine ---------------------------------------------------------
     statistical_layers = sum(1 for c in (ml_contribution, baseline_contribution) if c > 0)
-    corroboration = CORROBORATION_BONUS if (
-        (has_rules and statistical_layers >= 1) or statistical_layers >= 2
-    ) else 0
-    if corroboration:
-        reasons.append("independent detection layers agree on this source")
-
-    raw = rule_risk + ml_contribution + baseline_contribution + corroboration
     ceiling = 100 if has_rules else STATISTICAL_CEILING
-    risk = max(0, min(ceiling, raw))
 
-    if not has_rules and ml_contribution == 0 and baseline_contribution == 0:
-        verdict = VERDICT_BENIGN
-        risk = 0
+    if has_rules:
+        # Rules set the floor; statistics corroborate and may raise it.
+        corroboration = CORROBORATION_BONUS if statistical_layers >= 1 else 0
+        raw = rule_risk + ml_contribution + baseline_contribution + corroboration
     else:
-        verdict = _verdict_for(rule_threats, risk, has_rules)
+        # No deterministic finding: statistics must carry the assessment alone,
+        # under a stricter mapping and a lower ceiling.
+        raw = _statistical_risk(anomaly_score, baseline_state)
+        corroboration = 0
+        ml_contribution = raw if anomaly_score is not None and raw else 0
+        baseline_contribution = 0
+
+    risk = max(0, min(ceiling, raw))
+    verdict = VERDICT_BENIGN if risk == 0 else _verdict_for(rule_threats, risk, has_rules)
+    if verdict == VERDICT_BENIGN:
+        risk = 0
+        reasons = []
+    elif corroboration:
+        reasons.append("independent detection layers agree on this source")
 
     # Confidence: deterministic findings carry their own; a purely statistical
     # assessment is capped, because "unlike training data" is a weaker claim
@@ -322,6 +364,9 @@ def assess(source: str,
         "method": (
             "risk = strongest rule risk + ML contribution + baseline contribution "
             "+ corroboration bonus, capped at the applicable ceiling"
+            if has_rules else
+            "no rule fired: risk = max(ML tail risk, baseline risk) + corroboration "
+            "when both fired, capped below CRITICAL"
         ),
         "rule_floor": rule_risk,
         "ml_contribution": ml_contribution,

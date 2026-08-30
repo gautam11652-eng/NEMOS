@@ -13,6 +13,8 @@ class MainLifecycleTests(unittest.TestCase):
             log_level="INFO", db_path=Path("/tmp/nemos-test.db"), batch_size=1,
             flush_seconds=0.01, max_traffic=100, max_alerts=100,
             capture_enabled=False, interface=None, host="127.0.0.1", port=0,
+            analysis_enabled=True, analysis_window=10.0, max_flows=100,
+            persist_flows=True, model_dir=Path("/tmp/nemos-test-model"),
         )
 
         class Writer:
@@ -21,6 +23,7 @@ class MainLifecycleTests(unittest.TestCase):
             def shutdown(self, timeout=10): calls.append(("writer_shutdown", timeout))
             def submit_traffic(self, event): return True
             def submit_alert(self, alert): return True
+            def submit_flow(self, flow): return True
 
         class DetectorConfig:
             @classmethod
@@ -70,6 +73,22 @@ class MainLifecycleTests(unittest.TestCase):
         fake_detector.ThreatDetector = Detector
         fake_models = types.ModuleType("nemos.models")
         fake_models.TrafficEvent = object
+        fake_models.Alert = object
+
+        class Analysis:
+            """Stub analysis engine: records lifecycle calls only."""
+
+            def __init__(self, **kwargs): calls.append(("analysis_init", kwargs))
+            def start(self): calls.append(("analysis_start",))
+            def observe(self, event): pass
+            def record_rule_alerts(self, source, alerts): pass
+            def run_cycle(self, now=None, force=False):
+                calls.append(("analysis_final_cycle", force))
+            def stop(self, timeout=5): calls.append(("analysis_stop", timeout))
+            def status(self): return {}
+
+        fake_analysis = types.ModuleType("nemos.analysis")
+        fake_analysis.AnalysisEngine = Analysis
         fake_storage = types.ModuleType("nemos.storage")
         fake_storage.BatchWriter = Writer
         fake_waitress = types.ModuleType("waitress")
@@ -80,6 +99,7 @@ class MainLifecycleTests(unittest.TestCase):
             "nemos.config": fake_config, "nemos.database": fake_database,
             "nemos.detector": fake_detector, "nemos.models": fake_models,
             "nemos.storage": fake_storage, "waitress": fake_waitress,
+            "nemos.analysis": fake_analysis,
         }
         with patch.dict(sys.modules, modules):
             main_mod = importlib.reload(importlib.import_module("main"))
@@ -97,6 +117,20 @@ class MainLifecycleTests(unittest.TestCase):
         self.assertIn(("waitress_caught_shutdown_requested",), calls)
         self.assertIn(("writer_shutdown", 10), calls)
         self.assertEqual(server_holder["server"].closed, 1)
+
+    def test_analysis_engine_is_started_and_drained_on_shutdown(self):
+        """A final forced cycle must run so in-flight flows are not lost."""
+        _, calls, _ = self._load_main_with_stubs()
+        self.assertIn(("analysis_start",), calls)
+        self.assertIn(("analysis_final_cycle", True), calls)
+        self.assertIn(("analysis_stop", 5), calls)
+
+    def test_shutdown_order_stops_producers_before_consumers(self):
+        """Analysis must drain before the writer closes, or its final alerts
+        and flows would be submitted to a writer that is no longer accepting."""
+        _, calls, _ = self._load_main_with_stubs()
+        names = [c[0] for c in calls]
+        self.assertLess(names.index("analysis_stop"), names.index("writer_shutdown"))
 
 
 if __name__ == "__main__":

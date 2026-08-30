@@ -22,6 +22,22 @@ CREATE TABLE IF NOT EXISTS alerts (
  window_seconds INTEGER NOT NULL DEFAULT 0, technique TEXT NOT NULL DEFAULT '',
  evidence TEXT NOT NULL DEFAULT '{}', incident_id TEXT NOT NULL DEFAULT '', acknowledged INTEGER NOT NULL DEFAULT 0
 );
+-- Aggregated unidirectional flows. The (source, destination, source_port,
+-- destination_port, protocol) tuple is stored exactly as observed and is never
+-- normalised: A->B and B->A are separate rows by design. See nemos/flows.py.
+CREATE TABLE IF NOT EXISTS flows (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ first_timestamp TEXT NOT NULL, last_timestamp TEXT NOT NULL,
+ source TEXT NOT NULL, destination TEXT NOT NULL,
+ source_port INTEGER, destination_port INTEGER, protocol TEXT NOT NULL,
+ packets INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0,
+ duration REAL NOT NULL DEFAULT 0,
+ packets_per_second REAL NOT NULL DEFAULT 0, bytes_per_second REAL NOT NULL DEFAULT 0,
+ mean_packet_size REAL NOT NULL DEFAULT 0, stddev_packet_size REAL NOT NULL DEFAULT 0,
+ syn INTEGER NOT NULL DEFAULT 0, ack INTEGER NOT NULL DEFAULT 0,
+ fin INTEGER NOT NULL DEFAULT 0, rst INTEGER NOT NULL DEFAULT 0,
+ interface TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS telemetry_stats (
  id INTEGER PRIMARY KEY CHECK (id = 1),
  packets INTEGER NOT NULL DEFAULT 0,
@@ -50,6 +66,10 @@ CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(timestamp);
 CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
 CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts(source);
 CREATE INDEX IF NOT EXISTS idx_alerts_source_severity ON alerts(source, severity);
+CREATE INDEX IF NOT EXISTS idx_flows_last_timestamp ON flows(last_timestamp);
+CREATE INDEX IF NOT EXISTS idx_flows_source ON flows(source);
+CREATE INDEX IF NOT EXISTS idx_flows_destination ON flows(destination);
+CREATE INDEX IF NOT EXISTS idx_flows_protocol ON flows(protocol);
 
 
 """

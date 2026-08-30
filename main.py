@@ -5,6 +5,7 @@ import signal
 import threading
 from pathlib import Path
 
+from nemos.analysis import AnalysisEngine
 from nemos.api import create_app
 from nemos.capture import PacketCapture
 from nemos.config import load_settings
@@ -68,9 +69,34 @@ def main() -> int:
         writer.submit_alert(alert)
         notifier.submit(alert.as_dict())
 
+    # Windowed flow analysis and ML anomaly detection. All of its work happens
+    # on its own thread; the capture path below only appends to a flow table.
+    analysis = None
+    if settings.analysis_enabled:
+        def persist_flows(flows) -> None:
+            if settings.persist_flows:
+                for flow in flows:
+                    writer.submit_flow(flow.as_dict())
+
+        analysis = AnalysisEngine(
+            model_dir=settings.model_dir,
+            window_seconds=settings.analysis_window,
+            max_flows=settings.max_flows,
+            on_alert=record,
+            on_flows=persist_flows,
+        )
+        analysis.start()
+    else:
+        log.info("windowed flow analysis disabled")
+
     def event(event: TrafficEvent, packet_type: str) -> None:
         writer.submit_traffic(event)
-        for alert in detector.process(event, packet_type):
+        if analysis is not None:
+            # Cheap: one dict operation under a short lock. Feature extraction
+            # and model inference happen on the analysis thread.
+            analysis.observe(event)
+        alerts = detector.process(event, packet_type)
+        for alert in alerts:
             log.warning(
                 "THREAT %s source=%s score=%s severity=%s",
                 alert.threat,
@@ -79,6 +105,10 @@ def main() -> int:
                 alert.severity,
             )
             record(alert)
+        if alerts and analysis is not None:
+            # Hand deterministic findings to the analysis engine so the next
+            # window can fuse them with the statistical layers.
+            analysis.record_rule_alerts(event.source, alerts)
         if packet_type == "ARP" and event.metadata:
             alert = detector.observe_arp(
                 event.source,
@@ -118,7 +148,7 @@ def main() -> int:
         else:
             log.info("capture disabled")
 
-        app = create_app(settings, writer, capture, notifier)
+        app = create_app(settings, writer, capture, notifier, analysis)
 
         try:
             from waitress import create_server
@@ -155,6 +185,14 @@ def main() -> int:
                 capture.stop(timeout=5)
             except Exception:
                 log.exception("failed to stop packet capture")
+        if analysis is not None:
+            try:
+                # Capture has stopped, so drain the remaining flows: a final
+                # window's worth of traffic should still be analysed and stored.
+                analysis.run_cycle(force=True)
+                analysis.stop(timeout=5)
+            except Exception:
+                log.exception("failed to stop flow analysis")
         try:
             notifier.shutdown(timeout=5)
         except Exception:
