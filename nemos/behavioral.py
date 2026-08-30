@@ -14,6 +14,23 @@ class BehaviorObservation:
     unique_ports: int
 
 
+# Explicit baseline states. The distinction that matters most is the first one:
+# a host NEMOS has not observed long enough is NO_BASELINE, never "normal" and
+# never "anomalous". Treating an unknown host as either would be a claim the
+# evidence does not support.
+STATE_NO_BASELINE = "NO_BASELINE"
+STATE_NORMAL = "NORMAL"
+STATE_DEVIATING = "DEVIATING"
+STATE_HIGHLY_DEVIATING = "HIGHLY_DEVIATING"
+
+BASELINE_STATES = (
+    STATE_NO_BASELINE,
+    STATE_NORMAL,
+    STATE_DEVIATING,
+    STATE_HIGHLY_DEVIATING,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class BehaviorResult:
     ready: bool
@@ -21,6 +38,15 @@ class BehaviorResult:
     confidence: int
     deviations: dict[str, float]
     baseline: dict[str, float]
+    #: One of BASELINE_STATES. ``ready`` says whether this result should raise
+    #: an alert; ``state`` says what the baseline currently thinks of the host,
+    #: which the dashboard and the fusion layer both need even when no alert
+    #: fires.
+    state: str = STATE_NO_BASELINE
+    #: Largest per-feature deviation, in standard deviations.
+    strongest_sigma: float = 0.0
+    #: Observations recorded for this source so far.
+    samples: int = 0
 
 
 @dataclass(slots=True)
@@ -80,7 +106,12 @@ class AdaptiveBehaviorProfiler:
         if p.samples < self.min_samples:
             self._seed_or_update(p, values)
             p.samples += 1
-            return BehaviorResult(False, 0, 0, {}, self._baseline(p))
+            # Still warming up. A host without enough history is explicitly
+            # NO_BASELINE -- not normal, and certainly not anomalous.
+            return BehaviorResult(
+                False, 0, 0, {}, self._baseline(p),
+                state=STATE_NO_BASELINE, strongest_sigma=0.0, samples=p.samples,
+            )
 
         # Capture the baseline before updating it with the current observation.
         # Evidence must describe what the event was compared against, not a
@@ -142,7 +173,21 @@ class AdaptiveBehaviorProfiler:
             score += 7
         anomaly_score = min(100, int(score))
         confidence = min(98, int(50 + strongest * 6 + support * 3 + min(20, p.samples)))
-        return BehaviorResult(ready, anomaly_score, confidence, deviations, baseline_before)
+
+        # State is reported for every observation, whether or not it alerts.
+        # HIGHLY_DEVIATING needs a deviation well past the threshold *and*
+        # independent corroboration, matching the alerting rule above.
+        if strongest >= threshold + 2.0 and support >= threshold * 0.75:
+            state = STATE_HIGHLY_DEVIATING
+        elif strongest >= threshold:
+            state = STATE_DEVIATING
+        else:
+            state = STATE_NORMAL
+
+        return BehaviorResult(
+            ready, anomaly_score, confidence, deviations, baseline_before,
+            state=state, strongest_sigma=round(strongest, 3), samples=p.samples,
+        )
 
     def _seed_or_update(self, p: _Profile, values: Iterable[float]) -> None:
         attrs = (("rate_mean", "rate_var"), ("bytes_mean", "bytes_var"),
@@ -169,3 +214,15 @@ class AdaptiveBehaviorProfiler:
             "unique_ports": round(p.port_mean, 2),
             "samples": p.samples,
         }
+
+
+__all__ = [
+    "BASELINE_STATES",
+    "STATE_DEVIATING",
+    "STATE_HIGHLY_DEVIATING",
+    "STATE_NORMAL",
+    "STATE_NO_BASELINE",
+    "AdaptiveBehaviorProfiler",
+    "BehaviorObservation",
+    "BehaviorResult",
+]
