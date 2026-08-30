@@ -97,3 +97,27 @@ NEMOS combines bounded, deterministic network rules with an explainable per-sour
 ## SIH / demonstration
 
 Use `python tools/validate_detection.py` for a safe offline demonstration using synthetic documentation-address telemetry. See `docs/SIH_DEMO.md`, `docs/DEMO_SCRIPT.md` and `docs/SIH_SLIDE_OUTLINE.md`.
+
+## Telegram Alerts
+
+NEMOS can send security alerts and notifications through Telegram.
+
+### Setup
+
+Each user/deployment must use their own Telegram bot and credentials.
+
+1. Open Telegram and start a chat with **@BotFather**.
+2. Create a new bot using `/newbot`.
+3. Copy the bot token provided by BotFather.
+4. Send a message to your new bot.
+5. Obtain your Telegram chat ID.
+6. Add the following values to your local `.env` file:
+
+```env
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+Keep these credentials private. Do not commit your `.env` file or bot token to Git.
+
+After configuration, NEMOS can use the Telegram integration to deliver security alerts and notifications to the configured chat.
