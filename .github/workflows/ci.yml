@@ -28,6 +28,21 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install tooling
+        run: python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: python -m ruff check .
+
   dependency-audit:
     runs-on: ubuntu-latest
     steps:
@@ -56,6 +71,19 @@ jobs:
         run: |
           python -m pip install --upgrade build
           python -m build
+      - name: Verify packaged version matches nemos/version.py
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          expected = re.search(
+              r'VERSION\s*=\s*"([^"]+)"',
+              pathlib.Path("nemos/version.py").read_text(),
+          ).group(1)
+          names = [p.name for p in pathlib.Path("dist").iterdir()]
+          if not any(expected in name for name in names):
+              sys.exit(f"built artifacts {names} do not carry version {expected}")
+          print(f"packaged version {expected} confirmed in {names}")
+          PY
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:

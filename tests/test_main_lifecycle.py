@@ -83,7 +83,6 @@ class MainLifecycleTests(unittest.TestCase):
         }
         with patch.dict(sys.modules, modules):
             main_mod = importlib.reload(importlib.import_module("main"))
-            original_signal = main_mod.signal.signal
             def fake_signal(signum, handler):
                 signal_handlers[signum] = handler
                 return None

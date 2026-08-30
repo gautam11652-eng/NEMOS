@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from math import sqrt
-from typing import Iterable
+from collections.abc import Iterable
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +103,10 @@ class AdaptiveBehaviorProfiler:
             "unique_destinations": max(1.0, abs(means[2]) * 0.25),
             "unique_ports": max(1.0, abs(means[3]) * 0.25),
         }
-        for name, value, mean, var in zip(names, values, means, vars_):
+        # strict: the feature names, observations, means and variances are
+        # parallel by construction. A future mismatch should fail loudly
+        # rather than silently scoring a truncated feature set.
+        for name, value, mean, var in zip(names, values, means, vars_, strict=True):
             sd = max(sqrt(max(var, 0.0)), floors[name])
             z = abs(value - mean) / sd
             deviations[name] = round(z, 3)
@@ -144,7 +147,7 @@ class AdaptiveBehaviorProfiler:
     def _seed_or_update(self, p: _Profile, values: Iterable[float]) -> None:
         attrs = (("rate_mean", "rate_var"), ("bytes_mean", "bytes_var"),
                  ("dest_mean", "dest_var"), ("port_mean", "port_var"))
-        for value, (mean_name, var_name) in zip(values, attrs):
+        for value, (mean_name, var_name) in zip(values, attrs, strict=True):
             mean = getattr(p, mean_name)
             if p.samples == 0:
                 setattr(p, mean_name, value)

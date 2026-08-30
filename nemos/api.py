@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import threading
 import ipaddress
 import json
@@ -15,10 +16,12 @@ from .config import Settings
 from .database import connect
 from .models import TrafficEvent
 from .intelligence import summarize_incident
-from .attack import catalog as attack_catalog, enrich_alert, technique_metadata
+from .attack import catalog as attack_catalog, enrich_alert
 
 from .version import VERSION
 _ALLOWED_PROTOCOLS = {"TCP", "UDP", "DNS", "ICMP", "ARP", "IP", "OTHER"}
+_SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
+_BOOLEANS = {"1": True, "true": True, "yes": True, "0": False, "false": False, "no": False}
 
 
 def _bounded_limit(value: Any, default: int, minimum: int = 1, maximum: int = 500) -> int:
@@ -119,7 +122,7 @@ def _enrich_alert_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [enrich_alert(row) for row in rows]
 
 
-def create_app(settings: Settings, writer, capture=None) -> Flask:
+def create_app(settings: Settings, writer, capture=None, notifier=None) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
     # Flask 3.x trusted-host protection. Keep local aliases usable for the
@@ -141,6 +144,38 @@ def create_app(settings: Settings, writer, capture=None) -> Flask:
     dashboard_cache: dict[tuple[str, int], dict[str, Any]] = {}
     dashboard_cache_lock = threading.Lock()
     dashboard_cache_limit = 4
+
+    def _notification_state() -> dict[str, Any]:
+        """Summarize alert delivery for the dashboard.
+
+        Works with or without a live notifier so the endpoint stays useful when
+        the app is created standalone (tests, or a read-only inspection).
+        The bot token is never read into the response; only whether it is set.
+        """
+        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        telegram_configured = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip() and chat_id)
+        # Show only the tail of the chat id: enough to confirm the right chat is
+        # targeted, not enough to be a useful identifier on a shared screen.
+        masked = ("••••" + chat_id[-4:]) if len(chat_id) > 4 else (chat_id or "")
+        state: dict[str, Any] = {
+            "telegram_configured": telegram_configured,
+            "chat_id": masked,
+            "webhook_configured": bool(os.getenv("NEMOS_WEBHOOK_URL", "").strip()),
+            "channels": {},
+        }
+        if notifier is not None:
+            metrics = notifier.metrics()
+            state.update(metrics)
+            state["telegram_configured"] = telegram_configured
+            state["chat_id"] = masked
+            state["webhook_configured"] = "webhook" in metrics.get("channels", {})
+        else:
+            state.update({
+                "enabled": False, "active": False, "accepted": 0, "delivered": 0,
+                "failed": 0, "queue_depth": 0, "dropped_queue_full": 0,
+                "suppressed_severity": 0, "suppressed_cooldown": 0, "suppressed_rate": 0,
+            })
+        return state
 
     def auth() -> bool:
         if not token:
@@ -309,12 +344,15 @@ def create_app(settings: Settings, writer, capture=None) -> Flask:
     @app.get("/api/status")
     def status():
         capture_state = capture.status() if capture is not None else {"state": "not_configured", "running": False, "interface": settings.interface or "default", "packets_seen": 0, "last_packet": None, "error": None}
-        return jsonify(ok=True, version=VERSION, capture=capture_state, writer=writer.metrics())
+        return jsonify(
+            ok=True, version=VERSION, capture=capture_state,
+            writer=writer.metrics(), notifications=_notification_state(),
+        )
 
     @app.get("/api/metrics")
     def metrics():
-        """Return writer health/backpressure metrics; protected by API auth."""
-        return jsonify(writer=writer.metrics())
+        """Return writer/delivery health metrics; protected by API auth."""
+        return jsonify(writer=writer.metrics(), notifications=_notification_state())
 
     @app.get("/api/stats")
     def stats():
@@ -326,11 +364,74 @@ def create_app(settings: Settings, writer, capture=None) -> Flask:
 
     @app.get("/api/alerts")
     def alerts():
+        """Return recent alerts, optionally filtered.
+
+        Supported filters: ``severity`` (repeatable), ``source``, ``threat``,
+        ``technique``, ``acknowledged`` and ``since`` (ISO timestamp prefix).
+        Every filter is bound as a parameter and validated against a known set
+        or a length cap; none of them reach the SQL text.
+        """
         limit = _bounded_limit(request.args.get("limit"), 100)
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        severities = [
+            value.strip().upper()
+            for value in request.args.getlist("severity")
+            if value.strip()
+        ]
+        if severities:
+            if any(value not in _SEVERITIES for value in severities):
+                return jsonify(ok=False, error="invalid severity"), 400
+            unique = sorted(set(severities))
+            clauses.append(f"severity IN ({','.join('?' for _ in unique)})")
+            params.extend(unique)
+
+        source = request.args.get("source", "").strip()
+        if source:
+            if not _host(source):
+                return jsonify(ok=False, error="source must be a valid IP address"), 400
+            clauses.append("source = ?")
+            params.append(source)
+
+        for name, column in (("threat", "threat"), ("technique", "technique")):
+            value = request.args.get(name, "").strip()
+            if value:
+                if len(value) > 64:
+                    return jsonify(ok=False, error=f"{name} too long"), 400
+                clauses.append(f"{column} = ?")
+                params.append(value.upper() if name == "threat" else value)
+
+        acknowledged = request.args.get("acknowledged", "").strip().lower()
+        if acknowledged:
+            if acknowledged not in _BOOLEANS:
+                return jsonify(ok=False, error="acknowledged must be true or false"), 400
+            clauses.append("acknowledged = ?")
+            params.append(1 if _BOOLEANS[acknowledged] else 0)
+
+        since = request.args.get("since", "").strip()
+        if since:
+            if len(since) > 64:
+                return jsonify(ok=False, error="since too long"), 400
+            # Timestamps are stored as ISO-8601 strings, so a lexical
+            # comparison is also a chronological one.
+            clauses.append("timestamp >= ?")
+            params.append(since)
+
+        # Every element of `clauses` is a literal fragment written above; the
+        # only interpolated characters are `?` placeholders. All user-supplied
+        # values travel in `params` as bound parameters.
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
         c = connect(settings.db_path)
         try:
             return jsonify(_enrich_alert_rows([
-                dict(x) for x in c.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,))
+                dict(row) for row in c.execute(
+                    f"""SELECT id,timestamp,threat,category,source,severity,risk_score,
+                               confidence,reason,technique,incident_id,acknowledged,evidence
+                        FROM alerts{where} ORDER BY id DESC LIMIT ?""",
+                    params,
+                )
             ]))
         finally:
             c.close()
@@ -358,6 +459,7 @@ def create_app(settings: Settings, writer, capture=None) -> Flask:
             incident_ids = [row["incident_id"] for row in rows]
             placeholders = ",".join("?" for _ in incident_ids)
             evidence_rows = c.execute(
+                # `placeholders` is a run of `?` markers; ids are bound below.
                 f"""WITH ranked AS (
                        SELECT id,incident_id,threat,source,severity,risk_score,confidence,
                               technique,evidence,
@@ -505,14 +607,29 @@ def create_app(settings: Settings, writer, capture=None) -> Flask:
             c.close()
 
 
+    @app.get("/api/notifications")
+    def notification_status():
+        """Report alert-delivery configuration and health without secrets."""
+        return jsonify(_notification_state())
+
     @app.get("/api/telegram")
     def telegram_status():
-        """Expose safe Telegram configuration status without revealing secrets."""
-        import os
-        token_value = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        masked = ("••••" + chat_id[-4:]) if len(chat_id) > 4 else (chat_id or "")
-        return jsonify(configured=bool(token_value and chat_id), chat_id=masked)
+        """Telegram delivery status.
+
+        Retains the original ``configured``/``chat_id`` response shape for
+        existing clients and adds live delivery counters so the dashboard can
+        distinguish "credentials present" from "alerts are actually arriving".
+        """
+        state = _notification_state()
+        telegram = state["channels"].get("telegram", {})
+        return jsonify(
+            configured=bool(state["telegram_configured"]),
+            chat_id=state["chat_id"],
+            delivery=state,
+            sent=telegram.get("sent", 0),
+            failed=telegram.get("failed", 0),
+            last_error=telegram.get("last_error", ""),
+        )
 
     @app.get("/api/techniques")
     def techniques():
@@ -549,7 +666,12 @@ def create_app(settings: Settings, writer, capture=None) -> Flask:
         limit = _bounded_limit(request.args.get("limit"), 100)
         c = connect(settings.db_path)
         try:
-            return jsonify([dict(x) for x in c.execute("SELECT * FROM traffic ORDER BY id DESC LIMIT ?", (limit,))])
+            return jsonify([dict(row) for row in c.execute(
+                """SELECT id,timestamp,source,destination,source_port,destination_port,
+                          protocol,packet_size,flags,interface,direction
+                   FROM traffic ORDER BY id DESC LIMIT ?""",
+                (limit,),
+            )])
         finally:
             c.close()
 

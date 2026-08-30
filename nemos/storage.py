@@ -177,9 +177,9 @@ class BatchWriter:
             try:
                 self.q.put_nowait(None)
                 break
-            except queue.Full:
+            except queue.Full as exc:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("SQLite writer queue did not drain")
+                    raise TimeoutError("SQLite writer queue did not drain") from exc
                 time.sleep(0.01)
 
         remaining = max(0.0, deadline - time.monotonic())

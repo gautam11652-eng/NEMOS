@@ -1,39 +1,147 @@
 # NEMOS Security & Runtime Audit
 
-This release was reviewed from the source distribution before packaging.
+This file records the security-relevant design decisions in NEMOS and the
+verification that has actually been performed. It replaces the earlier
+`FINAL_AUDIT.md`, `TEST_REPORT.md` and `TEST_REPORT_LOCAL.md`, which had drifted
+into four overlapping point-in-time snapshots of the same review.
 
-## Fixed findings
+No audit can promise the absence of future vulnerabilities. Keep the pinned
+dependencies current and re-run `pip-audit` before any release.
 
-- **Startup blocker:** `DetectionConfig.from_env()` read slotted dataclass class attributes such as `cls.baseline_alpha`. With `slots=True`, those names are member descriptors rather than float defaults, causing `TypeError: '<' not supported between instances of 'member_descriptor' and 'float'` during `python main.py`.
-- **Unbounded detector state:** cooldown bookkeeping could grow with attacker-controlled source addresses even though packet/event state was bounded. Cooldown state is now bounded and evicts the oldest entries.
-- **Misleading behavioral evidence:** the profiler returned a baseline after updating it with the current observation. Evidence now records the pre-update baseline used for the comparison.
-- **Non-finite configuration values:** NaN/Infinity behavior settings are rejected in favor of defaults.
-- **API N+1 query pattern:** incident listing now batches evidence retrieval instead of querying once per incident.
-- **Writer failure handling:** a database-open failure now marks the writer unavailable instead of leaving callers believing it is accepting work forever.
-- **Capture lifecycle:** repeated `start()` calls are idempotent; capture now exposes explicit state/counters and uses a finite Scapy sniff timeout so idle capture can stop deterministically.
-- **Telemetry zero state:** stats endpoints tolerate a missing cached counter row and return a safe zero state instead of raising a server error.
-- **Browser token persistence:** dashboard API tokens now use `sessionStorage` rather than persistent `localStorage`, reducing credential lifetime on shared browsers.
-- **HTTP shutdown:** the production entry point now owns the Waitress server object and closes it on SIGINT/SIGTERM before joining capture/storage resources.
-- **Privilege boundary:** the supplied systemd unit grants only `CAP_NET_RAW` for packet capture and keeps the application process unprivileged.
-- **Telemetry truthfulness:** the dashboard now distinguishes capture-disabled, capture-starting, capture-running, permission-denied, and capture-error states instead of presenting all-zero telemetry as a healthy sensor.
-- **Deployment fallback:** the production entry point no longer silently falls back to Flask's development server; Waitress is required.
+## Standing security properties
 
-## Verification performed
+These are the invariants the code and test suite are written to protect. Each
+one has at least one regression test.
 
-- Python bytecode compilation: passed.
-- Runtime regression tests: passed.
-- Existing dependency-independent test suites plus the new lifecycle regression: **34 passed** in the offline audit environment; 2 package-namespace import checks also passed using a minimal Flask import stub.
-- The source tree currently contains 49 test functions, including 13 Flask API integration tests that require the pinned runtime dependencies. Those 13 could not be executed in this isolated audit environment because package installation is unavailable.
-- Runtime dependencies remain pinned in `requirements.txt`; run `pip-audit` in the target Kali environment before deployment because this audit container cannot access the package index.
+### Network exposure
+- Loopback bind by default. A non-loopback bind requires `NEMOS_API_TOKEN`, and
+  a wildcard bind (`0.0.0.0`, `::`) additionally requires `NEMOS_TRUSTED_HOSTS`.
+  Both are enforced in `load_settings`, at startup, not at first request.
+- Every `/api/*` route except `/api/health` requires `X-NEMOS-Token` when a
+  token is configured; comparison uses `hmac.compare_digest`.
+- With no token configured, mutating requests still reject cross-site browser
+  writes via `Sec-Fetch-Site` and `Origin`, so an unrelated page cannot drive a
+  localhost sensor.
+- CSP, `nosniff`, `X-Frame-Options`, `Referrer-Policy` and `Permissions-Policy`
+  are set on every response; API responses are `no-store`.
+- Request bodies are capped at 32 KB.
 
-## Verification boundary
+### Input handling
+- Packet ingestion validates source/destination as real IP addresses, the
+  protocol against an allow-list, and ports/sizes against their numeric ranges.
+- Alert filters (`severity`, `source`, `threat`, `technique`, `acknowledged`,
+  `since`) are validated against known sets or length caps and passed as bound
+  parameters. No user-supplied value is interpolated into SQL text.
+- Path parameters (`incident_id`, `host`) are character- and length-validated.
 
-The audit environment used for this source review does not have Flask/Scapy/Waitress installed and cannot reach PyPI, so a fresh end-to-end HTTP/capture execution could not be performed here. The code was compiled and the dependency-independent runtime paths were exercised. On Kali, install the pinned requirements and run the full suite before deployment:
+### Bounded state
+Every map keyed by an attacker-influenceable value has an eviction bound,
+because a spoofed source address must not be able to grow process memory:
+per-source event buckets, behavioural profiles, ARP mappings, alert cooldowns,
+incident correlation, and the notifier's delivery cooldown.
+
+### Storage
+- A single writer thread owns SQLite; WAL mode, busy timeout, and bounded retry
+  on lock contention.
+- The queue is bounded and reserves capacity for alerts, so a packet flood
+  cannot starve security findings. Overflow is counted, never silently lost.
+- Traffic and alert tables are pruned to configured retention limits, with
+  cached counters and host summaries updated incrementally rather than by
+  full-table scans.
+- The database file is created `0600` inside a `0700` directory.
+
+### Secrets
+- The Telegram bot token appears in the request URL, so every error string and
+  log line is redacted before it can escape (`notify.redact`).
+- No endpoint returns a credential. `/api/telegram` and `/api/notifications`
+  report only whether a credential is set, plus a masked chat-id tail.
+- The `.env` loader logs variable *names* only, never values.
+- Dashboard API tokens are held in `sessionStorage`, not `localStorage`.
+
+### Outbound alert delivery
+- Delivery never blocks packet capture: `submit` is non-blocking and all
+  network I/O happens on a worker thread.
+- Webhook URLs must be HTTPS unless the host is loopback, so alert bodies
+  describing the monitored network are not sent in cleartext.
+- HTTP redirects are refused rather than followed, so a redirect cannot
+  downgrade the transport or retarget the payload.
+- Severity floor, per-finding cooldown and a global token bucket bound outbound
+  volume, so a scan cannot turn the sensor into an amplifier.
+- Storage happens before delivery. An unreachable chat API never costs a
+  recorded detection.
+
+### Privilege boundary
+The supplied systemd unit grants `CAP_NET_RAW` only and runs the application
+unprivileged. The web application is never intended to run as root.
+
+### Honest telemetry
+The dashboard distinguishes capture-disabled, starting, running,
+permission-denied and error states rather than presenting all-zero telemetry as
+a healthy sensor. Delivery status likewise distinguishes "credentials present"
+from "alerts are actually arriving".
+
+## Detection integrity
+
+Detections are deliberately conservative and evidence-backed:
+
+- ATT&CK technique IDs are attached only where the observed network behaviour
+  supports the mapping. A generic traffic anomaly is reported as an unmapped
+  behavioural signal rather than being assigned a misleading technique.
+- The behavioural baseline is an explicitly documented exponentially weighted
+  mean/variance model, not a black-box ML claim. Every anomaly is explainable as
+  a deviation from that source's own observed baseline, and the evidence records
+  the pre-update baseline the comparison actually used.
+- A zero-variance warm-up cannot produce an infinite z-score; per-feature noise
+  floors keep a one-unit change from reading as hostile.
+- A single noisy feature is not treated as an attack: the strongest deviation
+  must be supported by an independent dimension unless it is extreme.
+
+## Previously fixed findings
+
+Retained for release history; all are covered by regression tests.
+
+- `DetectionConfig.from_env()` read slotted dataclass member descriptors as
+  float defaults, raising `TypeError` at startup.
+- Cooldown bookkeeping could grow unbounded with attacker-controlled sources.
+- The behavioural profiler reported a baseline it had already updated with the
+  observation being judged.
+- NaN/Infinity configuration values are rejected in favour of defaults.
+- Incident listing issued one query per incident (N+1); it now batches.
+- A database-open failure left callers believing the writer still accepted work.
+- Repeated `capture.start()` calls are idempotent, and sniffing uses a finite
+  timeout so idle capture stops deterministically.
+- Stats endpoints tolerate a missing cached counter row instead of raising 500.
+- The entry point owns the Waitress server and closes it on SIGINT/SIGTERM.
+- The production entry point no longer falls back to Flask's dev server.
+- The dashboard's writer-queue tile read a metric key that was never sent, so it
+  displayed nothing; it now reads live depth and capacity from `/api/status`.
+- The documented `.env` workflow had no loader behind it, so `TELEGRAM_*` and
+  other file-based settings were silently ignored.
+- Telegram alerting was documented and surfaced in the UI but had no delivery
+  code path at all; findings were never actually sent anywhere.
+
+## Verification
+
+Run in the target environment:
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 python -m pytest -q
-python main.py
+python -m compileall -q main.py nemos tests
+python -m pip_audit -r requirements.txt
+ruff check .
 ```
 
-No software audit can honestly guarantee zero future vulnerabilities. Keep the pinned dependencies updated and rerun `pip-audit` before public releases.
+CI runs the suite on Python 3.10–3.13, plus lint, dependency audit and a
+package build.
+
+### Scope limits
+
+Two areas cannot be covered by the unit suite and need a real Linux host:
+
+- **Live packet capture.** Tests exercise the parse and lifecycle paths with
+  synthetic packets; they do not put an interface in promiscuous mode.
+- **Outbound delivery over the network.** Tests inject a recording transport to
+  verify request shape, retry, redaction, suppression and non-blocking
+  behaviour. They deliberately never contact `api.telegram.org`. Confirm real
+  delivery once against your own bot before relying on it.

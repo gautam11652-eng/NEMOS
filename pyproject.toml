@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nemos"
-version = "3.2.7"
+# Single-sourced from nemos/version.py so packaging metadata and the version
+# reported by /api/health can never drift apart.
+dynamic = ["version"]
 description = "Defensive network monitoring and intrusion detection platform"
 requires-python = ">=3.10"
 license = {text = "GPL-2.0-only"}
@@ -21,6 +23,9 @@ nemos = "main:main"
 include-package-data = true
 py-modules = ["main"]
 
+[tool.setuptools.dynamic]
+version = {attr = "nemos.version.VERSION"}
+
 [tool.setuptools.packages.find]
 include = ["nemos*"]
 
@@ -29,3 +34,33 @@ nemos = ["templates/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+exclude = ["backup_before_final_ui"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "S", "UP", "C4"]
+ignore = [
+  "E501",    # long lines are deliberate in the compact dashboard/detector code
+  "E701",    # the compact one-line style in config/models is intentional
+  "E702",    # ditto: semicolon-separated statements in the terse modules
+  "E402",    # tools/ scripts set sys.path before importing the package
+  "S101",    # asserts are the test suite's assertion mechanism
+  "B008",    # Flask decorators legitimately call in argument position
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use dummy credentials, run trusted local tooling (node --check), and
+# reach into private state deliberately to prove that bounds hold.
+"tests/*" = ["S105", "S106", "S108", "S603", "S104", "SLF001"]
+# Every dynamic query here is built by _values_clause, which emits only `?`
+# placeholders; all values are bound parameters.
+"nemos/storage.py" = ["S608"]
+# S104: string comparisons against wildcard-bind addresses in validation logic,
+# not binds. Rejecting them is the whole point of the surrounding code.
+# S608: the only interpolated text is generated `?` placeholder runs and literal
+# clause fragments defined in-module. Every user-supplied value is bound.
+"nemos/config.py" = ["S104"]
+"nemos/api.py" = ["S104", "S608"]

@@ -1,4 +1,6 @@
-import tempfile, time, unittest
+import tempfile
+import time
+import unittest
 from pathlib import Path
 from nemos.database import initialize, connect
 from nemos.models import TrafficEvent, Alert
