@@ -227,6 +227,10 @@ class BatchWriter:
                             pending = []
                     if pending:
                         self._flush(c, pending)
+                        # Clear before breaking: the `finally` clause below
+                        # flushes whatever is still pending, so leaving these
+                        # items in place would write the final batch twice.
+                        pending = []
                     break
 
                 pending.append(item)

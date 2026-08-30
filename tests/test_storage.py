@@ -14,11 +14,52 @@ class StorageTests(unittest.TestCase):
             for i in range(7):
                 w.submit_traffic(TrafficEvent("now","10.0.0.1",f"10.0.0.{i+2}","TCP",1000,80,64))
             w.submit_alert(Alert("now","TEST","TEST","10.0.0.1","LOW",10,60,"test"))
-            time.sleep(.2);w.shutdown()
+            # shutdown() drains the queue and joins the writer, so it is the
+            # synchronization point; no sleep is needed before asserting.
+            w.shutdown()
             c=connect(db)
             self.assertEqual(c.execute("select count(*) from traffic").fetchone()[0],7)
             self.assertEqual(c.execute("select count(*) from alerts").fetchone()[0],1)
             c.close()
+
+    def test_shutdown_does_not_duplicate_the_final_partial_batch(self):
+        """A partial batch left pending at shutdown must be written exactly once.
+
+        The sentinel-drain path flushes `pending` and then falls through to the
+        `finally` clause, which flushes whatever is still pending. If the drain
+        path does not clear the list, the last batch is written twice --
+        duplicating traffic rows, duplicating alerts, and double-counting the
+        cached telemetry stats. A large batch_size guarantees the final batch is
+        still partial, and no sleep is used so the timeout-flush path cannot
+        mask the bug by emptying `pending` first.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "dupe.db"
+            initialize(db)
+            w = BatchWriter(db, batch_size=100, flush_seconds=30)
+            w.start()
+            for i in range(5):
+                w.submit_traffic(TrafficEvent("now", "10.0.0.1", f"10.0.0.{i + 2}", "TCP", 1000, 80, 64))
+            w.submit_alert(Alert("now", "TEST", "TEST", "10.0.0.1", "LOW", 10, 60, "test"))
+            w.shutdown()
+
+            c = connect(db)
+            try:
+                self.assertEqual(c.execute("select count(*) from traffic").fetchone()[0], 5)
+                self.assertEqual(c.execute("select count(*) from alerts").fetchone()[0], 1)
+                # Cached counters must match the rows actually stored.
+                stats = c.execute("select packets, threats from telemetry_stats where id=1").fetchone()
+                self.assertEqual(stats["packets"], 5)
+                self.assertEqual(stats["threats"], 1)
+                # And no destination may appear twice.
+                dupes = c.execute(
+                    "select destination, count(*) n from traffic group by destination having n > 1"
+                ).fetchall()
+                self.assertEqual(dupes, [])
+            finally:
+                c.close()
+
+
 class StorageLifecycleTests(unittest.TestCase):
     def test_submit_after_shutdown_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:

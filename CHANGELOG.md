@@ -24,6 +24,13 @@
   artifacts carry the version from `nemos/version.py`.
 
 ### Fixed
+- **Duplicate writes on shutdown.** The SQLite writer's sentinel-drain path
+  flushed the final partial batch and then fell through to a `finally` clause
+  that flushed the same still-populated list again. Any traffic and alerts
+  pending at shutdown were written twice, and the cached telemetry counters were
+  incremented twice with them. This hit every clean shutdown where the last
+  batch had not already been flushed by the timeout path -- the common case for
+  a busy sensor being stopped. Covered by a regression test.
 - The dashboard's writer-queue health tile read `queue_size` from the dashboard
   payload, but the metric is named `queue_depth` and `/api/dashboard` never
   returned writer metrics at all, so the tile was permanently blank. It now reads

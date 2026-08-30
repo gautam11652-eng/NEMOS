@@ -113,6 +113,8 @@ Retained for release history; all are covered by regression tests.
 - Stats endpoints tolerate a missing cached counter row instead of raising 500.
 - The entry point owns the Waitress server and closes it on SIGINT/SIGTERM.
 - The production entry point no longer falls back to Flask's dev server.
+- The writer's shutdown path wrote the final partial batch twice, duplicating
+  stored traffic and alerts and double-counting the cached telemetry stats.
 - The dashboard's writer-queue tile read a metric key that was never sent, so it
   displayed nothing; it now reads live depth and capacity from `/api/status`.
 - The documented `.env` workflow had no loader behind it, so `TELEGRAM_*` and

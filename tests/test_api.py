@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -6,6 +7,23 @@ from nemos.api import create_app
 from nemos.config import Settings
 from nemos.database import initialize
 from nemos.storage import BatchWriter
+
+
+def wait_for(predicate, timeout=10.0, interval=0.01):
+    """Poll until ``predicate()`` returns a truthy value, then return it.
+
+    The BatchWriter flushes on a background thread, so a fixed sleep is a guess
+    rather than a synchronization point: on a loaded CI runner the write can
+    land after the sleep expires, producing a spurious failure. Polling is both
+    deterministic and usually faster than the sleep it replaces.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(interval)
+    return predicate()
 
 
 class APITests(unittest.TestCase):
@@ -106,8 +124,11 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/packet", json={
             "source":"10.0.0.1", "destination":"10.0.0.2", "protocol":"DNS", "destination_port":53
         }).status_code, 202)
-        import time; time.sleep(.05)
-        second = self.client.get("/api/dashboard")
+        def dns_counted():
+            response = self.client.get("/api/dashboard")
+            return response if response.json["stats"]["dns"] == 1 else None
+
+        second = wait_for(dns_counted)
         self.assertNotEqual(second.headers["ETag"], etag)
         self.assertEqual(second.json["stats"]["dns"], 1)
 
@@ -115,10 +136,13 @@ class APITests(unittest.TestCase):
         self.client.post("/api/packet", json={
             "source":"10.0.0.10", "destination":"10.0.0.20", "protocol":"TCP"
         })
-        import time; time.sleep(.05)
-        r = self.client.get("/api/dashboard")
+        def host_recorded():
+            response = self.client.get("/api/dashboard")
+            hosts = {h["host"]: h for h in response.json["hosts"]}
+            return (response, hosts) if "10.0.0.10" in hosts else None
+
+        r, hosts = wait_for(host_recorded)
         self.assertEqual(r.status_code, 200)
-        hosts = {h["host"]: h for h in r.json["hosts"]}
         self.assertEqual(hosts["10.0.0.10"]["packets"], 1)
         self.assertEqual(hosts["10.0.0.20"]["packets"], 1)
 
@@ -127,8 +151,11 @@ class APITests(unittest.TestCase):
             "source":"10.0.0.30", "destination":"10.0.0.40", "protocol":"DNS",
             "destination_port":53, "packet_size":90,
         })
-        import time; time.sleep(.05)
-        r = self.client.get("/api/hosts?limit=1")
+        def host_indexed():
+            response = self.client.get("/api/hosts?limit=1")
+            return response if response.json else None
+
+        r = wait_for(host_indexed)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(len(r.json), 1)
         self.assertEqual(r.json[0]["host"], "10.0.0.30")
@@ -219,7 +246,10 @@ class HostIntelligenceTests(unittest.TestCase):
         self.w.submit_alert(__import__('nemos.models', fromlist=['Alert']).Alert(
             "2026-01-01T00:00:00+00:00","PORT_SCAN","NETWORK_RECONNAISSANCE","10.0.0.10","HIGH",80,90,"test",technique="T1046",incident_id="NEMOS-TEST123456",evidence={}
         ))
-        import time; time.sleep(.03)
+        # Both the packet and the alert must reach SQLite before any test in
+        # this class runs; the writer flushes them asynchronously.
+        wait_for(lambda: self.client.get("/api/hosts").json or None)
+        wait_for(lambda: self.client.get("/api/incidents/NEMOS-TEST123456").status_code == 200)
 
     def tearDown(self):
         self.w.shutdown(); self.td.cleanup()
