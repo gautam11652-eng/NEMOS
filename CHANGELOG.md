@@ -47,6 +47,34 @@
 - Webhook URLs must be HTTPS unless loopback, and HTTP redirects are refused
   rather than followed.
 
+### Documentation
+- **Corrected an overstatement risk.** The README's "Detection Engine v3"
+  heading described the behavioural baseline in terms that could be read as
+  machine learning. It is an exponentially weighted mean/variance model with an
+  explicit sigma threshold — a transparent statistical baseline, not a trained
+  one. The README now says so directly in a "What NEMOS is not" section, and
+  `CONTRIBUTING.md` makes not describing it as AI or ML a contribution rule.
+  (`detector.py` already stated this correctly in a comment; only the docs
+  overstated.)
+- Resolved a version-label contradiction: the README called the detector
+  "Detection Engine v3" while `docs/ARCHITECTURE.md` called the same component
+  "v2". Both now describe it without a version label.
+- Fixed the documented test command. `README.md`, `CONTRIBUTING.md` and
+  `docs/RELEASE.md` told users to run `python -m unittest discover`, but the
+  project uses pytest — which is what CI, the Makefile and `pyproject.toml`
+  configure.
+- Corrected the systemd instructions. The README implied a service could be set
+  up by copying two files; the packaged unit expects a `nemos` account, a venv
+  at `/opt/nemos` and `/var/lib/nemos`, all of which `install.sh` creates.
+- Rewrote the README: removed a duplicated introduction, moved the License
+  section out of the middle of the document, added status badges, an
+  architecture diagram, full configuration tables, an API table and an explicit
+  Limitations section.
+- Rewrote `docs/ARCHITECTURE.md`, which predated `notify.py` and `env.py`, and
+  `docs/RELEASE.md`, which contained stale release notes rather than a process.
+- Expanded `CONTRIBUTING.md` and `SECURITY.md`; added `CODE_OF_CONDUCT.md`,
+  issue and pull-request templates, `dependabot.yml` and `.editorconfig`.
+
 ### Removed
 - `backup_before_final_ui/` and four committed `*.pre_polish` files.
 - `FINAL_AUDIT.md`, `TEST_REPORT.md` and `TEST_REPORT_LOCAL.md`, consolidated

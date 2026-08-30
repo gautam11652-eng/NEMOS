@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest a capability for NEMOS
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        NEMOS is deliberately a local-first, defensive monitoring tool. Requests
+        that add offensive capability, evasion, or third-party targeting will be
+        declined.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve
+      description: Describe the situation you are in, not just the feature you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This is a defensive monitoring capability
+          required: true

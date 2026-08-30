@@ -1,0 +1,65 @@
+name: Bug report
+description: Something in NEMOS does not behave as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not report security vulnerabilities here — see
+        [SECURITY.md](https://github.com/gautam11652-eng/NEMOS/blob/main/SECURITY.md)
+        for private reporting.
+
+        Never paste bot tokens, API tokens, or capture data from a network you
+        do not own.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Set NEMOS_... in .env
+        2. Run python main.py
+        3. Open /api/...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: NEMOS version
+      description: From `GET /api/health`, or the commit hash.
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version and OS
+      placeholder: "Python 3.12 on Kali 2025.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: Redact addresses and identifiers you do not want public.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmations
+      options:
+        - label: I have removed all credentials and sensitive data from this report
+          required: true
+        - label: This concerns a network I own or am authorized to monitor
+          required: true

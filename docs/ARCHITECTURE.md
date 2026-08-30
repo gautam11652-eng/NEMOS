@@ -1,27 +1,159 @@
 # Architecture
 
-`main.py` owns lifecycle.
+## Design principles
 
-`capture.py` is the only packet-capture adapter. It translates Scapy packets into typed `TrafficEvent` objects.
+Two constraints shape almost every decision in this codebase.
 
-`detector.py` is pure in-memory detection state. It does not touch files or SQLite, preventing packet processing from blocking on I/O.
+**The capture path stays cheap.** A packet handler that blocks is a packet
+handler that drops traffic. Detection is pure in-memory state that never touches
+the filesystem or SQLite. Persistence and outbound delivery are both handed to
+background threads through bounded queues.
 
-`storage.py` owns the only SQLite writer thread. Events are queued and committed in batches.
+**State keyed by an attacker-influenceable value must be bounded.** A source
+address can be spoofed arbitrarily. Every map keyed by one — event buckets,
+behavioural profiles, ARP mappings, alert cooldowns, incident correlation,
+delivery cooldowns — has an explicit eviction bound, so a spoofing flood costs
+CPU rather than unbounded memory.
 
-`database.py` defines the schema, indexes and SQLite pragmas.
+## Data flow
 
-`api.py` is the single web application. `/api/dashboard` consolidates dashboard reads into one request. O(1) dashboard counters are maintained in the `telemetry_stats` singleton table and refreshed by the writer.
+```
+network interface
+      │
+      ▼
+capture.py ──────────► TrafficEvent
+      │                     │
+      │                     ├──────────────► storage.py ──► SQLite (WAL)
+      │                     │                                    │
+      ▼                     ▼                                    ▼
+detector.py ◄────► behavioral.py                            api.py
+      │                                                          │
+      ▼                                                          ▼
+   Alert ──┬──► storage.py (persist first)                  dashboard
+           └──► notify.py (deliver second, best effort)
+```
 
-`templates/index.html` is a self-contained SOC-style interface.
+## Modules
 
-The system defaults to loopback-only HTTP. A remote bind requires an API token, and configured tokens protect all API endpoints except the public health check. Production deployments should still put HTTPS/authentication/network controls in front of the application.
+| Module | Responsibility |
+| --- | --- |
+| `main.py` | Process lifecycle: configuration, startup order, signal handling, ordered shutdown |
+| `nemos/env.py` | Minimal `.env` parser; no interpolation, no substitution, existing environment wins |
+| `nemos/config.py` | Environment-derived `Settings` with range clamping and bind-safety validation |
+| `nemos/capture.py` | The only Scapy adapter. Translates packets into typed `TrafficEvent` objects and reports capture state |
+| `nemos/models.py` | `TrafficEvent` and `Alert` dataclasses — the boundary types between layers |
+| `nemos/detector.py` | Deterministic rules over bounded sliding windows; owns incident correlation |
+| `nemos/behavioral.py` | Per-source exponentially weighted baseline over four traffic features |
+| `nemos/intelligence.py` | Incident-level triage scoring and analyst recommendations |
+| `nemos/attack.py` | MITRE ATT&CK catalog and presentation-only alert enrichment |
+| `nemos/storage.py` | The single SQLite writer thread: batching, retention, backpressure |
+| `nemos/database.py` | Schema, indexes, pragmas and additive migrations |
+| `nemos/notify.py` | Outbound alert delivery to Telegram and webhooks |
+| `nemos/api.py` | The Flask application: JSON API, auth, security headers |
 
-### Detection Engine v2
+## Detection
 
-NEMOS uses deterministic rules plus a conservative per-source behavioural baseline. The baseline is an exponentially weighted moving average (EMA) of recent packets-per-second and is only eligible to alert after a minimum number of observations and a minimum burst size. This keeps the feature explainable and offline while avoiding a claim of opaque ML inference.
+Detection has two independent layers that are kept distinguishable in both the
+data model and the interface.
 
-Alerts from the same source are correlated into a bounded incident window and receive a stable `incident_id`. The dashboard and `/api/incidents` endpoint expose the correlated view without requiring a separate event-correlation service.
+### Deterministic rules
 
-### Telemetry statistics
+`detector.py` maintains a bounded deque of recent events per source. Within a
+sliding window it derives unique destination ports, unique destinations, SYN-only
+TCP packets, UDP ports, ICMP destinations and service-port hits, then applies
+explicit thresholds. Each finding carries the evidence that produced it.
 
-The SQLite writer updates aggregate telemetry counters from the rows inserted in each successful transaction. This avoids full-table `COUNT/SUM` scans on every flush. When retention pruning deletes rows, NEMOS performs a one-time recount so aggregate counters remain exact.
+A per-`(source, threat)` cooldown suppresses duplicate findings, and that
+cooldown map is itself bounded.
+
+### Statistical baseline
+
+`behavioral.py` maintains an exponentially weighted mean and variance for four
+features per source: packet rate, byte rate, unique destinations and unique
+ports.
+
+This is a statistical model, not a trained one. It is deliberately not machine
+learning, and the code says so. Every anomaly is explainable as a numeric
+deviation from that source's own observed history. Three properties keep it
+defensible:
+
+- **Fixed sampling cadence.** A rolling packet window can produce the same
+  observation hundreds of times; sampling on a cadence stops the baseline from
+  adapting to the burst it exists to catch.
+- **Per-feature noise floors.** An exponentially weighted variance can be
+  legitimately zero during a stable warm-up. Without a floor, a one-unit change
+  would produce an effectively infinite z-score.
+- **Independent corroboration.** Rate and byte rate are correlated, so the
+  strongest deviation must be supported by an independent dimension —
+  destination or port diversity — unless it is extreme.
+
+Evidence records the baseline *before* it was updated with the observation being
+judged, so the alert describes what the event was actually compared against.
+
+### Correlation and scoring
+
+Alerts from the same source within a bounded window share a stable
+`incident_id`. `intelligence.py` combines the strongest constituent alert with
+capped bonuses for independent signals — distinct threats, distinct techniques,
+critical findings and evidence count — into an incident risk score. The
+computation is deliberately arithmetic and readable rather than opaque.
+
+### ATT&CK mapping
+
+`attack.py` holds a small catalog of only those techniques the detector actually
+emits. Mapping is evidence-backed: a generic behavioural anomaly is reported as
+an unmapped signal with a stated reason rather than being assigned a technique
+the observation does not support. Technique IDs are stored on alerts; names and
+tactics live in the catalog so presentation metadata can be corrected without
+rewriting historical alerts.
+
+## Storage
+
+`storage.py` owns the only writer. Callers submit to a bounded queue and the
+worker commits in batches.
+
+- **Priority-aware backpressure.** Alerts get a reserved portion of the queue and
+  a short blocking window, so a packet flood cannot starve security findings.
+  Traffic is lossy under sustained overload by design; capture must not block.
+- **Incremental counters.** Telemetry totals and per-host summaries are updated
+  from the rows in each committed transaction rather than recomputed, keeping
+  dashboard reads O(1) instead of full-table scans.
+- **Retention.** Traffic and alert tables are pruned to configured row limits,
+  with counter deltas applied from the pruned rows and per-host risk fields
+  repaired only for hosts whose maxima may have changed.
+- **Lock handling.** Batches retry with backoff on SQLite lock contention;
+  a failed batch is counted, never silently dropped.
+
+## Delivery
+
+`notify.py` runs a worker thread behind a bounded queue. Ordering matters:
+`main.py` persists an alert before submitting it for delivery, so an unreachable
+channel cannot cost a recorded detection.
+
+Outbound volume is bounded by a severity floor, a per-finding cooldown and a
+global token bucket — a port scan must not turn the sensor into an amplifier.
+Suppressed alerts remain stored and visible; only the outbound copy is dropped,
+and each suppression is counted.
+
+Webhook URLs must be HTTPS unless loopback, and redirects are refused rather
+than followed. The Telegram bot token travels in the request URL, so it is
+redacted from every log line, error string and API response.
+
+## Web layer
+
+`api.py` is the single web application. `/api/dashboard` consolidates what the
+interface needs into one request, guarded by an ETag derived from the telemetry
+revision plus capture state, so a sensor failure invalidates the cache even when
+stored telemetry has not changed.
+
+Defaults are loopback-only. A non-loopback bind requires an API token; a
+wildcard bind additionally requires an explicit trusted-host list. Mutating
+endpoints reject cross-site browser writes even when no token is configured.
+Production deployments should still place HTTPS and network controls in front of
+the application.
+
+## Shutdown
+
+`main.py` closes the HTTP server, stops capture, drains delivery, then drains the
+writer — in that order, so nothing still producing alerts outlives the machinery
+that stores them.

@@ -1,0 +1,52 @@
+name: Detection quality
+description: A false positive, a false negative, or a threshold that needs tuning
+labels: ["detection"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Detection tuning is a tradeoff rather than a straightforward fix, so the
+        more concrete detail you can give about the traffic, the more useful
+        this is. A false positive with its evidence attached is a genuinely
+        valuable report.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type
+      options:
+        - False positive (alerted on benign traffic)
+        - False negative (missed something it should have caught)
+        - Threshold or score seems wrong
+    validations:
+      required: true
+
+  - type: input
+    id: detection
+    attributes:
+      label: Detection name
+      placeholder: "PORT_SCAN, BEHAVIORAL_TRAFFIC_ANOMALY, ..."
+
+  - type: textarea
+    id: traffic
+    attributes:
+      label: Traffic pattern
+      description: What was actually happening on the network? Redact real addresses.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Alert evidence
+      description: >
+        The `evidence` object from `GET /api/alerts/<id>`, with addresses
+        redacted. This is the most useful part of the report.
+      render: json
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened
+    validations:
+      required: true

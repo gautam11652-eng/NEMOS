@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/gautam11652-eng/NEMOS/security/advisories/new
+    about: Report privately. Do not open a public issue for a vulnerability.
+  - name: Documentation
+    url: https://github.com/gautam11652-eng/NEMOS#readme
+    about: Configuration, deployment and detection behaviour are documented here.
