@@ -85,7 +85,7 @@ jobs:
           print(f"packaged version {expected} confirmed in {names}")
           PY
       - name: Upload distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: NEMOS-dist
           path: dist/*
