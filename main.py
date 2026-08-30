@@ -10,7 +10,9 @@ from nemos.capture import PacketCapture
 from nemos.config import load_settings
 from nemos.database import initialize
 from nemos.detector import DetectionConfig, ThreatDetector
+from nemos.env import load_dotenv
 from nemos.models import TrafficEvent
+from nemos.notify import AlertNotifier, NotifierConfig
 from nemos.storage import BatchWriter
 
 
@@ -24,12 +26,24 @@ def main() -> int:
     # than the caller's working directory. This keeps manual launches and the
     # systemd service consistent; NEMOS_DB still overrides the database path.
     app_dir = Path(__file__).resolve().parent
+    # A local .env is a documented convenience for operators. Real environment
+    # variables always win, so a systemd unit or an explicit export is never
+    # overridden by a stale file on disk. This must happen before settings are
+    # read, which means it happens before logging is configured -- so report
+    # what was applied once handlers exist.
+    dotenv_applied = load_dotenv(app_dir / ".env")
     settings = load_settings(app_dir)
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     log = logging.getLogger("NEMOS")
+    if dotenv_applied:
+        # Names only. These values are secrets by design.
+        log.info(
+            "loaded %d setting(s) from .env: %s",
+            len(dotenv_applied), ", ".join(sorted(dotenv_applied)),
+        )
 
     initialize(settings.db_path)
     writer = BatchWriter(
@@ -42,6 +56,17 @@ def main() -> int:
     writer.start()
 
     detector = ThreatDetector(DetectionConfig.from_env())
+    notifier = AlertNotifier(NotifierConfig.from_env())
+    notifier.start()
+
+    def record(alert) -> None:
+        """Persist a finding, then hand it to alert delivery.
+
+        Storage comes first and delivery is best-effort: an unreachable chat
+        API must never cost the sensor a recorded detection.
+        """
+        writer.submit_alert(alert)
+        notifier.submit(alert.as_dict())
 
     def event(event: TrafficEvent, packet_type: str) -> None:
         writer.submit_traffic(event)
@@ -53,14 +78,14 @@ def main() -> int:
                 alert.risk_score,
                 alert.severity,
             )
-            writer.submit_alert(alert)
+            record(alert)
         if packet_type == "ARP" and event.metadata:
             alert = detector.observe_arp(
                 event.source,
                 str(event.metadata.get("mac", "")),
             )
             if alert:
-                writer.submit_alert(alert)
+                record(alert)
 
     capture = PacketCapture(settings.interface, event) if settings.capture_enabled else None
     server = None
@@ -93,7 +118,7 @@ def main() -> int:
         else:
             log.info("capture disabled")
 
-        app = create_app(settings, writer, capture)
+        app = create_app(settings, writer, capture, notifier)
 
         try:
             from waitress import create_server
@@ -130,6 +155,10 @@ def main() -> int:
                 capture.stop(timeout=5)
             except Exception:
                 log.exception("failed to stop packet capture")
+        try:
+            notifier.shutdown(timeout=5)
+        except Exception:
+            log.exception("failed to stop alert delivery")
         try:
             writer.shutdown(timeout=10)
         except Exception:

@@ -14,6 +14,7 @@ NEMOS is an open-source, defensive network monitoring and intrusion-detection pl
 - MITRE ATT&CK technique references where the mapping is meaningful
 - SQLite WAL + single batched writer thread
 - Security headers, request-size limits and token-protected API operations (health remains public)
+- Optional outbound alerting to Telegram or a webhook, with a severity floor, per-finding cooldown and rate limiting so a scan cannot become a message flood
 - Loopback-only default
 - Responsive SOC dashboard with a clean light workspace and dark navigation sidebar with one consolidated polling request and guarded 10-second polling
 - Tests and a clean source-only distribution; no virtual environment or runtime database is committed
@@ -69,12 +70,30 @@ python -m compileall -q nemos main.py
 - `GET /api/health`
 - `GET /api/dashboard`
 - `GET /api/stats`
-- `GET /api/alerts`
+- `GET /api/alerts` — supports filtering, see below
+- `GET /api/alerts/<id>`
+- `GET /api/incidents`, `GET /api/incidents/<incident_id>`
+- `GET /api/hosts`, `GET /api/hosts/<ip>`
+- `GET /api/techniques`
 - `GET /api/traffic`
-- `GET /api/status` — capture and writer health
+- `GET /api/status` — capture, writer and delivery health
+- `GET /api/metrics` — writer and delivery metrics
+- `GET /api/notifications` — alert-delivery configuration and health
 - `POST /api/packet` — compatibility/test ingestion endpoint
 - `POST /api/alerts/<id>/ack` — acknowledge an alert
 - `POST /api/alerts/clear` — clear alerts
+
+### Filtering alerts
+
+`GET /api/alerts` accepts `severity` (repeatable), `source`, `threat`,
+`technique`, `acknowledged`, `since` and `limit`:
+
+```bash
+curl 'http://127.0.0.1:5000/api/alerts?severity=CRITICAL&severity=HIGH&acknowledged=false'
+curl 'http://127.0.0.1:5000/api/alerts?source=192.0.2.10&since=2026-01-01'
+```
+
+Every filter is validated and passed as a bound parameter.
 
 When `NEMOS_API_TOKEN` is configured, every `/api/*` endpoint except `/api/health` requires `X-NEMOS-Token`. The dashboard prompts for the token and keeps it only in the current browser session storage.
 
@@ -98,26 +117,61 @@ NEMOS combines bounded, deterministic network rules with an explainable per-sour
 
 Use `python tools/validate_detection.py` for a safe offline demonstration using synthetic documentation-address telemetry. See `docs/SIH_DEMO.md`, `docs/DEMO_SCRIPT.md` and `docs/SIH_SLIDE_OUTLINE.md`.
 
-## Telegram Alerts
+## Alert delivery
 
-NEMOS can send security alerts and notifications through Telegram.
+By default NEMOS records findings locally and shows them on the dashboard. It can
+also push them to Telegram or a webhook. Delivery is off until you configure a
+channel, and it never blocks packet capture: storage always happens first, so an
+unreachable channel cannot cost you a recorded detection.
 
-### Setup
+NEMOS reads a `.env` file next to `main.py` at startup. Real environment
+variables take precedence, so a systemd unit or an explicit `export` is never
+overridden by a stale file.
 
-Each user/deployment must use their own Telegram bot and credentials.
+### Telegram
+
+Each deployment uses its own bot and credentials.
 
 1. Open Telegram and start a chat with **@BotFather**.
-2. Create a new bot using `/newbot`.
-3. Copy the bot token provided by BotFather.
-4. Send a message to your new bot.
-5. Obtain your Telegram chat ID.
-6. Add the following values to your local `.env` file:
+2. Create a bot with `/newbot` and copy the token it gives you.
+3. Send a message to your new bot, then obtain your chat ID.
+4. Add both values to your local `.env`:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 ```
 
-Keep these credentials private. Do not commit your `.env` file or bot token to Git.
+Keep these private. Do not commit `.env` or the bot token to Git — `.gitignore`
+already excludes it.
 
-After configuration, NEMOS can use the Telegram integration to deliver security alerts and notifications to the configured chat.
+### Webhook
+
+```env
+NEMOS_WEBHOOK_URL=https://your-collector.example/hook
+NEMOS_WEBHOOK_TOKEN=optional_bearer_token
+```
+
+The URL must be HTTPS unless it points at a loopback address: alert bodies
+describe your network and are not sent in cleartext to a remote host. Redirects
+are refused rather than followed.
+
+### Tuning what gets sent
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NEMOS_NOTIFY` | `true` | Master switch for outbound delivery |
+| `NEMOS_NOTIFY_MIN_SEVERITY` | `HIGH` | Floor: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` |
+| `NEMOS_NOTIFY_COOLDOWN` | `300` | Seconds before the same finding from the same source is sent again |
+| `NEMOS_NOTIFY_RATE` | `12` | Maximum messages per minute across all findings |
+| `NEMOS_NOTIFY_TIMEOUT` | `5.0` | Per-request timeout in seconds |
+| `NEMOS_NOTIFY_QUEUE` | `256` | Pending-delivery queue size |
+
+The cooldown and rate limit exist so that a port scan cannot turn your sensor
+into a message flood. Suppressed alerts are still recorded and still appear on
+the dashboard; only the outbound copy is dropped, and every suppression is
+counted in `/api/notifications`.
+
+Delivery health — sent, failed, suppressed, last error — is visible on the
+dashboard and at `GET /api/notifications`. No endpoint ever returns the bot
+token, and it is redacted from logs and error messages.

@@ -177,9 +177,9 @@ class BatchWriter:
             try:
                 self.q.put_nowait(None)
                 break
-            except queue.Full:
+            except queue.Full as exc:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("SQLite writer queue did not drain")
+                    raise TimeoutError("SQLite writer queue did not drain") from exc
                 time.sleep(0.01)
 
         remaining = max(0.0, deadline - time.monotonic())
@@ -227,6 +227,10 @@ class BatchWriter:
                             pending = []
                     if pending:
                         self._flush(c, pending)
+                        # Clear before breaking: the `finally` clause below
+                        # flushes whatever is still pending, so leaving these
+                        # items in place would write the final batch twice.
+                        pending = []
                     break
 
                 pending.append(item)

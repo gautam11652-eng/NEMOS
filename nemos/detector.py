@@ -5,7 +5,7 @@ import os
 import time
 import uuid
 from math import isfinite
-from collections import OrderedDict, defaultdict, deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,7 +38,7 @@ class DetectionConfig:
     min_confidence: int = 55
 
     @classmethod
-    def from_env(cls) -> "DetectionConfig":
+    def from_env(cls) -> DetectionConfig:
         defaults = cls()
 
         def integer(name: str, default: int, lo: int, hi: int) -> int:

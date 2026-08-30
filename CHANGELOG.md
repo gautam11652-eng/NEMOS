@@ -1,5 +1,57 @@
 # Changelog
 
+## 3.3.0
+
+### Added
+- **Outbound alert delivery.** Telegram and generic-webhook channels now actually
+  send findings. Previously the Telegram integration was documented and shown in
+  the dashboard but had no delivery code path at all: `/api/telegram` only
+  reported whether the credentials were set, and no alert was ever sent anywhere.
+  Delivery runs on a worker thread and never blocks packet capture; storage
+  happens first, so an unreachable channel cannot cost a recorded detection.
+- Severity floor, per-finding cooldown and a global token-bucket rate limit, so a
+  port scan cannot turn the sensor into a message flood. Suppressed alerts remain
+  recorded and every suppression is counted.
+- `.env` loading. The README and `.env.example` had instructed users to create a
+  `.env` file, but nothing in the codebase ever read one, so file-based settings
+  were silently ignored. Real environment variables still take precedence.
+- `GET /api/notifications` and delivery metrics on `/api/status` and
+  `/api/metrics`, so operators can tell "credentials present" from "alerts are
+  actually arriving".
+- Filtering on `GET /api/alerts`: `severity` (repeatable), `source`, `threat`,
+  `technique`, `acknowledged` and `since`, all bound as parameters.
+- Ruff lint configuration and a CI lint job; CI now also verifies that built
+  artifacts carry the version from `nemos/version.py`.
+
+### Fixed
+- **Duplicate writes on shutdown.** The SQLite writer's sentinel-drain path
+  flushed the final partial batch and then fell through to a `finally` clause
+  that flushed the same still-populated list again. Any traffic and alerts
+  pending at shutdown were written twice, and the cached telemetry counters were
+  incremented twice with them. This hit every clean shutdown where the last
+  batch had not already been flushed by the timeout path -- the common case for
+  a busy sensor being stopped. Covered by a regression test.
+- The dashboard's writer-queue health tile read `queue_size` from the dashboard
+  payload, but the metric is named `queue_depth` and `/api/dashboard` never
+  returned writer metrics at all, so the tile was permanently blank. It now reads
+  live depth and capacity from `/api/status`.
+- `TimeoutError` raised during writer shutdown lost its originating exception.
+
+### Changed
+- Packaging version is single-sourced from `nemos/version.py` via
+  `dynamic = ["version"]`; it was previously duplicated by hand in
+  `pyproject.toml` and could drift from the version `/api/health` reports.
+- `/api/alerts` and `/api/traffic` select explicit columns instead of `SELECT *`.
+- Telegram alert text is sent with no Markdown/HTML parse mode, so alert content
+  cannot break rendering or inject formatting.
+- Webhook URLs must be HTTPS unless loopback, and HTTP redirects are refused
+  rather than followed.
+
+### Removed
+- `backup_before_final_ui/` and four committed `*.pre_polish` files.
+- `FINAL_AUDIT.md`, `TEST_REPORT.md` and `TEST_REPORT_LOCAL.md`, consolidated
+  into a single current `AUDIT_REPORT.md`.
+
 ## 3.2.7
 
 - Optimized SQLite retention maintenance to avoid full-table telemetry and host-stat recounts after every prune.
