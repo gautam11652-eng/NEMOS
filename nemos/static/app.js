@@ -120,7 +120,10 @@ const setToken = (v) => { try { v ? localStorage.setItem(tokenKey, v) : localSto
 async function api(path) {
   const headers = {};
   const token = getToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
+  // X-NEMOS-Token is the header the API documents and checks. Sending only
+  // Authorization: Bearer meant the dashboard could never authenticate against
+  // a token-protected sensor.
+  if (token) headers["X-NEMOS-Token"] = token;
   const response = await fetch(path, { headers, cache: "no-store" });
   if (response.status === 401) { $("authbar").hidden = false; throw new Error("unauthorized"); }
   // A disabled subsystem answers 503. That is a state to render, not a failure

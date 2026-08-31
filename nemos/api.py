@@ -189,9 +189,25 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
         return state
 
     def auth() -> bool:
+        """Accept the NEMOS header or a standard bearer token.
+
+        X-NEMOS-Token is the documented form. Authorization: Bearer is accepted
+        too because it is what scripts, curl and HTTP clients reach for by
+        default, and rejecting it produced a 401 that looked like a wrong
+        credential rather than a wrong header name.
+
+        Both comparisons are constant-time. Note that compare_digest is only
+        constant-time over equal-length inputs, which is unavoidable here and
+        leaks length, not content.
+        """
         if not token:
             return True
         supplied = request.headers.get("X-NEMOS-Token", "")
+        if not supplied:
+            header = request.headers.get("Authorization", "")
+            scheme, _, value = header.partition(" ")
+            if scheme.lower() == "bearer":
+                supplied = value.strip()
         return hmac.compare_digest(supplied, token)
 
     def same_origin_state_change() -> bool:
