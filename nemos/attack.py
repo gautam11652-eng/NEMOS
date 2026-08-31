@@ -20,9 +20,12 @@ class AttackTechnique:
     url: str
 
 
-# Only techniques actually emitted by the detector are included.  Keep this
-# catalog conservative: a generic anomaly is not automatically an ATT&CK
-# technique merely because it is suspicious.
+# Only techniques the detector actually emits are included, plus any it emitted
+# in an earlier release (marked below) so stored alerts keep their names. Keep
+# this catalog conservative: a generic anomaly is not automatically an ATT&CK
+# technique merely because it is suspicious. Adding an aspirational entry here
+# would misrepresent what NEMOS can evidence.
+LEGACY_TECHNIQUES = frozenset({"T1110"})
 TECHNIQUES: dict[str, AttackTechnique] = {
     "T1046": AttackTechnique(
         "T1046",
@@ -31,12 +34,61 @@ TECHNIQUES: dict[str, AttackTechnique] = {
         "Identifying services running on remote hosts through port or service scanning.",
         "https://attack.mitre.org/techniques/T1046/",
     ),
+    "T1018": AttackTechnique(
+        "T1018",
+        "Remote System Discovery",
+        "Discovery",
+        "Enumerating other hosts on the network by address, sweep or broadcast.",
+        "https://attack.mitre.org/techniques/T1018/",
+    ),
     "T1021": AttackTechnique(
         "T1021",
         "Remote Services",
         "Lateral Movement",
         "Using valid accounts over remote services such as SMB, RDP or SSH to move between hosts.",
         "https://attack.mitre.org/techniques/T1021/",
+    ),
+    "T1021.001": AttackTechnique(
+        "T1021.001",
+        "Remote Services: Remote Desktop Protocol",
+        "Lateral Movement",
+        "Moving between hosts over RDP using valid accounts.",
+        "https://attack.mitre.org/techniques/T1021/001/",
+    ),
+    "T1021.002": AttackTechnique(
+        "T1021.002",
+        "Remote Services: SMB / Windows Admin Shares",
+        "Lateral Movement",
+        "Moving between hosts over SMB administrative shares using valid accounts.",
+        "https://attack.mitre.org/techniques/T1021/002/",
+    ),
+    "T1021.004": AttackTechnique(
+        "T1021.004",
+        "Remote Services: SSH",
+        "Lateral Movement",
+        "Moving between hosts over SSH using valid accounts or keys.",
+        "https://attack.mitre.org/techniques/T1021/004/",
+    ),
+    "T1021.005": AttackTechnique(
+        "T1021.005",
+        "Remote Services: VNC",
+        "Lateral Movement",
+        "Moving between hosts over VNC using valid credentials.",
+        "https://attack.mitre.org/techniques/T1021/005/",
+    ),
+    "T1021.006": AttackTechnique(
+        "T1021.006",
+        "Remote Services: Windows Remote Management",
+        "Lateral Movement",
+        "Moving between hosts over WinRM using valid accounts.",
+        "https://attack.mitre.org/techniques/T1021/006/",
+    ),
+    "T1041": AttackTechnique(
+        "T1041",
+        "Exfiltration Over C2 Channel",
+        "Exfiltration",
+        "Sending collected data out over the same channel the implant uses for command and control.",
+        "https://attack.mitre.org/techniques/T1041/",
     ),
     "T1048": AttackTechnique(
         "T1048",
@@ -59,6 +111,20 @@ TECHNIQUES: dict[str, AttackTechnique] = {
         "Using DNS as an application-layer communication protocol.",
         "https://attack.mitre.org/techniques/T1071/004/",
     ),
+    "T1095": AttackTechnique(
+        "T1095",
+        "Non-Application Layer Protocol",
+        "Command and Control",
+        "Using a non-application-layer protocol such as ICMP to carry command-and-control traffic.",
+        "https://attack.mitre.org/techniques/T1095/",
+    ),
+    "T1105": AttackTechnique(
+        "T1105",
+        "Ingress Tool Transfer",
+        "Command and Control",
+        "Transferring tools or files from an external system into the target network.",
+        "https://attack.mitre.org/techniques/T1105/",
+    ),
     "T1090.003": AttackTechnique(
         "T1090.003",
         "Proxy: Multi-hop Proxy",
@@ -66,12 +132,29 @@ TECHNIQUES: dict[str, AttackTechnique] = {
         "Routing traffic through a multi-hop proxy network such as Tor to obscure its destination.",
         "https://attack.mitre.org/techniques/T1090/003/",
     ),
+    # Retained for alerts stored by 4.0/4.1, which emitted the parent before
+    # the guessing/spraying sub-techniques existed. The detector no longer
+    # emits it; removing it would leave those historical alerts unnamed.
     "T1110": AttackTechnique(
         "T1110",
         "Brute Force",
         "Credential Access",
         "Repeatedly attempting authentication against a service to guess valid credentials.",
         "https://attack.mitre.org/techniques/T1110/",
+    ),
+    "T1110.001": AttackTechnique(
+        "T1110.001",
+        "Brute Force: Password Guessing",
+        "Credential Access",
+        "Repeatedly guessing passwords against one account or service without prior knowledge.",
+        "https://attack.mitre.org/techniques/T1110/001/",
+    ),
+    "T1110.003": AttackTechnique(
+        "T1110.003",
+        "Brute Force: Password Spraying",
+        "Credential Access",
+        "Trying a small number of common passwords across many accounts to avoid lockout.",
+        "https://attack.mitre.org/techniques/T1110/003/",
     ),
     "T1496": AttackTechnique(
         "T1496",
@@ -93,6 +176,34 @@ TECHNIQUES: dict[str, AttackTechnique] = {
         "Impact",
         "Generating high-volume network traffic directly against a target.",
         "https://attack.mitre.org/techniques/T1498/001/",
+    ),
+    "T1498.002": AttackTechnique(
+        "T1498.002",
+        "Network Denial of Service: Reflection Amplification",
+        "Impact",
+        "Using an amplifiable third-party service to direct magnified traffic at a victim.",
+        "https://attack.mitre.org/techniques/T1498/002/",
+    ),
+    "T1499": AttackTechnique(
+        "T1499",
+        "Endpoint Denial of Service",
+        "Impact",
+        "Exhausting the resources of a specific service or host rather than the network link.",
+        "https://attack.mitre.org/techniques/T1499/",
+    ),
+    "T1571": AttackTechnique(
+        "T1571",
+        "Non-Standard Port",
+        "Command and Control",
+        "Communicating over a port that does not match the expected service, to evade filtering.",
+        "https://attack.mitre.org/techniques/T1571/",
+    ),
+    "T1595": AttackTechnique(
+        "T1595",
+        "Active Scanning",
+        "Reconnaissance",
+        "Probing a target's infrastructure from outside before compromise.",
+        "https://attack.mitre.org/techniques/T1595/",
     ),
     "T1557.002": AttackTechnique(
         "T1557.002",

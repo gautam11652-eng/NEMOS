@@ -59,7 +59,9 @@ class DetectorV3Tests(unittest.TestCase):
         for i in range(12):
             alerts += d.process(TrafficEvent("x", "10.0.0.8", f"10.0.1.{i+1}", "ICMP", packet_size=64))
         alert = next(a for a in alerts if a.threat == "ICMP_SWEEP")
-        self.assertEqual(alert.technique, "T1046")
+        # A sweep enumerates hosts, so Remote System Discovery describes it
+        # more accurately than Network Service Discovery.
+        self.assertEqual(alert.technique, "T1018")
         self.assertEqual(alert.evidence["scan_type"], "icmp_sweep")
 
     def test_behavior_anomaly_has_no_false_attack_mapping(self):

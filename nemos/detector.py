@@ -33,6 +33,15 @@ class DetectionConfig:
     dns_tunnel_mean_size: int = 180
     mining_packets: int = 10
     tor_packets: int = 10
+    spray_hosts: int = 8
+    spray_max_attempts: int = 6
+    icmp_tunnel_packets: int = 12
+    icmp_tunnel_mean_size: int = 200
+    service_dos: int = 120
+    amplification_packets: int = 60
+    ingress_bytes: int = 25_000_000
+    nonstandard_packets: int = 40
+    nonstandard_min_port: int = 10_000
     # Beaconing is periodicity, which a 10s window cannot see. These govern a
     # separate per-pair timing history with its own horizon.
     beacon_min_intervals: int = 5
@@ -79,6 +88,20 @@ class DetectionConfig:
         )
 
 
+def _amplification(bucket: list[dict[str, Any]]) -> dict[tuple[str, int], int]:
+    """Count packets per (destination, amplifiable source port).
+
+    Kept at module scope so the rule body stays readable; the port set lives on
+    the class because it is part of the detector's published configuration.
+    """
+    counts: dict[tuple[str, int], int] = {}
+    for x in bucket:
+        sport = x.get("sport")
+        if sport in ThreatDetector.AMPLIFIER_PORTS and x["proto"] in {"UDP", "DNS"}:
+            counts[(x["dst"], sport)] = counts.get((x["dst"], sport), 0) + 1
+    return counts
+
+
 class ThreatDetector:
     """Bounded, explainable network-behaviour detector.
 
@@ -110,6 +133,23 @@ class ThreatDetector:
 
     # Default Tor OR/dir/SOCKS ports. Same caveat as mining: heuristic.
     TOR_PORTS = {9001, 9030, 9050, 9051, 9150}
+
+    # Remote-administration ports mapped to the ATT&CK sub-technique for that
+    # service. The port is observed directly, so naming the sub-technique is
+    # evidence-backed rather than a guess about what the traffic carried.
+    REMOTE_SERVICE_TECHNIQUES = {
+        3389: "T1021.001",   # Remote Desktop Protocol
+        445: "T1021.002",    # SMB / Windows Admin Shares
+        22: "T1021.004",     # SSH
+        5900: "T1021.005",   # VNC
+        5985: "T1021.006",   # Windows Remote Management
+        5986: "T1021.006",
+    }
+
+    # Services routinely abused for reflection/amplification floods. Seen as a
+    # *source* port in high volume toward one destination, this is the sensor
+    # observing the reflected leg of an amplification attack.
+    AMPLIFIER_PORTS = {19, 53, 123, 161, 389, 1900, 5353, 11211}
 
     # Periodic by design. Excluded from beacon analysis because NTP sync, DNS
     # refresh and DHCP renewal are textbook low-jitter timers -- flagging them
@@ -146,6 +186,9 @@ class ThreatDetector:
         # influences -- so it is bounded and evicted least-recently-used like
         # every other map in this class.
         self.contacts: OrderedDict[tuple[str, str, int | None], deque[float]] = OrderedDict()
+        # Destinations already judged to be beacon targets for a source.
+        # Bounded for the same reason as every other attacker-keyed map.
+        self.beacon_targets: OrderedDict[tuple[str, str], float] = OrderedDict()
         self.internal_networks = self._parse_networks(
             os.getenv("NEMOS_INTERNAL_NETWORKS", "")
         ) or [ipaddress.ip_network(n) for n in self.DEFAULT_INTERNAL_NETWORKS]
@@ -186,6 +229,7 @@ class ThreatDetector:
             "t": now,
             "dst": e.destination,
             "port": e.destination_port,
+            "sport": e.source_port,
             "proto": e.protocol.upper(),
             "flags": e.flags,
             "type": ptype.upper(),
@@ -229,16 +273,22 @@ class ThreatDetector:
         # confidence because a SYN-only burst is a stronger scan indicator.
         if len(ports) >= self.cfg.port_scan:
             syn_ratio = len(tcp_syn) / max(1, len(bucket))
+            # ATT&CK separates pre-compromise scanning from the inside from
+            # post-compromise service discovery. The source address decides
+            # which one the evidence actually supports.
+            external = not self._private(e.source)
+            scan_technique = "T1595" if external else "T1046"
             scan_score = min(96, 50 + len(ports) * 3 + (15 if syn_ratio >= 0.5 else 0))
             scan_conf = min(99, 58 + len(ports) * 3 + (18 if syn_ratio >= 0.5 else 0))
             add(
                 "PORT_SCAN", "NETWORK_RECONNAISSANCE", scan_score,
                 f"{len(ports)} unique destination ports in {self.cfg.window}s",
-                "T1046", confidence=scan_conf,
+                scan_technique, confidence=scan_conf,
                 ports_scanned=len(ports), packets=len(bucket),
                 destinations=len(destinations), ports=len(ports),
                 evidence={
                     "scan_type": "vertical",
+                    "source_position": "external" if external else "internal",
                     "ports": sorted(ports)[:100],
                     "syn_packets": len(tcp_syn),
                     "syn_ratio": round(syn_ratio, 3),
@@ -275,7 +325,7 @@ class ThreatDetector:
             add(
                 "NETWORK_FANOUT", "NETWORK_DISCOVERY", 70,
                 f"{len(destinations)} unique destinations in {self.cfg.window}s",
-                "T1046", confidence=min(95, 60 + len(destinations)),
+                "T1018", confidence=min(95, 60 + len(destinations)),
                 packets=len(bucket), destinations=len(destinations), ports=len(ports),
                 evidence={"unique_destinations": len(destinations)},
             )
@@ -285,7 +335,7 @@ class ThreatDetector:
                 "ICMP_SWEEP", "NETWORK_RECONNAISSANCE",
                 min(88, 56 + len(icmp_destinations) * 2),
                 f"ICMP traffic targeted {len(icmp_destinations)} destinations in {self.cfg.window}s",
-                "T1046", confidence=min(95, 62 + len(icmp_destinations) * 2),
+                "T1018", confidence=min(95, 62 + len(icmp_destinations) * 2),
                 packets=icmp_count, destinations=len(icmp_destinations),
                 evidence={"scan_type": "icmp_sweep", "destinations": sorted(icmp_destinations)[:100]},
             )
@@ -371,21 +421,31 @@ class ThreatDetector:
                 and self._private(x["dst"]) and x["dst"] != e.source
             }
             if len(lateral_targets) >= self.cfg.lateral_hosts:
-                lateral_ports = sorted({
-                    x["port"] for x in bucket
-                    if x["port"] in self.ADMIN_PORTS and self._private(x["dst"])
-                })
+                admin_hits: dict[int, int] = {}
+                for x in bucket:
+                    if x["port"] in self.ADMIN_PORTS and self._private(x["dst"]):
+                        admin_hits[x["port"]] = admin_hits.get(x["port"], 0) + 1
+                lateral_ports = sorted(admin_hits)
+                # The dominant service names the sub-technique. Falling back to
+                # the parent when no port dominates keeps the claim honest.
+                dominant = max(admin_hits, key=lambda k: admin_hits[k]) if admin_hits else None
+                lateral_technique = self.REMOTE_SERVICE_TECHNIQUES.get(dominant, "T1021")
                 add(
                     "LATERAL_MOVEMENT", "LATERAL_MOVEMENT",
                     min(93, 62 + len(lateral_targets) * 4),
                     f"internal host contacted {len(lateral_targets)} internal hosts "
                     f"on remote-administration ports in {self.cfg.window}s",
-                    "T1021", confidence=min(96, 66 + len(lateral_targets) * 4),
+                    lateral_technique, confidence=min(96, 66 + len(lateral_targets) * 4),
                     packets=len(bucket), destinations=len(lateral_targets),
                     ports=len(lateral_ports),
                     evidence={
                         "internal_targets": sorted(lateral_targets)[:50],
                         "admin_ports": lateral_ports,
+                        "dominant_port": dominant,
+                        "service": {
+                            3389: "RDP", 445: "SMB", 22: "SSH",
+                            5900: "VNC", 5985: "WinRM", 5986: "WinRM",
+                        }.get(dominant, "unknown"),
                     },
                 )
 
@@ -404,7 +464,7 @@ class ThreatDetector:
                     "CREDENTIAL_BRUTE_FORCE", "CREDENTIAL_ACCESS",
                     min(91, 60 + count // 2),
                     f"{count} connection attempts to {dst}:{port} in {self.cfg.window}s",
-                    "T1110", confidence=min(95, 64 + count // 2),
+                    "T1110.001", confidence=min(95, 64 + count // 2),
                     packets=count, destinations=1, ports=1,
                     evidence={
                         "target": dst,
@@ -425,20 +485,28 @@ class ThreatDetector:
                 volumes[x["dst"]] = volumes.get(x["dst"], 0) + x["size"]
         for dst, total in volumes.items():
             if total >= self.cfg.exfil_bytes:
+                # If this destination was already judged a beacon target, the
+                # transfer is leaving over the channel the implant established.
+                over_c2 = (e.source, dst) in self.beacon_targets
                 add(
-                    "DATA_EXFILTRATION_VOLUME", "EXFILTRATION",
+                    "DATA_EXFILTRATION_OVER_C2" if over_c2 else "DATA_EXFILTRATION_VOLUME",
+                    "EXFILTRATION",
                     min(90, 62 + int(total / max(1, self.cfg.exfil_bytes)) * 5),
                     f"{total / 1_000_000:.1f} MB sent to external host {dst} "
                     f"in {self.cfg.window}s",
-                    "T1048", confidence=78,
+                    "T1041" if over_c2 else "T1048",
+                    confidence=88 if over_c2 else 78,
                     packets=sum(1 for x in bucket if x["dst"] == dst),
                     destinations=1,
                     evidence={
                         "destination": dst,
                         "bytes": total,
                         "threshold_bytes": self.cfg.exfil_bytes,
-                        "note": "volume only; a legitimate backup or upload "
-                                "has the same shape",
+                        "over_beacon_channel": over_c2,
+                        "note": ("bulk transfer to a host this source was already "
+                                 "beaconing to" if over_c2 else
+                                 "volume only; a legitimate backup or upload "
+                                 "has the same shape"),
                     },
                 )
 
@@ -498,6 +566,12 @@ class ThreatDetector:
         # lives on a longer horizon than the detection window.
         beacon = self._record_contact(bucket[-1], e.source, now)
         if beacon:
+            key = (e.source, beacon["destination"])
+            if key in self.beacon_targets:
+                self.beacon_targets.move_to_end(key)
+            elif len(self.beacon_targets) >= self.cfg.max_sources * 4:
+                self.beacon_targets.popitem(last=False)
+            self.beacon_targets[key] = now
             add(
                 "C2_BEACONING", "COMMAND_AND_CONTROL",
                 min(89, 66 + int((1 - beacon["jitter_ratio"] /
@@ -508,6 +582,151 @@ class ThreatDetector:
                 packets=beacon["contacts"], destinations=1,
                 evidence=beacon,
             )
+
+        # --- Password spraying -------------------------------------------------
+        # The inverse shape of brute force: few attempts each, across many
+        # hosts, on one service. Counting per target (as brute force does)
+        # never sees it, which is why it needs its own rule.
+        by_service: dict[int, dict[str, int]] = {}
+        for x in bucket:
+            if x["proto"] == "TCP" and x["port"] in self.AUTH_PORTS:
+                by_service.setdefault(x["port"], {})
+                by_service[x["port"]][x["dst"]] = by_service[x["port"]].get(x["dst"], 0) + 1
+        for port, targets in by_service.items():
+            spread = len(targets)
+            heaviest = max(targets.values(), default=0)
+            if spread >= self.cfg.spray_hosts and heaviest <= self.cfg.spray_max_attempts:
+                add(
+                    "PASSWORD_SPRAYING", "CREDENTIAL_ACCESS",
+                    min(90, 62 + spread * 2),
+                    f"{spread} hosts probed on port {port} with at most "
+                    f"{heaviest} attempts each in {self.cfg.window}s",
+                    "T1110.003", confidence=min(94, 66 + spread * 2),
+                    packets=sum(targets.values()), destinations=spread, ports=1,
+                    evidence={
+                        "service_port": port,
+                        "hosts_targeted": spread,
+                        "max_attempts_per_host": heaviest,
+                        "note": "low attempts per host across many hosts is the "
+                                "shape that evades per-account lockout",
+                    },
+                )
+
+        # --- ICMP tunneling ----------------------------------------------------
+        # Echo payloads are small and fixed by the OS. A sustained stream of
+        # large ones is carrying something the protocol was not meant to carry.
+        icmp_packets = [x for x in bucket if x["proto"] == "ICMP"]
+        if len(icmp_packets) >= self.cfg.icmp_tunnel_packets:
+            mean_icmp = sum(x["size"] for x in icmp_packets) / len(icmp_packets)
+            if mean_icmp >= self.cfg.icmp_tunnel_mean_size:
+                add(
+                    "ICMP_TUNNELING_PATTERN", "COMMAND_AND_CONTROL",
+                    min(88, 64 + int(mean_icmp // 100)),
+                    f"{len(icmp_packets)} ICMP packets averaging {mean_icmp:.0f} bytes "
+                    f"in {self.cfg.window}s",
+                    "T1095", confidence=74,
+                    packets=len(icmp_packets),
+                    destinations=len({x["dst"] for x in icmp_packets}),
+                    evidence={
+                        "icmp_packets": len(icmp_packets),
+                        "mean_packet_bytes": round(mean_icmp, 1),
+                        "size_threshold": self.cfg.icmp_tunnel_mean_size,
+                        "note": "payloads are not inspected; packet size is the signal",
+                    },
+                )
+
+        # --- Endpoint denial of service ----------------------------------------
+        # Distinct from a network flood: volume concentrated on one service of
+        # one host exhausts that service rather than the link.
+        endpoint: dict[tuple[str, int], int] = {}
+        for x in bucket:
+            if x["proto"] == "TCP" and x["port"] is not None:
+                endpoint[(x["dst"], x["port"])] = endpoint.get((x["dst"], x["port"]), 0) + 1
+        for (dst, port), count in endpoint.items():
+            if count >= self.cfg.service_dos:
+                add(
+                    "SERVICE_DENIAL_OF_SERVICE", "NETWORK_DENIAL_OF_SERVICE",
+                    min(92, 70 + count // 40),
+                    f"{count} connections to {dst}:{port} in {self.cfg.window}s",
+                    "T1499", confidence=min(96, 72 + count // 40),
+                    packets=count, destinations=1, ports=1,
+                    evidence={"target": dst, "service_port": port, "connections": count},
+                )
+
+        # --- Reflection amplification ------------------------------------------
+        # Seen from the reflector side: high-volume traffic sourced from an
+        # amplifiable service toward a single victim.
+        for (dst, sport), count in _amplification(bucket).items():
+            if count >= self.cfg.amplification_packets:
+                add(
+                    "REFLECTION_AMPLIFICATION", "NETWORK_DENIAL_OF_SERVICE",
+                    min(93, 72 + count // 50),
+                    f"{count} packets from amplifiable service port {sport} "
+                    f"toward {dst} in {self.cfg.window}s",
+                    "T1498.002", confidence=76,
+                    packets=count, destinations=1,
+                    evidence={
+                        "victim": dst,
+                        "reflector_service_port": sport,
+                        "packets": count,
+                        "note": "the source address of reflected traffic is "
+                                "typically spoofed to the victim",
+                    },
+                )
+
+        # --- Ingress tool transfer ---------------------------------------------
+        # Bulk data arriving from outside onto an internal host. The mirror of
+        # exfiltration, and the stage that usually precedes it.
+        if not self._private(e.source) and self._private(e.destination):
+            inbound: dict[str, int] = {}
+            for x in bucket:
+                if self._private(x["dst"]):
+                    inbound[x["dst"]] = inbound.get(x["dst"], 0) + x["size"]
+            for dst, total in inbound.items():
+                if total >= self.cfg.ingress_bytes:
+                    add(
+                        "INGRESS_TOOL_TRANSFER", "COMMAND_AND_CONTROL",
+                        min(88, 64 + int(total / max(1, self.cfg.ingress_bytes)) * 5),
+                        f"{total / 1_000_000:.1f} MB delivered from external host "
+                        f"to {dst} in {self.cfg.window}s",
+                        "T1105", confidence=72,
+                        packets=len(bucket), destinations=1,
+                        evidence={
+                            "internal_destination": dst,
+                            "bytes": total,
+                            "threshold_bytes": self.cfg.ingress_bytes,
+                            "note": "volume and direction only; a software "
+                                    "update has the same shape",
+                        },
+                    )
+
+        # --- Non-standard port communication -----------------------------------
+        # Sustained traffic to one external host on a high, unregistered port.
+        # Weak alone, which is why its confidence is low and it names the port.
+        outbound_odd: dict[tuple[str, int], int] = {}
+        for x in bucket:
+            if (x["proto"] == "TCP" and x["port"] is not None
+                    and x["port"] >= self.cfg.nonstandard_min_port
+                    and x["port"] not in self.MINING_PORTS
+                    and not self._private(x["dst"])):
+                outbound_odd[(x["dst"], x["port"])] = outbound_odd.get((x["dst"], x["port"]), 0) + 1
+        for (dst, port), count in outbound_odd.items():
+            if count >= self.cfg.nonstandard_packets:
+                add(
+                    "NON_STANDARD_PORT_TRAFFIC", "COMMAND_AND_CONTROL",
+                    62, f"{count} packets to {dst} on non-standard port {port} "
+                        f"in {self.cfg.window}s",
+                    "T1571", confidence=58,
+                    packets=count, destinations=1, ports=1,
+                    evidence={
+                        "destination": dst,
+                        "port": port,
+                        "packets": count,
+                        "note": "a high port is not itself suspicious; this is "
+                                "corroboration for other findings, not a "
+                                "conclusion on its own",
+                    },
+                )
 
         rate = len(bucket) / max(1, self.cfg.window)
 

@@ -66,7 +66,8 @@ class LateralMovementTests(unittest.TestCase):
             found += detector.process(event("10.0.0.5", f"10.0.0.{host}", 445))
         alerts = [a for a in found if a.threat == "LATERAL_MOVEMENT"]
         self.assertTrue(alerts)
-        self.assertEqual(alerts[0].technique, "T1021")
+        # Port 445 is SMB, so the sub-technique is what the evidence supports.
+        self.assertEqual(alerts[0].technique, "T1021.002")
 
     def test_external_source_is_not_lateral_movement(self):
         # The same shape from a public address is inbound reconnaissance. It
@@ -381,3 +382,271 @@ class InternalNetworkTests(unittest.TestCase):
             found += detector.process(
                 event("10.0.0.5", "203.0.113.7", 443, flags="PA", size=60_000))
         self.assertNotIn("DATA_EXFILTRATION_VOLUME", threats(found))
+
+
+class TechniqueMappingTests(unittest.TestCase):
+    """ATT&CK claims must follow the evidence, not the threat name."""
+
+    def test_external_scan_is_reconnaissance_not_discovery(self):
+        # ATT&CK separates pre-compromise scanning from outside (T1595) from
+        # post-compromise service discovery from inside (T1046).
+        detector = ThreatDetector()
+        found = []
+        for port in range(100, 110):
+            found += detector.process(event("203.0.113.9", "10.0.0.9", port))
+        scan = next(a for a in found if a.threat == "PORT_SCAN")
+        self.assertEqual(scan.technique, "T1595")
+        self.assertEqual(scan.evidence["source_position"], "external")
+
+    def test_internal_scan_is_service_discovery(self):
+        detector = ThreatDetector()
+        found = []
+        for port in range(100, 110):
+            found += detector.process(event("10.0.0.5", "10.0.0.9", port))
+        scan = next(a for a in found if a.threat == "PORT_SCAN")
+        self.assertEqual(scan.technique, "T1046")
+        self.assertEqual(scan.evidence["source_position"], "internal")
+
+    def test_host_enumeration_is_remote_system_discovery(self):
+        detector = ThreatDetector()
+        found = []
+        for host in range(10, 45):
+            found += detector.process(event("10.0.0.5", f"10.0.0.{host}", 80))
+        fanout = next(a for a in found if a.threat == "NETWORK_FANOUT")
+        self.assertEqual(fanout.technique, "T1018")
+
+    def test_lateral_movement_names_the_service_sub_technique(self):
+        for port, technique, service in (
+            (3389, "T1021.001", "RDP"),
+            (445, "T1021.002", "SMB"),
+            (22, "T1021.004", "SSH"),
+            (5900, "T1021.005", "VNC"),
+            (5985, "T1021.006", "WinRM"),
+        ):
+            detector = ThreatDetector()
+            found = []
+            for host in range(10, 20):
+                found += detector.process(event("10.0.0.5", f"10.0.0.{host}", port))
+            alert = next(a for a in found if a.threat == "LATERAL_MOVEMENT")
+            self.assertEqual(alert.technique, technique, f"port {port}")
+            self.assertEqual(alert.evidence["service"], service)
+
+    def test_unknown_admin_port_falls_back_to_the_parent(self):
+        # 135 is an admin port with no dedicated sub-technique. Claiming a
+        # specific one would be a guess.
+        detector = ThreatDetector()
+        found = []
+        for host in range(10, 20):
+            found += detector.process(event("10.0.0.5", f"10.0.0.{host}", 135))
+        alert = next(a for a in found if a.threat == "LATERAL_MOVEMENT")
+        self.assertEqual(alert.technique, "T1021")
+
+
+class PasswordSprayingTests(unittest.TestCase):
+    def test_spraying_detected(self):
+        detector = ThreatDetector()
+        found = []
+        for host in range(10, 25):
+            for _ in range(3):
+                found += detector.process(event("10.0.0.5", f"10.0.0.{host}", 22))
+        alerts = [a for a in found if a.threat == "PASSWORD_SPRAYING"]
+        self.assertTrue(alerts)
+        self.assertEqual(alerts[0].technique, "T1110.003")
+
+    def test_concentrated_guessing_is_not_spraying(self):
+        # Many attempts on one host is brute force; the two must not collide.
+        detector = ThreatDetector()
+        found = []
+        for _ in range(30):
+            found += detector.process(event("10.0.0.5", "10.0.0.9", 22))
+        self.assertNotIn("PASSWORD_SPRAYING", threats(found))
+        self.assertIn("CREDENTIAL_BRUTE_FORCE", threats(found))
+
+    def test_brute_force_is_password_guessing(self):
+        detector = ThreatDetector()
+        found = []
+        for _ in range(25):
+            found += detector.process(event("10.0.0.5", "10.0.0.9", 22))
+        alert = next(a for a in found if a.threat == "CREDENTIAL_BRUTE_FORCE")
+        self.assertEqual(alert.technique, "T1110.001")
+
+
+class IcmpTunnelingTests(unittest.TestCase):
+    def test_large_icmp_detected(self):
+        detector = ThreatDetector()
+        found = []
+        for _ in range(15):
+            found += detector.process(
+                event("10.0.0.5", "203.0.113.7", None, protocol="ICMP", flags="", size=900))
+        alerts = [a for a in found if a.threat == "ICMP_TUNNELING_PATTERN"]
+        self.assertTrue(alerts)
+        self.assertEqual(alerts[0].technique, "T1095")
+
+    def test_ordinary_ping_does_not_trigger(self):
+        detector = ThreatDetector()
+        found = []
+        for _ in range(15):
+            found += detector.process(
+                event("10.0.0.5", "203.0.113.7", None, protocol="ICMP", flags="", size=74))
+        self.assertNotIn("ICMP_TUNNELING_PATTERN", threats(found))
+
+
+class EndpointDosTests(unittest.TestCase):
+    def test_service_flood_detected(self):
+        detector = ThreatDetector(DetectionConfig(service_dos=50))
+        found = []
+        for _ in range(60):
+            found += detector.process(event("10.0.0.5", "10.0.0.9", 443, flags="S"))
+        alerts = [a for a in found if a.threat == "SERVICE_DENIAL_OF_SERVICE"]
+        self.assertTrue(alerts)
+        self.assertEqual(alerts[0].technique, "T1499")
+        self.assertEqual(alerts[0].evidence["service_port"], 443)
+
+    def test_spread_traffic_is_not_endpoint_dos(self):
+        detector = ThreatDetector(DetectionConfig(service_dos=50))
+        found = []
+        for i in range(60):
+            found += detector.process(event("10.0.0.5", f"10.0.0.{i % 30 + 10}", 443))
+        self.assertNotIn("SERVICE_DENIAL_OF_SERVICE", threats(found))
+
+
+class AmplificationTests(unittest.TestCase):
+    def _flood(self, sport):
+        detector = ThreatDetector(DetectionConfig(amplification_packets=30))
+        found = []
+        for _ in range(40):
+            traffic = TrafficEvent(
+                "2026-01-01T00:00:00Z", "10.0.0.5", "203.0.113.7", "UDP",
+                source_port=sport, destination_port=40000, packet_size=1400, flags="")
+            found += detector.process(traffic)
+        return found
+
+    def test_reflected_dns_detected(self):
+        alerts = [a for a in self._flood(53) if a.threat == "REFLECTION_AMPLIFICATION"]
+        self.assertTrue(alerts)
+        self.assertEqual(alerts[0].technique, "T1498.002")
+
+    def test_evidence_notes_the_source_is_spoofed(self):
+        alert = next(a for a in self._flood(123) if a.threat == "REFLECTION_AMPLIFICATION")
+        self.assertIn("spoofed", alert.evidence["note"])
+
+    def test_ordinary_client_port_does_not_trigger(self):
+        self.assertNotIn("REFLECTION_AMPLIFICATION", threats(self._flood(51234)))
+
+
+class IngressTransferTests(unittest.TestCase):
+    def test_inbound_bulk_transfer_detected(self):
+        detector = ThreatDetector(DetectionConfig(ingress_bytes=1_000_000))
+        found = []
+        for _ in range(30):
+            found += detector.process(
+                event("203.0.113.7", "10.0.0.9", 443, flags="PA", size=60_000))
+        alerts = [a for a in found if a.threat == "INGRESS_TOOL_TRANSFER"]
+        self.assertTrue(alerts)
+        self.assertEqual(alerts[0].technique, "T1105")
+
+    def test_internal_to_internal_transfer_does_not_trigger(self):
+        detector = ThreatDetector(DetectionConfig(ingress_bytes=1_000_000))
+        found = []
+        for _ in range(30):
+            found += detector.process(
+                event("10.0.0.5", "10.0.0.9", 445, flags="PA", size=60_000))
+        self.assertNotIn("INGRESS_TOOL_TRANSFER", threats(found))
+
+
+class ExfiltrationOverC2Tests(unittest.TestCase):
+    def test_transfer_to_a_known_beacon_target_is_over_c2(self):
+        """The correlation that makes this worth separating from T1048."""
+        detector = ThreatDetector(DetectionConfig(exfil_bytes=1_000_000))
+        clock = 1000.0
+        # Establish the beacon first.
+        for _ in range(8):
+            clock += 30.0
+            detector.process(event("10.0.0.5", "203.0.113.7", 8443, flags="PA"), now=clock)
+        self.assertIn(("10.0.0.5", "203.0.113.7"), detector.beacon_targets)
+
+        found = []
+        for _ in range(30):
+            clock += 0.1
+            found += detector.process(
+                event("10.0.0.5", "203.0.113.7", 8443, flags="PA", size=60_000), now=clock)
+        alerts = [a for a in found if a.threat == "DATA_EXFILTRATION_OVER_C2"]
+        self.assertTrue(alerts)
+        self.assertEqual(alerts[0].technique, "T1041")
+        self.assertTrue(alerts[0].evidence["over_beacon_channel"])
+
+    def test_transfer_to_an_unrelated_host_stays_generic(self):
+        detector = ThreatDetector(DetectionConfig(exfil_bytes=1_000_000))
+        found = []
+        for _ in range(30):
+            found += detector.process(
+                event("10.0.0.5", "203.0.113.99", 443, flags="PA", size=60_000))
+        alerts = [a for a in found if a.threat == "DATA_EXFILTRATION_VOLUME"]
+        self.assertTrue(alerts)
+        self.assertEqual(alerts[0].technique, "T1048")
+
+    def test_beacon_target_table_is_bounded(self):
+        detector = ThreatDetector(DetectionConfig(max_sources=4))
+        clock = 1000.0
+        for i in range(400):
+            for _ in range(7):
+                clock += 3.0
+                detector.process(event("10.0.0.5", f"203.0.113.{i % 200}", 8443), now=clock)
+        self.assertLessEqual(len(detector.beacon_targets), detector.cfg.max_sources * 4)
+
+
+class NonStandardPortTests(unittest.TestCase):
+    def test_sustained_high_port_traffic_detected(self):
+        detector = ThreatDetector()
+        found = []
+        for _ in range(45):
+            found += detector.process(event("10.0.0.5", "203.0.113.7", 48291, flags="PA"))
+        alerts = [a for a in found if a.threat == "NON_STANDARD_PORT_TRAFFIC"]
+        self.assertTrue(alerts)
+        self.assertEqual(alerts[0].technique, "T1571")
+
+    def test_confidence_stays_low_because_the_signal_is_weak(self):
+        detector = ThreatDetector()
+        found = []
+        for _ in range(45):
+            found += detector.process(event("10.0.0.5", "203.0.113.7", 48291, flags="PA"))
+        alert = next(a for a in found if a.threat == "NON_STANDARD_PORT_TRAFFIC")
+        self.assertLess(alert.confidence, 65)
+        self.assertIn("not a", alert.evidence["note"])
+
+    def test_standard_https_does_not_trigger(self):
+        detector = ThreatDetector()
+        found = []
+        for _ in range(45):
+            found += detector.process(event("10.0.0.5", "203.0.113.7", 443, flags="PA"))
+        self.assertNotIn("NON_STANDARD_PORT_TRAFFIC", threats(found))
+
+
+class CatalogIntegrityTests(unittest.TestCase):
+    def test_catalog_contains_nothing_aspirational(self):
+        """Every catalog entry must be emitted, or explicitly marked legacy.
+
+        A catalog listing techniques NEMOS cannot evidence would overstate its
+        coverage -- exactly the failure mode the project exists to avoid.
+        """
+        import re
+        from pathlib import Path
+        from nemos.attack import LEGACY_TECHNIQUES
+
+        source = Path("nemos/detector.py").read_text()
+        emitted = set(re.findall(r'"(T\d{4}(?:\.\d{3})?)"', source))
+        unreachable = set(TECHNIQUES) - emitted - set(LEGACY_TECHNIQUES)
+        self.assertEqual(unreachable, set())
+
+    def test_every_technique_has_a_url_matching_its_id(self):
+        for tid, technique in TECHNIQUES.items():
+            self.assertTrue(technique.url.startswith("https://attack.mitre.org/techniques/"))
+            self.assertIn(tid.replace(".", "/"), technique.url)
+
+    def test_kill_chain_covers_every_catalog_tactic(self):
+        """A tactic with no chain stage would render findings nowhere."""
+        from pathlib import Path
+        js = Path("nemos/static/app.js").read_text()
+        for technique in TECHNIQUES.values():
+            first = technique.tactic.split("/")[0].strip().split()[0].lower()
+            self.assertIn(first, js.lower(), f"{technique.tactic} has no chain stage")

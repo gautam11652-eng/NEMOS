@@ -44,6 +44,7 @@ const TITLES = {
  * tactic their technique evidences, so the chain shows how far an actor has
  * got rather than merely how many alerts fired. */
 const CHAIN = [
+  { key: "Reconnaissance",    label: "Reconnaissance",    match: /reconnaissance/i },
   { key: "Discovery",         label: "Discovery",        match: /discovery/i },
   { key: "Credential Access", label: "Credential Access", match: /credential/i },
   { key: "Lateral Movement",  label: "Lateral Movement",  match: /lateral/i },
