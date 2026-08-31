@@ -6,6 +6,7 @@ import time
 import uuid
 from math import isfinite
 from collections import OrderedDict, deque
+from itertools import pairwise
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,20 @@ class DetectionConfig:
     service_burst: int = 40
     udp_scan: int = 12
     icmp_sweep: int = 12
+    stealth_scan: int = 6
+    lateral_hosts: int = 5
+    brute_force: int = 20
+    exfil_bytes: int = 25_000_000
+    dns_tunnel_packets: int = 30
+    dns_tunnel_mean_size: int = 180
+    mining_packets: int = 10
+    tor_packets: int = 10
+    # Beaconing is periodicity, which a 10s window cannot see. These govern a
+    # separate per-pair timing history with its own horizon.
+    beacon_min_intervals: int = 5
+    beacon_max_jitter: float = 0.15
+    beacon_min_period: float = 2.0
+    beacon_horizon: float = 900.0
     cooldown: int = 30
     correlation_window: int = 60
     max_sources: int = 4096
@@ -78,6 +93,40 @@ class ThreatDetector:
         993, 995, 1433, 3306, 3389, 5432, 6379, 8080,
     }
 
+    # Remote-administration and file-sharing services. Internal-to-internal
+    # traffic across many of these hosts is the shape lateral movement takes.
+    ADMIN_PORTS = {22, 23, 135, 139, 445, 3389, 5985, 5986, 5900}
+
+    # Services that accept credentials. Repeated attempts against one of these
+    # on a single host is the shape a brute-force attempt takes.
+    AUTH_PORTS = {
+        21, 22, 23, 25, 110, 143, 389, 445, 1433, 3306, 3389, 5432, 5900, 6379,
+    }
+
+    # Default ports for common mining pool protocols (Stratum and variants).
+    # Port-based identification is a heuristic, not proof: the evidence records
+    # the port so an analyst can confirm.
+    MINING_PORTS = {3333, 4444, 5555, 7777, 8888, 9999, 14433, 14444, 45560}
+
+    # Default Tor OR/dir/SOCKS ports. Same caveat as mining: heuristic.
+    TOR_PORTS = {9001, 9030, 9050, 9051, 9150}
+
+    # Periodic by design. Excluded from beacon analysis because NTP sync, DNS
+    # refresh and DHCP renewal are textbook low-jitter timers -- flagging them
+    # would bury real callbacks in known-benign noise.
+    BENIGN_PERIODIC_PORTS = {53, 67, 68, 123, 5353}
+
+    # What counts as "inside" for lateral-movement and exfiltration decisions.
+    # RFC 1918, loopback, link-local and IPv6 unique-local -- deliberately not
+    # the RFC 5737 documentation ranges. Override with NEMOS_INTERNAL_NETWORKS
+    # when a deployment routes public address space internally, which would
+    # otherwise make its own east-west traffic look like exfiltration.
+    DEFAULT_INTERNAL_NETWORKS = (
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+        "127.0.0.0/8", "169.254.0.0/16",
+        "::1/128", "fc00::/7", "fe80::/10",
+    )
+
     def __init__(self, cfg: DetectionConfig | None = None):
         self.cfg = cfg or DetectionConfig()
         self.events: OrderedDict[str, deque[dict[str, Any]]] = OrderedDict()
@@ -91,6 +140,33 @@ class ThreatDetector:
             max_sources=self.cfg.max_sources,
         )
         self.incidents: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        # Beaconing is a property of the interval between contacts, so it needs
+        # a horizon far longer than the detection window. Keyed by
+        # (source, destination, port) -- every component of which an attacker
+        # influences -- so it is bounded and evicted least-recently-used like
+        # every other map in this class.
+        self.contacts: OrderedDict[tuple[str, str, int | None], deque[float]] = OrderedDict()
+        self.internal_networks = self._parse_networks(
+            os.getenv("NEMOS_INTERNAL_NETWORKS", "")
+        ) or [ipaddress.ip_network(n) for n in self.DEFAULT_INTERNAL_NETWORKS]
+
+    @staticmethod
+    def _parse_networks(raw: str) -> list[Any]:
+        """Parse a comma-separated CIDR list, skipping anything unparseable.
+
+        A malformed entry is dropped rather than raising: a typo in one CIDR
+        must not stop the sensor from starting.
+        """
+        networks = []
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                networks.append(ipaddress.ip_network(item, strict=False))
+            except ValueError:
+                continue
+        return networks
 
     def process(self, e: TrafficEvent, ptype: str = "", now: float | None = None) -> list[Alert]:
         """Evaluate one event against the deterministic rules.
@@ -251,6 +327,188 @@ class ThreatDetector:
                 evidence={"service_ports": sorted(service_ports), "service_connections": service_count},
             )
 
+        # --- Stealth scans -------------------------------------------------
+        # NULL, FIN and Xmas probes exist to elicit a response from a closed
+        # port without completing a handshake. They are defined entirely by
+        # their flag combination, which capture already records.
+        stealth: dict[str, set[int]] = {"null": set(), "fin": set(), "xmas": set()}
+        for x in bucket:
+            if x["proto"] != "TCP" or x["port"] is None:
+                continue
+            flags = set(x["flags"]) - {"E", "C", "N"}
+            if not flags:
+                stealth["null"].add(x["port"])
+            elif flags == {"F"}:
+                stealth["fin"].add(x["port"])
+            elif {"F", "P", "U"} <= flags and "S" not in flags and "A" not in flags:
+                stealth["xmas"].add(x["port"])
+        for kind, scanned in stealth.items():
+            if len(scanned) >= self.cfg.stealth_scan:
+                add(
+                    f"TCP_{kind.upper()}_SCAN", "NETWORK_RECONNAISSANCE",
+                    min(92, 60 + len(scanned) * 3),
+                    f"{len(scanned)} ports probed with {kind.upper()} TCP flags "
+                    f"in {self.cfg.window}s",
+                    "T1046", confidence=min(97, 68 + len(scanned) * 3),
+                    packets=len(bucket), ports=len(scanned),
+                    destinations=len(destinations),
+                    evidence={
+                        "scan_type": f"tcp_{kind}",
+                        "ports": sorted(scanned)[:100],
+                        "note": "stealth probe: no handshake is completed",
+                    },
+                )
+
+        # --- Lateral movement ----------------------------------------------
+        # Internal source reaching many internal hosts on remote-administration
+        # ports. Restricted to private-to-private traffic: a public scanner
+        # hitting these ports is reconnaissance, already covered above, and
+        # calling it lateral movement would misrepresent where the actor is.
+        if self._private(e.source):
+            lateral_targets = {
+                x["dst"] for x in bucket
+                if x["proto"] == "TCP" and x["port"] in self.ADMIN_PORTS
+                and self._private(x["dst"]) and x["dst"] != e.source
+            }
+            if len(lateral_targets) >= self.cfg.lateral_hosts:
+                lateral_ports = sorted({
+                    x["port"] for x in bucket
+                    if x["port"] in self.ADMIN_PORTS and self._private(x["dst"])
+                })
+                add(
+                    "LATERAL_MOVEMENT", "LATERAL_MOVEMENT",
+                    min(93, 62 + len(lateral_targets) * 4),
+                    f"internal host contacted {len(lateral_targets)} internal hosts "
+                    f"on remote-administration ports in {self.cfg.window}s",
+                    "T1021", confidence=min(96, 66 + len(lateral_targets) * 4),
+                    packets=len(bucket), destinations=len(lateral_targets),
+                    ports=len(lateral_ports),
+                    evidence={
+                        "internal_targets": sorted(lateral_targets)[:50],
+                        "admin_ports": lateral_ports,
+                    },
+                )
+
+        # --- Credential brute force -----------------------------------------
+        # Many attempts against one authentication service on one host. Keyed
+        # per (destination, port) so spraying one credential across many hosts
+        # does not average away into a below-threshold count.
+        attempts: dict[tuple[str, int], int] = {}
+        for x in bucket:
+            if x["proto"] == "TCP" and x["port"] in self.AUTH_PORTS:
+                pair = (x["dst"], x["port"])
+                attempts[pair] = attempts.get(pair, 0) + 1
+        for (dst, port), count in attempts.items():
+            if count >= self.cfg.brute_force:
+                add(
+                    "CREDENTIAL_BRUTE_FORCE", "CREDENTIAL_ACCESS",
+                    min(91, 60 + count // 2),
+                    f"{count} connection attempts to {dst}:{port} in {self.cfg.window}s",
+                    "T1110", confidence=min(95, 64 + count // 2),
+                    packets=count, destinations=1, ports=1,
+                    evidence={
+                        "target": dst,
+                        "service_port": port,
+                        "attempts": count,
+                        "note": "attempt volume only; success cannot be "
+                                "determined from metadata",
+                    },
+                )
+
+        # --- Data exfiltration ------------------------------------------------
+        # Sustained outbound volume to a single external destination. The
+        # threshold is bytes observed in one window, so it scales with the
+        # window rather than assuming a fixed session length.
+        volumes: dict[str, int] = {}
+        for x in bucket:
+            if x["dst"] and not self._private(x["dst"]):
+                volumes[x["dst"]] = volumes.get(x["dst"], 0) + x["size"]
+        for dst, total in volumes.items():
+            if total >= self.cfg.exfil_bytes:
+                add(
+                    "DATA_EXFILTRATION_VOLUME", "EXFILTRATION",
+                    min(90, 62 + int(total / max(1, self.cfg.exfil_bytes)) * 5),
+                    f"{total / 1_000_000:.1f} MB sent to external host {dst} "
+                    f"in {self.cfg.window}s",
+                    "T1048", confidence=78,
+                    packets=sum(1 for x in bucket if x["dst"] == dst),
+                    destinations=1,
+                    evidence={
+                        "destination": dst,
+                        "bytes": total,
+                        "threshold_bytes": self.cfg.exfil_bytes,
+                        "note": "volume only; a legitimate backup or upload "
+                                "has the same shape",
+                    },
+                )
+
+        # --- DNS tunneling ----------------------------------------------------
+        # Ordinary DNS packets are small. A sustained stream of large ones
+        # carries something other than routine name resolution. This is
+        # separate from DNS_BURST, which counts volume alone.
+        dns_packets = [x for x in bucket if x["proto"] == "DNS"]
+        if len(dns_packets) >= self.cfg.dns_tunnel_packets:
+            mean_dns = sum(x["size"] for x in dns_packets) / len(dns_packets)
+            if mean_dns >= self.cfg.dns_tunnel_mean_size:
+                add(
+                    "DNS_TUNNELING_PATTERN", "COMMAND_AND_CONTROL",
+                    min(88, 64 + int(mean_dns // 50)),
+                    f"{len(dns_packets)} DNS packets averaging {mean_dns:.0f} bytes "
+                    f"in {self.cfg.window}s",
+                    "T1071.004", confidence=76,
+                    packets=len(dns_packets),
+                    destinations=len({x["dst"] for x in dns_packets}),
+                    evidence={
+                        "dns_packets": len(dns_packets),
+                        "mean_packet_bytes": round(mean_dns, 1),
+                        "size_threshold": self.cfg.dns_tunnel_mean_size,
+                        "note": "payloads are not inspected; size is the signal",
+                    },
+                )
+
+        # --- Known-suspicious destination ports -------------------------------
+        # Port-based identification is a heuristic and says so in the evidence.
+        for label, portset, threat, technique, category, score in (
+            ("mining pool", self.MINING_PORTS, "CRYPTO_MINING_PATTERN",
+             "T1496", "RESOURCE_HIJACKING", 72),
+            ("Tor", self.TOR_PORTS, "TOR_CONNECTION_PATTERN",
+             "T1090.003", "COMMAND_AND_CONTROL", 68),
+        ):
+            threshold = (self.cfg.mining_packets if "MINING" in threat
+                         else self.cfg.tor_packets)
+            hits = [x for x in bucket if x["proto"] == "TCP" and x["port"] in portset]
+            if len(hits) >= threshold:
+                targets = sorted({x["dst"] for x in hits})
+                add(
+                    threat, category, score,
+                    f"{len(hits)} connections to {label} ports in {self.cfg.window}s",
+                    technique, confidence=64,
+                    packets=len(hits), destinations=len(targets),
+                    ports=len({x["port"] for x in hits}),
+                    evidence={
+                        "ports": sorted({x["port"] for x in hits}),
+                        "destinations": targets[:50],
+                        "note": f"port-based heuristic: these are default {label} "
+                                "ports, not confirmation of the protocol",
+                    },
+                )
+
+        # --- Beaconing --------------------------------------------------------
+        # Evaluated on the event itself, not the window, because periodicity
+        # lives on a longer horizon than the detection window.
+        beacon = self._record_contact(bucket[-1], e.source, now)
+        if beacon:
+            add(
+                "C2_BEACONING", "COMMAND_AND_CONTROL",
+                min(89, 66 + int((1 - beacon["jitter_ratio"] /
+                                  self.cfg.beacon_max_jitter) * 20)),
+                f"{beacon['contacts']} contacts with {beacon['destination']} at a "
+                f"regular {beacon['mean_interval_seconds']}s interval",
+                "T1071", confidence=80,
+                packets=beacon["contacts"], destinations=1,
+                evidence=beacon,
+            )
+
         rate = len(bucket) / max(1, self.cfg.window)
 
         # Adaptive behavioral profile. Unlike the old per-packet EMA, this
@@ -316,6 +574,59 @@ class ThreatDetector:
             )
         return None
 
+    def _record_contact(self, event: dict[str, Any], source: str,
+                        now: float) -> dict[str, Any] | None:
+        """Track contact times for one (source, destination, port) pair.
+
+        Returns beacon evidence when the intervals between contacts are regular
+        enough to look like a scheduled callback rather than human-driven or
+        bursty traffic.
+
+        Periodicity is measured with the coefficient of variation of the
+        intervals -- standard deviation over mean. That ratio is scale-free, so
+        a 5-second beacon and a 5-minute beacon are judged by the same
+        criterion, which a fixed jitter tolerance in seconds could not do.
+        """
+        port = event["port"]
+        if port in self.BENIGN_PERIODIC_PORTS:
+            return None
+        key = (source, event["dst"], port)
+        history = self.contacts.get(key)
+        if history is None:
+            if len(self.contacts) >= self.cfg.max_sources * 4:
+                self.contacts.popitem(last=False)
+            history = deque(maxlen=self.cfg.beacon_min_intervals + 8)
+            self.contacts[key] = history
+        else:
+            self.contacts.move_to_end(key)
+        if history and now - history[-1] < self.cfg.beacon_min_period:
+            # Packets belonging to the same contact, not a new one. Without
+            # this every packet of a single transfer would look like a
+            # perfectly regular beacon at line rate.
+            return None
+        history.append(now)
+        while history and now - history[0] > self.cfg.beacon_horizon:
+            history.popleft()
+        if len(history) < self.cfg.beacon_min_intervals + 1:
+            return None
+        intervals = [b - a for a, b in pairwise(history)]
+        mean = sum(intervals) / len(intervals)
+        if mean < self.cfg.beacon_min_period:
+            return None
+        variance = sum((x - mean) ** 2 for x in intervals) / len(intervals)
+        jitter = (variance ** 0.5) / mean
+        if jitter > self.cfg.beacon_max_jitter:
+            return None
+        return {
+            "destination": event["dst"],
+            "port": port,
+            "contacts": len(history),
+            "mean_interval_seconds": round(mean, 2),
+            "jitter_ratio": round(jitter, 4),
+            "jitter_threshold": self.cfg.beacon_max_jitter,
+            "intervals_seconds": [round(x, 2) for x in intervals][-12:],
+        }
+
     def _bucket(self, source: str) -> deque[dict[str, Any]]:
         bucket = self.events.get(source)
         if bucket is None:
@@ -372,6 +683,28 @@ class ThreatDetector:
             self.incidents.popitem(last=False)
         self.incidents[source] = (incident_id, now)
         return incident_id
+
+    def _private(self, value: str) -> bool:
+        """True when an address belongs to this deployment's internal ranges.
+
+        Deliberately does not use ``ipaddress.is_private`` or ``is_global``.
+        Both classify the RFC 5737 documentation ranges (192.0.2.0/24,
+        198.51.100.0/24, 203.0.113.0/24) as non-global, and those are exactly
+        the addresses NEMOS's synthetic traffic uses to stand in for the public
+        internet. Relying on the stdlib predicate made every synthetic external
+        host look internal, which silently disabled exfiltration detection and
+        reported an external scanner as lateral movement -- and it did so only
+        in the traffic used to demonstrate the sensor, where it was least
+        likely to be noticed.
+
+        An unparseable address counts as external, so a malformed value cannot
+        suppress an exfiltration finding.
+        """
+        try:
+            address = ipaddress.ip_address(value)
+        except (TypeError, ValueError):
+            return False
+        return any(address in network for network in self.internal_networks)
 
     @staticmethod
     def _ip(value: str) -> bool:
