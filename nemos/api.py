@@ -21,7 +21,7 @@ from .analyst import collect_evidence
 from .attack import catalog as attack_catalog, enrich_alert
 
 from .version import VERSION
-_ALLOWED_PROTOCOLS = {"TCP", "UDP", "DNS", "ICMP", "ARP", "IP", "OTHER"}
+_ALLOWED_PROTOCOLS = {"TCP", "UDP", "DNS", "ICMP", "ARP", "NDP", "IP", "OTHER"}
 _SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
 _BOOLEANS = {"1": True, "true": True, "yes": True, "0": False, "false": False, "no": False}
 

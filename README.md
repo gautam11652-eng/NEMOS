@@ -57,7 +57,9 @@ This section exists because these distinctions matter more than marketing does.
 - Live packet capture via Scapy, with explicit capture-state reporting
 - Bounded, stateful detections: TCP SYN scans, UDP port scans, vertical port
   scans, network fan-out, ICMP sweeps and floods, SYN floods, DNS bursts,
-  service-connection bursts and ARP mapping changes
+  service-connection bursts, and ARP/NDP mapping changes
+- **Dual-stack**: IPv4 and IPv6 both reach every rule, with Neighbour Discovery
+  classified separately so a healthy v6 segment is not mistaken for a flood
 - **Unidirectional flow aggregation** — the five-tuple is used exactly as
   observed, never canonicalised, so a one-way tap is a first-class deployment
 - **24 engineered features per source per window**: rates, per-flow statistics,
@@ -79,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 539 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 567 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -783,7 +785,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 539 tests
+python -m pytest -q                              # 567 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
@@ -892,8 +894,12 @@ Stated plainly, because an evaluator will find them anyway:
 - The model is trained per deployment. There is no pretrained model shipped,
   because a generic notion of "normal traffic" would not describe your network.
 - Encrypted payloads are not inspected. Detection is metadata-only.
-- IPv4-oriented. IPv6 traffic is captured but detection heuristics are tuned for
-  IPv4 topologies.
+- IPv6 is captured and every rule applies to it, but the volumetric thresholds
+  were tuned against IPv4 traffic. A v6 segment with very different host
+  density may want them adjusted — see
+  [Detection rule tuning](#detection-rule-tuning). (Until 4.1.0 this section
+  claimed v6 was captured when in fact every v6 packet was discarded at the
+  parse path; it is genuinely captured now.)
 - Single-host. There is no multi-sensor federation or central collector.
 - Retention is row-count based, not time based.
 - The aggregation window is fixed per deployment and must match the model's

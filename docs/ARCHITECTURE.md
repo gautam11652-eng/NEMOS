@@ -163,6 +163,23 @@ service port to an ephemeral port are therefore excluded from the scanned-port
 set. Probes are never excluded — only packets that are unambiguously part of an
 established session.
 
+### Address families
+
+IPv4 and IPv6 share one parse path and one set of rules. TCP and UDP are the
+same layers over either family, so every port-based rule applies to v6 without
+change, and the detector's internal-range list has always included `::1/128`,
+`fc00::/7` and `fe80::/10`, so internal/external classification is correct for
+both. Until this was fixed, none of that mattered: the capture path gated on
+`haslayer(IP)` and dropped every v6 packet before any rule saw it.
+
+Neighbour Discovery is the one place the families are not treated alike. NDP is
+IPv6's replacement for ARP and is constant, benign link-local traffic; folding
+it into the ICMP rules would report every healthy dual-stack segment as a
+permanent ping flood. It is therefore recorded under its own protocol, kept out
+of the ICMP rules, and inspected for the binding it asserts — an unsolicited
+advertisement claiming another host's address is the v6 form of ARP cache
+poisoning, and reaches the same detection through a shared observer.
+
 ## Unidirectional flows
 
 The flow key is `(source, destination, source_port, destination_port, protocol)`

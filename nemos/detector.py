@@ -834,6 +834,31 @@ class ThreatDetector:
         return out
 
     def observe_arp(self, ip: str, mac: str, now: float | None = None) -> Alert | None:
+        return self._observe_link_layer(
+            ip, mac, "ARP_MAPPING_CHANGE", "ARP", "T1557.002", now)
+
+    def observe_ndp(self, ip: str, mac: str, now: float | None = None) -> Alert | None:
+        """The IPv6 form of the same attack.
+
+        IPv6 has no ARP: Neighbour Discovery does the job, and an unsolicited
+        Neighbour Advertisement claiming another host's address poisons a
+        neighbour cache exactly as a forged ARP reply poisons an ARP cache.
+        ATT&CK has no NDP-specific sub-technique, so this maps to the parent
+        T1557 rather than borrowing T1557.002, which is ARP by name.
+        """
+        return self._observe_link_layer(
+            ip, mac, "NDP_MAPPING_CHANGE", "NDP", "T1557", now)
+
+    def _observe_link_layer(
+        self, ip: str, mac: str, threat: str, label: str,
+        technique: str, now: float | None = None,
+    ) -> Alert | None:
+        """Track address-to-MAC bindings and report a change.
+
+        One bounded map serves both families: the keys are address strings, so
+        v4 and v6 cannot collide, and sharing it keeps a single eviction policy
+        rather than two that could drift.
+        """
         if not self._ip(ip) or not mac:
             return None
         mac = mac.lower().strip()
@@ -844,8 +869,8 @@ class ThreatDetector:
             self.arp.popitem(last=False)
         if old and old != mac:
             return self._emit(
-                ip, "ARP_MAPPING_CHANGE", "NETWORK_MANIPULATION", 75,
-                f"ARP mapping changed {old} -> {mac}", "T1557.002",
+                ip, threat, "NETWORK_MANIPULATION", 75,
+                f"{label} mapping changed {old} -> {mac}", technique,
                 evidence={"old_mac": old, "new_mac": mac},
                 confidence=88, now=now,
             )

@@ -56,15 +56,34 @@ class CountTests(unittest.TestCase):
             self.assertEqual(int(claim[1]), len(TECHNIQUES))
 
     def test_documented_rule_count_is_real(self):
-        """Counts distinct threat labels the detector can emit."""
+        """Counts distinct threat labels the detector can emit.
+
+        Each pattern below matches one call shape the detector actually uses.
+        They exist separately rather than as one loose regex because a regex
+        broad enough to catch every uppercase literal would also count
+        categories and config names, and would report a rule count that only
+        looked right.
+        """
         source = _detector_source()
         emitted = set(re.findall(r'add\(\s*\n?\s*"([A-Z0-9_]+)"', source))
         emitted |= set(re.findall(r'f"TCP_\{kind\.upper\(\)\}_SCAN"', source)) and {
             "TCP_NULL_SCAN", "TCP_FIN_SCAN", "TCP_XMAS_SCAN"} or set()
         emitted |= set(re.findall(r'_emit\(\s*\n?\s*[a-z_]+,\s*"([A-Z0-9_]+)"', source))
+        # Chosen between by a conditional: exfiltration over an established C2
+        # channel versus by raw volume.
+        emitted |= set(re.findall(r'else\s+"([A-Z0-9_]+)",', source))
+        # Declared in a table of (label, key, threat, ...) rows: mining and Tor.
+        emitted |= set(re.findall(r'\(\s*"[a-z ]+",\s*"[a-z]+",\s*"([A-Z0-9_]+)"', source))
+        # Passed through a shared observer: the ARP and NDP mapping changes,
+        # which are the same detection over the two address families.
+        emitted |= set(re.findall(
+            r'_observe_link_layer\(\s*[a-z_]+,\s*[a-z_]+,\s*"([A-Z0-9_]+)"', source))
+        # ATT&CK ids are chosen by the same conditionals and match the same
+        # shape, but they are not threat labels.
+        emitted -= {name for name in emitted if re.fullmatch(r"T\d{4}(?:\.\d{3})?", name)}
         for claim in re.findall(r"Detection rules: \d+ -> (\d+)", CHANGELOG):
             self.assertGreaterEqual(
-                len(emitted), int(claim) - 2,
+                len(emitted), int(claim),
                 f"CHANGELOG claims {claim} rules; found {len(emitted)}: {sorted(emitted)}")
 
 

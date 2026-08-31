@@ -125,6 +125,16 @@ def main() -> int:
             )
             if alert:
                 record(alert)
+        elif packet_type == "NDP" and event.metadata.get("mac"):
+            # Neighbour Discovery asserts a binding for the address it names,
+            # which is not necessarily the packet's own source -- an
+            # advertisement speaks for its target.
+            alert = detector.observe_ndp(
+                str(event.metadata.get("claimed") or event.source),
+                str(event.metadata.get("mac", "")),
+            )
+            if alert:
+                record(alert)
 
     def watchdog_notify(alert: dict) -> bool:
         """Log a sensor-health finding before attempting delivery.

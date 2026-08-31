@@ -212,6 +212,15 @@ TECHNIQUES: dict[str, AttackTechnique] = {
         "Manipulating ARP mappings to position an adversary between networked devices.",
         "https://attack.mitre.org/techniques/T1557/002/",
     ),
+    "T1557": AttackTechnique(
+        "T1557",
+        "Adversary-in-the-Middle",
+        "Credential Access / Collection",
+        "Repositioning between networked devices by forging address ownership. "
+        "Used here for IPv6 Neighbour Discovery spoofing, which has no "
+        "sub-technique of its own but is the direct equivalent of ARP poisoning.",
+        "https://attack.mitre.org/techniques/T1557/",
+    ),
 }
 
 # Signals that are intentionally not forced into ATT&CK.  This distinction is

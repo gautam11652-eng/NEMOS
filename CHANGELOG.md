@@ -13,8 +13,8 @@ running system rather than the unit suite.
   data exfiltration, stealth TCP flag scans, DNS and ICMP tunneling, endpoint
   denial of service, reflection amplification, ingress tool transfer,
   crypto-mining and Tor port heuristics, and non-standard port traffic.
-  Detection rules: 10 -> 27.
-- **ATT&CK coverage 5 -> 26 techniques**, spanning seven tactics where it
+  Detection rules: 10 -> 28.
+- **ATT&CK coverage 5 -> 27 techniques**, spanning seven tactics where it
   previously spanned two. Coverage was expanded by adding detections, never by
   adding catalog entries: a test asserts the catalog contains no technique the
   detector cannot emit.
@@ -75,8 +75,30 @@ running system rather than the unit suite.
   are indistinguishable from packet volume alone, unlike capture death.
   `packaging/systemd/nemos.service` now sets `NotifyAccess=main` and
   `WatchdogSec=90`.
+- **IPv6 detection.** Every rule now applies to v6 traffic, and NDP spoofing
+  (`NDP_MAPPING_CHANGE`, T1557) is detected as the v6 form of ARP cache
+  poisoning. Neighbour Discovery is classified as its own protocol rather than
+  as ICMP: it is IPv6's ARP, constant on any healthy segment, and counting it
+  as ICMP would have reported every dual-stack network as a permanent ping
+  flood -- a false positive introduced by the fix itself. Duplicate-address
+  detection (a solicitation from `::`) asserts no binding and is ignored.
 
 ### Fixed
+
+- **IPv6 was discarded before any detection ran.** `capture.py` gated on
+  `haslayer(IP)`, so every v6 packet was dropped at the parse path. Nothing
+  failed and nothing was logged: the sensor reported no findings for v6
+  traffic, which is indistinguishable from a quiet network. On a dual-stack
+  segment an attacker bypassed all 27 rules by preferring the other address
+  family. Everything downstream was already family-agnostic -- the detector's
+  internal ranges have always listed `::1/128`, `fc00::/7` and `fe80::/10` --
+  so the blindness was confined to, and complete at, the capture path.
+- **The parse path existed twice.** A `_parse` method that only the tests
+  called, and a second copy inlined in the sniff callback that actually ran.
+  They had already drifted, which is how a parse path acquires a defect no
+  test can see: the fake packet the tests used could not represent an IPv6
+  layer at all. There is now one implementation, and the capture thread calls
+  the same one the tests do.
 
 - **The dashboard could never authenticate.** The API reads `X-NEMOS-Token`;
   the rewritten script sent `Authorization: Bearer`. Against a token-protected
