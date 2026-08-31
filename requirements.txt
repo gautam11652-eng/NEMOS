@@ -1,5 +1,12 @@
 Flask==3.1.3
 Scapy==2.7.0
 waitress==3.0.2
-scikit-learn==1.9.0
+
+# scikit-learn dropped Python 3.10 in 1.8.0, and NEMOS still supports 3.10
+# (pyproject requires-python, the CI matrix and the README all say so). 1.7.2 is
+# the last release that installs there. The Isolation Forest API NEMOS uses is
+# unchanged between the two, and the full suite passes on both -- so the split
+# is a packaging constraint, not a behavioural fork.
+scikit-learn==1.7.2; python_version < "3.11"
+scikit-learn==1.9.0; python_version >= "3.11"
 joblib==1.5.3
