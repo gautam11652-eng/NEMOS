@@ -83,6 +83,19 @@ running system rather than the unit suite.
   flood -- a false positive introduced by the fix itself. Duplicate-address
   detection (a solicitation from `::`) asserts no binding and is ignored.
 
+- **Syslog/SIEM export** (`NEMOS_SYSLOG_HOST`). Findings are exported as CEF
+  over RFC 5424 syslog, the format the widest range of collectors parse
+  without a custom decoder, so NEMOS can be a component of an existing
+  detection stack rather than a second console nobody watches. UDP by default
+  because it cannot block delivery on an unreachable collector; TCP available
+  where the collector requires it. Every field is escaped before it is
+  written, which is a security boundary rather than formatting: alert fields
+  quote evidence and evidence quotes the network, so a raw newline reaching a
+  collector would let an attacker terminate the record and forge a separate
+  entry after it -- adversary-controlled text inside a record a responder
+  trusts. A test asserts a forged `CEF:0|Evil|...|All clear` embedded in a
+  finding stays inside the `msg=` field instead of becoming its own event.
+
 ### Fixed
 
 - **IPv6 was discarded before any detection ran.** `capture.py` gated on

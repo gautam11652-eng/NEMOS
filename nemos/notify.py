@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import queue
+import socket
 import threading
 import time
 import urllib.error
@@ -33,6 +34,8 @@ from ipaddress import ip_address
 from typing import Any
 from collections.abc import Callable, Mapping
 from urllib.parse import urlsplit
+
+from .version import VERSION
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +116,10 @@ class NotifierConfig:
     timeout_seconds: float = 5.0
     queue_size: int = 256
     enabled: bool = True
+    syslog_host: str = ""
+    syslog_port: int = 514
+    syslog_protocol: str = "udp"
+    syslog_facility: int = 13
 
     @property
     def telegram_configured(self) -> bool:
@@ -123,8 +130,12 @@ class NotifierConfig:
         return bool(self.webhook_url)
 
     @property
+    def syslog_configured(self) -> bool:
+        return bool(self.syslog_host)
+
+    @property
     def any_channel(self) -> bool:
-        return self.telegram_configured or self.webhook_configured
+        return self.telegram_configured or self.webhook_configured or self.syslog_configured
 
     @property
     def active(self) -> bool:
@@ -153,6 +164,13 @@ class NotifierConfig:
             timeout_seconds=_float_env("NEMOS_NOTIFY_TIMEOUT", 5.0, 0.5, 60.0),
             queue_size=_int_env("NEMOS_NOTIFY_QUEUE", 256, 8, 10_000),
             enabled=_bool_env("NEMOS_NOTIFY", True),
+            syslog_host=_syslog_sanitize(os.getenv("NEMOS_SYSLOG_HOST", "").strip())[:255],
+            syslog_port=_int_env("NEMOS_SYSLOG_PORT", 514, 1, 65_535),
+            syslog_protocol=(
+                "tcp" if os.getenv("NEMOS_SYSLOG_PROTOCOL", "udp").strip().lower() == "tcp"
+                else "udp"
+            ),
+            syslog_facility=_int_env("NEMOS_SYSLOG_FACILITY", 13, 0, 23),
         )
 
 
@@ -360,6 +378,142 @@ class DeliveryError(RuntimeError):
     """Raised by a channel when a single delivery attempt fails."""
 
 
+# CEF severity is 0-10. NEMOS severities map onto the bands SIEMs conventionally
+# treat as low / medium / high / very high.
+CEF_SEVERITY = {"LOW": 3, "MEDIUM": 5, "HIGH": 7, "CRITICAL": 9}
+
+SYSLOG_MAX_BYTES = 8192
+
+
+def _cef_header_escape(value: str) -> str:
+    r"""Escape a CEF header field, where ``\`` and ``|`` are structural."""
+    return str(value).replace("\\", "\\\\").replace("|", "\\|")
+
+
+def _cef_extension_escape(value: str) -> str:
+    r"""Escape a CEF extension value, where ``\`` and ``=`` are structural.
+
+    Newlines are escaped rather than passed through. This is a security
+    boundary, not cosmetics: alert fields carry attacker-influenced content,
+    and a raw newline reaching a syslog collector lets an attacker terminate
+    the record and forge an entirely separate log entry after it.
+    """
+    text = str(value).replace("\\", "\\\\").replace("=", "\\=")
+    return text.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+
+
+def _syslog_sanitize(value: str) -> str:
+    """Strip characters that would break out of a syslog record."""
+    return "".join(ch for ch in str(value) if ch not in "\r\n\x00")
+
+
+def format_cef(alert: Mapping[str, Any], version: str) -> str:
+    """Render one finding as ArcSight CEF.
+
+    CEF is the format the widest range of collectors (Splunk, QRadar, Elastic,
+    Wazuh) parse without a custom decoder, which is the point of exporting at
+    all: a finding that only exists in NEMOS's own dashboard is not part of
+    anyone's detection stack.
+    """
+    severity = str(alert.get("severity") or "LOW").upper()
+    header = "|".join([
+        "CEF:0",
+        "NEMOS",
+        "NEMOS",
+        _cef_header_escape(version),
+        _cef_header_escape(alert.get("threat") or "FINDING"),
+        _cef_header_escape(alert.get("threat") or "Finding"),
+        str(CEF_SEVERITY.get(severity, 3)),
+    ])
+    # A custom field carries its label only when it carries a value: a bare
+    # cs1Label with no cs1 is noise a SIEM has to filter back out.
+    fields: list[tuple[str, Any, str]] = [
+        ("src", alert.get("source"), ""),
+        ("dst", alert.get("destination"), ""),
+        ("dpt", alert.get("destination_port"), ""),
+        ("proto", alert.get("protocol"), ""),
+        ("cat", alert.get("category"), ""),
+        ("cn1", alert.get("risk_score"), "riskScore"),
+        ("cn2", alert.get("confidence"), "confidence"),
+        ("cs1", alert.get("technique"), "mitreTechnique"),
+        ("cs2", alert.get("incident_id"), "incidentId"),
+        ("rt", alert.get("timestamp"), ""),
+        ("msg", alert.get("reason"), ""),
+    ]
+    parts: list[str] = []
+    for key, value, label in fields:
+        if value in (None, ""):
+            continue
+        parts.append(f"{key}={_cef_extension_escape(value)}")
+        if label:
+            parts.append(f"{key}Label={label}")
+    extension = " ".join(parts)
+    return f"{header}|{extension}" if extension else header
+
+
+class SyslogChannel(_Channel):
+    """Export findings to a SIEM over syslog.
+
+    Deliberately not built on the HTTP ``transport``: syslog is a datagram or
+    stream protocol, so this channel owns its socket. UDP is the default
+    because it cannot block the delivery worker on an unreachable collector;
+    TCP is available where the collector requires it and losses matter more
+    than latency.
+    """
+
+    name = "syslog"
+
+    def __init__(self, host: str, port: int = 514, protocol: str = "udp",
+                 facility: int = 13, hostname: str = "", socket_factory=None):
+        self.host = host
+        self.port = int(port)
+        self.protocol = protocol.lower().strip()
+        self.facility = int(facility)
+        self.hostname = _syslog_sanitize(hostname or socket.gethostname())[:255] or "-"
+        self._socket_factory = socket_factory or socket.socket
+
+    def _priority(self, severity: str) -> int:
+        # Syslog PRI = facility * 8 + severity, where syslog severity counts
+        # down: 3 is Error, 4 Warning, 5 Notice.
+        level = {"CRITICAL": 2, "HIGH": 3, "MEDIUM": 4, "LOW": 5}.get(severity.upper(), 5)
+        return self.facility * 8 + level
+
+    def render(self, alert: Mapping[str, Any]) -> str:
+        """RFC 5424 framing around a CEF payload."""
+        severity = str(alert.get("severity") or "LOW").upper()
+        timestamp = _syslog_sanitize(alert.get("timestamp") or "")[:64] or "-"
+        message = format_cef(alert, VERSION)
+        line = (
+            f"<{self._priority(severity)}>1 {timestamp} {self.hostname} NEMOS - "
+            f"{_syslog_sanitize(alert.get('threat') or 'FINDING')[:32]} - {message}"
+        )
+        return _syslog_sanitize(line)
+
+    def send(self, alert: Mapping[str, Any], transport: Transport, timeout: float) -> None:
+        payload = self.render(alert).encode("utf-8", "replace")[:SYSLOG_MAX_BYTES]
+        try:
+            if self.protocol == "tcp":
+                sock = self._socket_factory(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    sock.settimeout(timeout)
+                    sock.connect((self.host, self.port))
+                    # RFC 6587 non-transparent framing: collectors delimit on
+                    # the newline, which is why the payload can never contain
+                    # one of its own.
+                    sock.sendall(payload + b"\n")
+                finally:
+                    sock.close()
+            else:
+                sock = self._socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sock.settimeout(timeout)
+                    sock.sendto(payload, (self.host, self.port))
+                finally:
+                    sock.close()
+        except OSError as exc:
+            raise DeliveryError(f"syslog delivery to {self.host}:{self.port} failed: {exc}") from exc
+
+
 @dataclass
 class _Counters:
     accepted: int = 0
@@ -395,6 +549,15 @@ class AlertNotifier:
             if self.config.webhook_configured:
                 channels.append(
                     WebhookChannel(self.config.webhook_url, self.config.webhook_token)
+                )
+            if self.config.syslog_configured:
+                channels.append(
+                    SyslogChannel(
+                        self.config.syslog_host,
+                        self.config.syslog_port,
+                        self.config.syslog_protocol,
+                        self.config.syslog_facility,
+                    )
                 )
         self.channels = channels
 
@@ -611,6 +774,8 @@ __all__ = [
     "SEVERITY_ORDER",
     "TelegramChannel",
     "WebhookChannel",
+    "SyslogChannel",
+    "format_cef",
     "format_alert_text",
     "http_post",
     "redact",

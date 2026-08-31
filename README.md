@@ -74,14 +74,14 @@ This section exists because these distinctions matter more than marketing does.
 - Incident correlation with stable incident IDs and preserved evidence
 - MITRE ATT&CK technique references **only** where the observed behaviour
   supports the mapping; generic anomalies stay explicitly unmapped
-- Optional outbound alerting to Telegram or a webhook, with a severity floor,
-  per-finding cooldown and rate limiting
+- Optional outbound alerting to Telegram, a webhook, or a SIEM as CEF over
+  syslog, with a severity floor, per-finding cooldown and rate limiting
 - SQLite WAL storage behind a single batched writer thread with bounded,
   priority-aware backpressure
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 567 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 593 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -679,6 +679,38 @@ The URL must be HTTPS unless it points at loopback: alert bodies describe your
 network and are not sent in cleartext. Redirects are refused rather than
 followed, so a redirect cannot downgrade the transport or retarget the payload.
 
+### Syslog / SIEM
+
+Findings can be exported as **CEF over RFC 5424 syslog**, the format Splunk,
+QRadar, Elastic and Wazuh parse without a custom decoder — so NEMOS can be a
+component of an existing detection stack rather than a second console nobody
+watches.
+
+```env
+NEMOS_SYSLOG_HOST=10.0.0.9
+NEMOS_SYSLOG_PORT=514
+NEMOS_SYSLOG_PROTOCOL=udp      # or tcp
+NEMOS_SYSLOG_FACILITY=13
+```
+
+A finding arrives looking like this:
+
+```
+<107>1 2026-01-01T00:00:00+00:00 sensor NEMOS - PORT_SCAN - CEF:0|NEMOS|NEMOS|4.1.0|PORT_SCAN|PORT_SCAN|7|src=203.0.113.9 dst=192.168.1.10 dpt=443 proto=TCP cn1=74 cn1Label=riskScore cs1=T1595 cs1Label=mitreTechnique cs2=NEMOS-ABC123 cs2Label=incidentId msg=20 distinct ports probed in 10s
+```
+
+UDP is the default because it cannot block delivery on an unreachable
+collector; TCP is available where the collector requires it and losses matter
+more than latency.
+
+Every field is escaped before it is written. This is a security boundary, not
+formatting: alert fields quote evidence, evidence quotes the network, and a
+raw newline reaching a collector would let an attacker end the record and
+forge a second one after it — putting adversary-controlled text into a record
+a responder trusts. Newlines, pipes and equals signs are escaped, and a test
+asserts a forged `CEF:0|Evil|...|All clear` inside a finding stays inside the
+`msg=` field instead of becoming its own event.
+
 ### Tuning what gets sent
 
 | Variable | Default | Purpose |
@@ -785,7 +817,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 567 tests
+python -m pytest -q                              # 593 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
