@@ -102,6 +102,23 @@ class PerformanceClaimTests(unittest.TestCase):
                                 cwd=ROOT, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_the_documented_sample_size_matches_the_benchmark_default(self):
+        """A reader running the tool must get the configuration we claim.
+
+        The README described 12,000 packets per profile while the tool's
+        default had moved to 20,000, so the published numbers were measured
+        under settings nobody could reproduce by following the instructions
+        beside them.
+        """
+        script = (ROOT / "tools" / "benchmark.py").read_text()
+        default = re.search(r'"--packets".*?default=([\d_]+)', script, re.S)
+        self.assertIsNotNone(default, "benchmark.py no longer declares a --packets default")
+        actual = int(default.group(1).replace("_", ""))
+        for claim in re.findall(r"([\d,]+) packets per profile", README):
+            self.assertEqual(
+                int(claim.replace(",", "")), actual,
+                f"README claims {claim} packets per profile; the tool defaults to {actual}")
+
     def test_readme_points_at_the_benchmark_for_its_numbers(self):
         self.assertIn("tools/benchmark.py", README)
         self.assertIn("## Performance", README)

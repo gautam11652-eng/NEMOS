@@ -163,6 +163,28 @@ service port to an ephemeral port are therefore excluded from the scanned-port
 set. Probes are never excluded — only packets that are unambiguously part of an
 established session.
 
+### Two time scales
+
+The windowed rules are cheap because the window is short, and that is also
+their evasion: an attacker who paces a scan below the threshold is invisible
+to every one of them. Widening the window does not fix it — per-packet cost
+is linear in window occupancy, so an hour-long packet window costs roughly
+360x more on the capture thread, which is dropped traffic.
+
+`nemos/slowscan.py` is a second tier at a much lower resolution. It records
+one `(destination, port) -> timestamp` entry per packet (O(1), no scanning)
+and evaluates that bounded set on a per-source interval rather than per
+packet. The measured cost is 0.5 us/packet.
+
+Two details matter. Eviction is not LRU: a slow scanner is by definition the
+least recently active source tracked, so recency-based eviction would discard
+exactly what the tier exists to catch — fully expired sources go first, then
+the source with the fewest distinct endpoints. And the sweep rule ignores
+common client ports, because a workstation browsing the web contacts hundreds
+of hosts an hour on 443 with the same shape as a horizontal sweep and none of
+the meaning. A source a windowed rule has already reported is silenced here,
+so one behaviour is not reported by both tiers.
+
 ### Address families
 
 IPv4 and IPv6 share one parse path and one set of rules. TCP and UDP are the

@@ -13,6 +13,7 @@ from typing import Any
 
 from .behavioral import AdaptiveBehaviorProfiler, BehaviorObservation
 from .models import Alert, TrafficEvent, utc_now
+from .slowscan import SlowHorizonTracker
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +54,15 @@ class DetectionConfig:
     beacon_max_jitter: float = 0.15
     beacon_min_period: float = 2.0
     beacon_horizon: float = 900.0
+    # Long-horizon reconnaissance, for scans paced below the window above.
+    # Kept separate because this tier records far less per packet: see
+    # nemos/slowscan.py.
+    slow_horizon: float = 3600.0
+    slow_scan_ports: int = 40
+    slow_sweep_hosts: int = 30
+    slow_eval_interval: float = 30.0
+    slow_max_sources: int = 1024
+    slow_max_tracked: int = 256
     cooldown: int = 30
     correlation_window: int = 60
     max_sources: int = 4096
@@ -137,6 +147,17 @@ class DetectionConfig:
                 "NEMOS_DETECT_BEACON_MIN_PERIOD", defaults.beacon_min_period, 0.5, 3600.0),
             beacon_horizon=real(
                 "NEMOS_DETECT_BEACON_HORIZON", defaults.beacon_horizon, 60.0, 86_400.0),
+            slow_horizon=real("NEMOS_DETECT_SLOW_HORIZON", defaults.slow_horizon, 60.0, 86_400.0),
+            slow_scan_ports=integer(
+                "NEMOS_DETECT_SLOW_SCAN_PORTS", defaults.slow_scan_ports, 5, 65_535),
+            slow_sweep_hosts=integer(
+                "NEMOS_DETECT_SLOW_SWEEP_HOSTS", defaults.slow_sweep_hosts, 5, 100_000),
+            slow_eval_interval=real(
+                "NEMOS_DETECT_SLOW_EVAL_SECONDS", defaults.slow_eval_interval, 1.0, 600.0),
+            slow_max_sources=integer(
+                "NEMOS_DETECT_SLOW_MAX_SOURCES", defaults.slow_max_sources, 64, 100_000),
+            slow_max_tracked=integer(
+                "NEMOS_DETECT_SLOW_MAX_TRACKED", defaults.slow_max_tracked, 32, 10_000),
             cooldown=integer("NEMOS_DETECT_COOLDOWN", defaults.cooldown, 0, 3600),
             correlation_window=integer(
                 "NEMOS_DETECT_CORRELATION_WINDOW", defaults.correlation_window, 5, 3600),
@@ -273,6 +294,14 @@ class ThreatDetector:
         # Destinations already judged to be beacon targets for a source.
         # Bounded for the same reason as every other attacker-keyed map.
         self.beacon_targets: OrderedDict[tuple[str, str], float] = OrderedDict()
+        self.slow = SlowHorizonTracker(
+            horizon=self.cfg.slow_horizon,
+            scan_ports=self.cfg.slow_scan_ports,
+            sweep_hosts=self.cfg.slow_sweep_hosts,
+            eval_interval=self.cfg.slow_eval_interval,
+            max_sources=self.cfg.slow_max_sources,
+            max_tracked=self.cfg.slow_max_tracked,
+        )
         self._private_cache: OrderedDict[str, bool] = OrderedDict()
         self.internal_networks = self._parse_networks(
             os.getenv("NEMOS_INTERNAL_NETWORKS", "")
@@ -829,6 +858,26 @@ class ThreatDetector:
                     "deviations_sigma": behavior.deviations,
                     "threshold_sigma": self.cfg.baseline_sigma_threshold,
                 },
+            )
+
+        # Long-horizon reconnaissance. Recording is O(1) per packet; the
+        # bounded walk inside evaluate() is rate-limited per source, so this
+        # does not reintroduce the per-packet cost that the short window
+        # exists to avoid.
+        self.slow.observe(e.source, e.destination, e.destination_port, now)
+        if out and any(
+            alert.category in ("NETWORK_RECONNAISSANCE", "NETWORK_DISCOVERY")
+            for alert in out
+        ):
+            # A windowed rule already reported this source. Reporting the same
+            # behaviour again from the slow tier would be a duplicate, not a
+            # second detection.
+            self.slow.note_fast_finding(e.source, now)
+        for finding in self.slow.evaluate(e.source, now):
+            add(
+                finding["threat"], "NETWORK_RECONNAISSANCE", 72, finding["reason"],
+                "T1595" if not self._private(e.source) else "T1046",
+                confidence=80, evidence=finding["evidence"],
             )
 
         return out

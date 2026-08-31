@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 593 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 617 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -293,6 +293,12 @@ value is clamped on load, so a bad setting cannot silently disable a rule.
 | `NEMOS_DETECT_BEACON_MAX_JITTER` | `0.15` | Maximum timing variance still counted as periodic |
 | `NEMOS_DETECT_BEACON_MIN_PERIOD` | `2.0` | Shortest interval (seconds) considered beaconing, not chatter |
 | `NEMOS_DETECT_BEACON_HORIZON` | `900.0` | How far back (seconds) beacon timing history is kept |
+| `NEMOS_DETECT_SLOW_HORIZON` | `3600.0` | Long-horizon window, seconds, for scans paced below `NEMOS_DETECT_WINDOW` |
+| `NEMOS_DETECT_SLOW_SCAN_PORTS` | `40` | Distinct ports on one host over the horizon to flag a slow vertical scan |
+| `NEMOS_DETECT_SLOW_SWEEP_HOSTS` | `30` | Hosts on one uncommon port over the horizon to flag a slow sweep |
+| `NEMOS_DETECT_SLOW_EVAL_SECONDS` | `30.0` | How often the slow tier is evaluated per source (recording is per packet and O(1)) |
+| `NEMOS_DETECT_SLOW_MAX_SOURCES` | `1024` | Sources tracked in the slow tier |
+| `NEMOS_DETECT_SLOW_MAX_TRACKED` | `256` | Endpoints remembered per source in the slow tier |
 | `NEMOS_DETECT_COOLDOWN` | `30` | Seconds before the same rule can refire for the same source |
 | `NEMOS_DETECT_CORRELATION_WINDOW` | `60` | Seconds findings from one source share an incident id |
 | `NEMOS_DETECT_MAX_SOURCES` | `4096` | Distinct sources tracked at once, LRU-evicted beyond this |
@@ -817,7 +823,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 593 tests
+python -m pytest -q                              # 617 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
@@ -887,7 +893,8 @@ repository so you can check it on your own hardware rather than trusting it:
 python tools/benchmark.py
 ```
 
-Measured on Python 3.11, 12,000 packets per profile:
+Measured on Python 3.11 at the tool's default of 20,000 packets per profile,
+on a dedicated machine:
 
 | Profile | Distinct sources | Packets/sec | µs/packet |
 | --- | ---: | ---: | ---: |
@@ -895,6 +902,10 @@ Measured on Python 3.11, 12,000 packets per profile:
 | Office | 500 | 29,147 | 34.3 |
 | Large segment | 5,000 | 38,319 | 26.1 |
 | Spoofing flood | 50,000 | 31,654 | 31.6 |
+
+These are one machine's numbers, not a specification. A shared or virtualised
+host will report considerably less — run the benchmark on the hardware you
+intend to deploy on and plan against what it tells you.
 
 **Read the slowest row, not the fastest.** Detection cost is driven by how many
 events sit in a source's window, not by the packet rate. A few busy hosts fill

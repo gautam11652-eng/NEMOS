@@ -96,7 +96,34 @@ running system rather than the unit suite.
   trusts. A test asserts a forged `CEF:0|Evil|...|All clear` embedded in a
   finding stays inside the `msg=` field instead of becoming its own event.
 
+- **Low-and-slow reconnaissance** (`SLOW_PORT_SCAN`, `SLOW_HOST_SWEEP`). Every
+  volumetric rule works over one short window, which is what makes them cheap
+  and is also a published evasion: spread the same scan over hours and no
+  single window crosses a threshold. Widening the window is not the fix --
+  per-packet cost is linear in window size, so an hour-long packet window
+  would cost ~360x more on the capture thread. `nemos/slowscan.py` keeps a
+  much coarser record instead: recording is one dict write per packet, and
+  the bounded walk that evaluates it is rate-limited per source. Measured
+  overhead is 0.5 us/packet, 0.2%. Eviction deliberately does not use LRU --
+  a slow scanner is by definition the least recently active thing tracked, so
+  recency-based eviction would discard exactly what this exists to catch;
+  expired sources go first, then the source with the fewest distinct
+  endpoints. The sweep rule ignores common client ports (443, 53, 80 and
+  similar) because a workstation browsing the web contacts hundreds of hosts
+  an hour with the same shape and none of the meaning.
+
 ### Fixed
+
+- **A new source in the slow tier could evict itself.** `_evict_source` ran
+  before `last_seen` was assigned, so a state still holding its `0.0` default
+  looked infinitely stale and was the one selected for eviction. Once the
+  source table filled, the slow tier silently stopped tracking anything new.
+  Found by a bounding test, not by inspection.
+- **The README described a benchmark configuration nobody could reproduce.**
+  It documented 12,000 packets per profile while `tools/benchmark.py` had
+  moved to a default of 20,000, so the published numbers were measured under
+  settings that did not match the command printed beside them. A test now
+  pins the documented sample size to the tool's actual default.
 
 - **IPv6 was discarded before any detection ran.** `capture.py` gated on
   `haslayer(IP)`, so every v6 packet was dropped at the parse path. Nothing
