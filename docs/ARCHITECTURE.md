@@ -70,6 +70,8 @@ extraction and model inference can never add latency to packet capture.
 | `nemos/storage.py` | The single SQLite writer thread: batching, retention, backpressure |
 | `nemos/database.py` | Schema, indexes, pragmas and additive migrations |
 | `nemos/notify.py` | Outbound alert delivery to Telegram and webhooks |
+| `nemos/slowscan.py` | Long-horizon reconnaissance tier for scans paced below the detection window |
+| `nemos/drift.py` | Compares live traffic against the model's training distribution |
 | `nemos/watchdog.py` | Detects a dead capture thread and pings systemd's own watchdog |
 | `nemos/api.py` | The Flask application: JSON API, auth, security headers |
 

@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 617 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 645 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -566,6 +566,28 @@ python tools/train_model.py --source synthetic --window 10
 This generates RFC 5737 documentation traffic in memory. It proves the pipeline
 works; it says nothing about your network, and the tool says so on completion.
 
+### Knowing when to retrain
+
+A model trained once and never revisited fails silently in both directions:
+traffic drifts away from what it learned and ordinary work starts scoring
+anomalous, or the network grows into what it considers normal and it stops
+flagging what it should. Neither raises an error.
+
+`/api/status` reports three independent signals under
+`analysis.model.health`:
+
+| Signal | Meaning |
+| --- | --- |
+| `age_days` / `stale` | Time since training. Reported separately from any verdict, because age alone is not evidence — a model on a stable network stays valid far longer than the 90-day mark that raises `stale`. |
+| `drifted` / `drifted_features` | Each feature's live mean against its training mean, in training standard deviations. A feature 4+ sigmas out is named with its numbers; the model is only called drifted once ~a third of features have moved, since one moved feature is a changed service rather than a changed network. |
+| `score_inflated` / `anomalous_fraction` | Share of windows in the anomalous bands. If most windows are anomalous, a stale calibration is the likelier explanation than a network under continuous attack. |
+
+`drift_comparable` reports whether the comparison could run at all, so a
+check that could not execute is never mistaken for one that passed.
+
+None of these assert the model is wrong. They are the evidence for deciding
+whether to retrain, and the report names which signal fired.
+
 ### Model lifecycle
 
 - **Persistence** — model and calibration are written atomically to
@@ -823,7 +845,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 617 tests
+python -m pytest -q                              # 645 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit

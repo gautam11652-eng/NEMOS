@@ -112,8 +112,34 @@ running system rather than the unit suite.
   similar) because a workstation browsing the web contacts hundreds of hosts
   an hour with the same shape and none of the meaning.
 
+- **Model drift and staleness reporting** (`nemos/drift.py`, surfaced at
+  `/api/status` under `analysis.model.health`). The Isolation Forest is
+  trained once, by hand, and was then never mentioned again -- so both
+  failure modes were silent: traffic moves away from the training
+  distribution and ordinary work starts scoring anomalous until the operator
+  learns to ignore the layer, or the network grows into what the model
+  considers normal and it stops flagging what it should. Neither produces an
+  error; the dashboard shows a model that is loaded and scoring, which is
+  what it shows when all is well. Three independent signals are now reported
+  from data the model already persists at training time: age since training,
+  per-feature distance from the training distribution in training sigmas, and
+  the share of windows landing in anomalous bands. None is asserted as "the
+  model is wrong" -- they are the evidence for deciding whether to retrain,
+  and the report says which fired. Statistics are accumulated with Welford's
+  method on the analysis thread and reset on train and load, so a freshly
+  trained model cannot report drift against its own training data.
+
 ### Fixed
 
+- **Feature drift was silently never assessed.** The engine keeps the
+  training mean and spread in their own fields rather than in `_metadata`,
+  and `status()` passed `_metadata` alone -- so the monitor had nothing to
+  compare against and reported "not drifted" for traffic dozens of sigmas
+  from training, which is indistinguishable from a healthy model. Found by
+  running it against a real trained model rather than the hand-written
+  metadata the unit tests used. The monitor now reports
+  `drift_comparable: false` with a reason when it cannot compare, so a check
+  that could not run can never again look like a check that passed.
 - **A new source in the slow tier could evict itself.** `_evict_source` ran
   before `last_seen` was assigned, so a state still holding its `0.0` default
   looked infinitely stale and was the one selected for eviction. Once the

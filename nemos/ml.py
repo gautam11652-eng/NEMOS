@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Sequence
 
+from .drift import DriftMonitor
 from .ownership import give_back
 from .features import FEATURE_NAMES, FEATURE_SCHEMA_VERSION, FeatureVector
 
@@ -175,6 +176,9 @@ class AnomalyEngine:
         self._metadata: dict[str, Any] = {}
         self._unavailable_reason: str = "model not loaded"
         self.scored = 0
+        # Compares live traffic against what the model was trained on. Updated
+        # on the analysis thread, never on the capture path.
+        self.drift = DriftMonitor()
 
     # ---------------------------------------------------------------- state
 
@@ -201,6 +205,17 @@ class AnomalyEngine:
                 "scored_windows": self.scored,
                 "schema_version": FEATURE_SCHEMA_VERSION,
                 "metadata": dict(self._metadata),
+                # The training mean and spread are held in their own fields
+                # rather than in _metadata, so they have to be put back for
+                # the comparison. Passing _metadata alone silently disabled
+                # the feature-drift check: it reported "not drifted" for
+                # traffic dozens of sigmas from training, which looks exactly
+                # like a healthy model.
+                "health": self.drift.assess({
+                    **self._metadata,
+                    "feature_mean": list(self._feature_mean),
+                    "feature_std": list(self._feature_std),
+                }),
                 "bands": {
                     "NORMAL": f"0-{BAND_NORMAL - 1}",
                     "SUSPICIOUS": f"{BAND_NORMAL}-{BAND_SUSPICIOUS - 1}",
@@ -327,6 +342,10 @@ class AnomalyEngine:
             self._metadata = {k: v for k, v in metadata.items()
                               if k not in ("quantiles", "feature_mean", "feature_std")}
             self._unavailable_reason = ""
+        # Live statistics describe the previous model's view of the network.
+        # Carrying them forward would have a freshly trained model report
+        # drift against its own training data.
+        self.drift.reset()
 
         return TrainingReport(
             samples=len(vectors),
@@ -452,6 +471,7 @@ class AnomalyEngine:
             self._metadata = {k: v for k, v in metadata.items()
                               if k not in ("quantiles", "feature_mean", "feature_std")}
             self._unavailable_reason = ""
+        self.drift.reset()
         log.info(
             "anomaly model loaded: version=%s samples=%s trained_at=%s",
             metadata.get("model_version"), metadata.get("samples"), metadata.get("trained_at"),
@@ -514,6 +534,8 @@ class AnomalyEngine:
                 model_version=version,
                 contributing_features=self._contributions(vector, mean, std),
             ))
+        for vector, result in zip(usable, results, strict=True):
+            self.drift.observe(vector.as_row(), result.anomaly_score)
         with self._lock:
             self.scored += len(results)
         return results
