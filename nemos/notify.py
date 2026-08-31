@@ -266,10 +266,31 @@ class TelegramChannel(_Channel):
         status, detail = transport(
             "POST", url, {"Content-Type": "application/json"}, body, timeout
         )
+        safe = redact(detail, self.token)[:200]
         if status != 200:
             # The token is embedded in the URL and echoed by some errors.
+            raise DeliveryError(f"telegram responded {status}: {safe}")
+
+        # A 200 is not proof of delivery. The Bot API carries its outcome in the
+        # `ok` field of a JSON body, and can answer 200 with `"ok": false`.
+        # Trusting the status code alone reported those as delivered, so the
+        # operator saw a success for a message that was never sent -- the worst
+        # possible failure for an alerting path. The API always answers JSON, so
+        # a body that will not parse is also treated as a failure rather than
+        # assumed good.
+        try:
+            payload = json.loads(detail)
+        except (ValueError, TypeError) as exc:
             raise DeliveryError(
-                f"telegram responded {status}: {redact(detail, self.token)[:200]}"
+                f"telegram returned {status} with an unparseable body: {safe}"
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            description = ""
+            if isinstance(payload, dict):
+                description = str(payload.get("description") or "")
+            raise DeliveryError(
+                "telegram accepted the request but reported failure: "
+                f"{redact(description, self.token)[:200] or safe}"
             )
 
 

@@ -79,7 +79,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 438 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 455 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -548,6 +548,21 @@ NEMOS records findings locally by default. It can also push them to Telegram or
 a webhook. Delivery is off until you configure a channel, and it never blocks
 packet capture.
 
+### Verifying delivery
+
+NEMOS tests the delivery path against a mock Bot API, and the transport is
+verified against the live one. What it cannot test for you is the last hop:
+that *your* token and chat id put a message on *your* device. Run:
+
+```bash
+python tools/verify_telegram.py
+```
+
+It sends one clearly-labelled test message and, on failure, names the likely
+cause -- wrong token, unreachable chat, bot blocked, bot never started, missing
+post rights, or no route to api.telegram.org. Credentials are read from the
+environment or `.env`, never from arguments, and never printed.
+
 ### Telegram
 
 1. Open Telegram and start a chat with **@BotFather**.
@@ -677,7 +692,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 438 tests
+python -m pytest -q                              # 455 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit

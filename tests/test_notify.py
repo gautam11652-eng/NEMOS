@@ -36,7 +36,12 @@ def alert(severity="CRITICAL", source="192.0.2.10", threat="PORT_SCAN", **kw):
 class Recorder:
     """Test transport that records requests and returns a scripted status."""
 
-    def __init__(self, status=200, body=""):
+    # A successful Telegram response always carries {"ok": true}; the previous
+    # default of an empty body made this double more permissive than the real
+    # API, which is why a 200-with-ok-false being counted as delivered went
+    # unnoticed. Test doubles must not be kinder than the service they stand in
+    # for.
+    def __init__(self, status=200, body='{"ok":true,"result":{"message_id":1}}'):
         self.status = status
         self.body = body
         self.calls = []
@@ -385,3 +390,115 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TelegramApiContractTests(unittest.TestCase):
+    """The Bot API reports its outcome in the body, not only the status line.
+
+    Telegram can answer HTTP 200 with ``{"ok": false}``. Treating the status
+    code as proof of delivery counted those as sent, so the operator saw a
+    success for a message that never arrived -- the worst failure mode an
+    alerting path has, because it is silent.
+    """
+
+    TOKEN = "1234567890:AAFAKEfakeFAKEfakeFAKEfakeFAKEfake00"
+
+    def _channel(self):
+        from nemos.notify import TelegramChannel
+        return TelegramChannel(self.TOKEN, "-1001234567890", api_base="https://example.invalid")
+
+    def _transport(self, status, body):
+        def transport(method, url, headers, data, timeout):
+            self.captured = {"method": method, "url": url, "headers": headers,
+                             "body": json.loads(data.decode())}
+            return status, body
+        return transport
+
+    def test_ok_true_is_delivered(self):
+        self._channel().send({"threat": "T"}, self._transport(200, '{"ok":true,"result":{}}'), 5)
+
+    def test_two_hundred_with_ok_false_is_a_failure(self):
+        from nemos.notify import DeliveryError
+        body = '{"ok":false,"description":"Bad Request: message text is empty"}'
+        with self.assertRaises(DeliveryError) as caught:
+            self._channel().send({"threat": "T"}, self._transport(200, body), 5)
+        self.assertIn("reported failure", str(caught.exception))
+        self.assertIn("message text is empty", str(caught.exception))
+
+    def test_two_hundred_with_unparseable_body_is_a_failure(self):
+        """A captive portal or proxy answering 200 with HTML is not delivery."""
+        from nemos.notify import DeliveryError
+        with self.assertRaises(DeliveryError) as caught:
+            self._channel().send({"threat": "T"}, self._transport(200, "<html>hi</html>"), 5)
+        self.assertIn("unparseable", str(caught.exception))
+
+    def test_error_statuses_never_disclose_the_token(self):
+        from nemos.notify import DeliveryError
+        for status, body in (
+            (401, f'{{"ok":false,"description":"Unauthorized: bot{TelegramApiContractTests.TOKEN}"}}'),
+            (400, '{"ok":false,"description":"Bad Request: chat not found"}'),
+            (403, '{"ok":false,"description":"Forbidden: bot was blocked by the user"}'),
+            (429, '{"ok":false,"description":"Too Many Requests: retry after 30"}'),
+        ):
+            with self.assertRaises(DeliveryError) as caught:
+                self._channel().send({"threat": "T"}, self._transport(status, body), 5)
+            self.assertNotIn(self.TOKEN, str(caught.exception), f"token leaked on {status}")
+
+    def test_request_matches_the_bot_api_contract(self):
+        self._channel().send(
+            {"severity": "HIGH", "threat": "C2_BEACONING", "source": "10.0.0.5"},
+            self._transport(200, '{"ok":true}'), 5)
+        self.assertEqual(self.captured["method"], "POST")
+        self.assertTrue(self.captured["url"].endswith("/sendMessage"))
+        self.assertIn(f"/bot{self.TOKEN}/", self.captured["url"])
+        self.assertEqual(self.captured["headers"]["Content-Type"], "application/json")
+        self.assertEqual(self.captured["body"]["chat_id"], "-1001234567890")
+        self.assertTrue(self.captured["body"]["disable_web_page_preview"])
+        # No parse_mode: alert text describes observed traffic and must never be
+        # handed to a markup parser.
+        self.assertNotIn("parse_mode", self.captured["body"])
+        self.assertIn("C2_BEACONING", self.captured["body"]["text"])
+
+
+class TelegramVerifierTests(unittest.TestCase):
+    """tools/verify_telegram.py is how an operator proves the last hop."""
+
+    def _tool(self):
+        import importlib.util
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[1] / "tools" / "verify_telegram.py"
+        spec = importlib.util.spec_from_file_location("verify_telegram", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_it_exists_and_imports(self):
+        self.assertTrue(hasattr(self._tool(), "main"))
+
+    def test_missing_credentials_exit_without_sending(self):
+        import os
+        from unittest import mock
+        tool = self._tool()
+        with mock.patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""}), \
+             mock.patch("sys.argv", ["verify_telegram.py"]), \
+             mock.patch.object(tool, "load_dotenv", lambda path: {}):
+            self.assertEqual(tool.main(), 2)
+
+    def test_every_documented_failure_has_a_diagnosis(self):
+        tool = self._tool()
+        for message, expect in (
+            ("telegram responded 401: Unauthorized", "token"),
+            ("chat not found", "TELEGRAM_CHAT_ID"),
+            ("bot was blocked by the user", "blocked"),
+            ("Too Many Requests", "Rate limited"),
+        ):
+            self.assertIn(expect, tool.diagnose(message))
+
+    def test_unknown_errors_still_get_actionable_advice(self):
+        self.assertTrue(self._tool().diagnose("something entirely new").strip())
+
+    def test_the_test_message_is_labelled_as_a_test(self):
+        alert = self._tool().build_alert("LOW")
+        self.assertEqual(alert["threat"], "NEMOS_DELIVERY_TEST")
+        self.assertIn("Not a detection", alert["reason"])
+        self.assertEqual(alert["risk_score"], 0)

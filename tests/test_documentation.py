@@ -101,11 +101,28 @@ class PerformanceClaimTests(unittest.TestCase):
 
 
 class HonestyTests(unittest.TestCase):
-    def test_untested_paths_are_declared_untested(self):
-        """Telegram delivery and live capture have never been exercised."""
+    def test_the_unproven_last_hop_stays_declared(self):
+        """Delivery to a real chat needs credentials this project does not have.
+
+        Live capture and the Telegram transport are now genuinely verified, so
+        this no longer pins them as untested -- but the one step that cannot be
+        proven here must never quietly become an unqualified claim of success.
+        """
         recent = CHANGELOG.split("## 4.0.0")[0]
-        self.assertRegex(recent, r"Telegram.{0,80}not\s+tested|not\s+tested.{0,80}Telegram")
-        self.assertIn("Live packet capture", recent)
+        self.assertIn("Known limitations", recent)
+        self.assertRegex(
+            recent,
+            r"valid.{0,40}token has still not been performed|no message has arrived",
+            "the unverified Telegram hop is no longer declared",
+        )
+
+    def test_verified_claims_name_how_they_were_verified(self):
+        """A "verified" claim must say what was run, not merely assert it."""
+        recent = CHANGELOG.split("## 4.0.0")[0]
+        if "### Verified" in recent:
+            block = recent.split("### Verified")[1].split("###")[0]
+            self.assertIn("test_capture_live.py", block)
+            self.assertRegex(block, r"401|round trip")
 
     def test_readme_still_states_what_nemos_is_not(self):
         self.assertIn("What NEMOS is not", README)

@@ -50,6 +50,21 @@ running system rather than the unit suite.
   (T1595) rather than Discovery (T1046); host sweeps as Remote System Discovery
   (T1018) rather than Network Service Discovery.
 
+- **Telegram counted an undelivered message as sent.** The Bot API reports its
+  outcome in the body, and can answer HTTP 200 with `{"ok": false}`. Only the
+  status line was checked, so those were recorded as delivered: a silent failure
+  in the alerting path. The response body is now authoritative. The test double
+  had defaulted to an empty body, which the real API never returns -- a fake
+  more permissive than the service it stood in for, which is why this survived.
+- **Capture reported "starting" forever on a quiet link.** State only advanced
+  to "running" when the first packet arrived, so a correctly bound sensor on an
+  idle interface was indistinguishable from one that never came up. It now flips
+  on a successful socket bind via Scapy's started_callback.
+- **A dead capture thread reported no error at all.** A BaseException such as a
+  native panic escapes `except Exception`, leaving the status stuck at
+  "starting" with `error: null`. Status is now reconciled against whether the
+  thread is alive, and reports "failed" with an actionable message.
+
 ### Changed
 
 - **Corrected a published performance claim.** 4.0.0 reported 189,356
@@ -61,12 +76,23 @@ running system rather than the unit suite.
 - Per-packet cost remains linear in window size. This predates 4.1.0 and is
   documented as a known limitation rather than left implicit.
 
+### Verified
+
+- **Live packet capture now works and is tested.** Capture binds a real socket
+  on loopback, and the TCP, UDP, DNS and ICMP parse paths were all exercised by
+  self-generated traffic (490 packets through the full sensor: capture ->
+  detector -> storage -> API -> dashboard), producing real findings. Covered by
+  tests/test_capture_live.py, which skips where raw capture is unavailable.
+- **Telegram transport verified against the live Bot API.** A request to
+  api.telegram.org completed the full DNS, TLS and HTTP round trip and returned
+  a real 401, which NEMOS parsed, redacted and diagnosed correctly.
+
 ### Known limitations
 
-- Real Telegram delivery is still **not tested**. No credentials are present in
-  the development environment; nothing has been sent.
-- Live packet capture is still **not exercised**; no interface is available in
-  the development environment.
+- Telegram delivery with a **valid** token has still not been performed: no
+  credentials exist in the development environment, so no message has arrived in
+  a real chat. Everything up to that hop is now verified, and
+  `tools/verify_telegram.py` performs the check in one command.
 
 ## 4.0.0
 

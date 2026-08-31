@@ -31,14 +31,32 @@ class PacketCapture:
             self.thread.start()
 
     def status(self) -> dict:
+        """Report capture state, reconciled against whether the thread is alive.
+
+        The worker sets its own state on the paths it can see, but a thread can
+        die in ways it cannot catch -- a BaseException such as a native panic
+        escapes ``except Exception`` entirely. Without this reconciliation the
+        sensor reported ``starting`` with no error indefinitely after the
+        capture thread had already exited, which is a silent failure: the
+        dashboard shows a sensor that looks like it is still coming up.
+        """
         with self._lock:
+            alive = bool(self.thread is not None and self.thread.is_alive())
+            state = self._state
+            error = self._error
+            if not alive and state in {"starting", "running"}:
+                state = "failed"
+                error = error or (
+                    "capture thread exited without reporting a reason; check "
+                    "privileges (CAP_NET_RAW) and the interface name"
+                )
             return {
-                "state": self._state,
-                "running": bool(self.thread and self.thread.is_alive()),
+                "state": state,
+                "running": alive,
                 "interface": self.interface or "default",
                 "packets_seen": self._packets_seen,
                 "last_packet": self._last_packet,
-                "error": self._error,
+                "error": error,
             }
 
     def stop(self, timeout=5):
@@ -110,6 +128,18 @@ class PacketCapture:
             except Exception:
                 log.exception("packet parse error")
 
+        def started():
+            """Scapy calls this once the capture socket is open.
+
+            State must flip to "running" on a successful bind, not on the first
+            packet. Keying it to traffic meant a correctly-running sensor on a
+            quiet link reported "starting" forever, which is indistinguishable
+            from a capture that never came up.
+            """
+            with self._lock:
+                if self._state == "starting":
+                    self._state = "running"
+
         try:
             with self._lock:
                 self._state = "starting"
@@ -119,6 +149,7 @@ class PacketCapture:
                 # forever waiting for the next packet.
                 sniff(
                     iface=self.interface, prn=handle, store=False, timeout=1,
+                    started_callback=started,
                 )
             with self._lock:
                 self._state = "stopped"
@@ -132,6 +163,15 @@ class PacketCapture:
                 self._state = "error"
                 self._error = str(exc)[:240]
             log.exception("capture stopped")
+        except BaseException as exc:
+            # A native panic or an injected exception is still a dead capture
+            # thread, and the operator must be told rather than left looking at
+            # a sensor stuck in "starting". Re-raised after recording it.
+            with self._lock:
+                self._state = "error"
+                self._error = f"{type(exc).__name__}: {exc}"[:240]
+            log.critical("capture thread terminated: %s", type(exc).__name__)
+            raise
 
     @staticmethod
     def _parse(packet, IP, TCP, UDP, ICMP, DNS, interface=""):
