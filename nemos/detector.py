@@ -161,6 +161,11 @@ class ThreatDetector:
     # observing the reflected leg of an amplification attack.
     AMPLIFIER_PORTS = {19, 53, 123, 161, 389, 1900, 5353, 11211}
 
+    # Linux allocates ephemeral client ports from 32768 upward. A packet
+    # arriving at one of these is almost always a reply to a connection this
+    # host opened, not a probe of a listening service.
+    EPHEMERAL_PORT_FLOOR = 32768
+
     # Periodic by design. Excluded from beacon analysis because NTP sync, DNS
     # refresh and DHCP renewal are textbook low-jitter timers -- flagging them
     # would bury real callbacks in known-benign noise.
@@ -258,6 +263,7 @@ class ThreatDetector:
         # slow dashboard.
         agg = self._aggregate(bucket, e.source)
         ports = agg["ports"]
+        scan_ports = agg["scan_ports"]
         destinations = agg["destinations"]
         tcp_syn = agg["tcp_syn"]
         tcp_syn_ports = agg["tcp_syn_ports"]
@@ -280,25 +286,25 @@ class ThreatDetector:
 
         # Vertical scan: many ports on one or a few hosts. SYN evidence raises
         # confidence because a SYN-only burst is a stronger scan indicator.
-        if len(ports) >= self.cfg.port_scan:
+        if len(scan_ports) >= self.cfg.port_scan:
             syn_ratio = len(tcp_syn) / max(1, len(bucket))
             # ATT&CK separates pre-compromise scanning from the inside from
             # post-compromise service discovery. The source address decides
             # which one the evidence actually supports.
             external = not self._private(e.source)
             scan_technique = "T1595" if external else "T1046"
-            scan_score = min(96, 50 + len(ports) * 3 + (15 if syn_ratio >= 0.5 else 0))
-            scan_conf = min(99, 58 + len(ports) * 3 + (18 if syn_ratio >= 0.5 else 0))
+            scan_score = min(96, 50 + len(scan_ports) * 3 + (15 if syn_ratio >= 0.5 else 0))
+            scan_conf = min(99, 58 + len(scan_ports) * 3 + (18 if syn_ratio >= 0.5 else 0))
             add(
                 "PORT_SCAN", "NETWORK_RECONNAISSANCE", scan_score,
-                f"{len(ports)} unique destination ports in {self.cfg.window}s",
+                f"{len(scan_ports)} unique destination ports in {self.cfg.window}s",
                 scan_technique, confidence=scan_conf,
-                ports_scanned=len(ports), packets=len(bucket),
-                destinations=len(destinations), ports=len(ports),
+                ports_scanned=len(scan_ports), packets=len(bucket),
+                destinations=len(destinations), ports=len(scan_ports),
                 evidence={
                     "scan_type": "vertical",
                     "source_position": "external" if external else "internal",
-                    "ports": sorted(ports)[:100],
+                    "ports": sorted(scan_ports)[:100],
                     "syn_packets": len(tcp_syn),
                     "syn_ratio": round(syn_ratio, 3),
                     "unique_destinations": len(destinations),
@@ -765,6 +771,12 @@ class ThreatDetector:
         source_internal = self._private(source)
 
         ports: set[int] = set()
+        # Ports that could plausibly be a scan target. On a bidirectional
+        # interface -- which is what most deployments actually have, whatever
+        # the one-way-tap design assumes -- a busy server's replies land on many
+        # ephemeral ports of this host. Counting those made every server that
+        # answered several client connections look like a vertical scan.
+        scan_ports: set[int] = set()
         destinations: set[str] = set()
         tcp_syn: list[dict[str, Any]] = []
         tcp_syn_ports: set[int] = set()
@@ -813,13 +825,32 @@ class ThreatDetector:
 
             if proto == "TCP":
                 flags = x["flags"]
-                if "S" in flags and "A" not in flags:
+                initiating = "S" in flags and "A" not in flags
+                if initiating:
                     tcp_syn.append(x)
                     if port is not None:
                         tcp_syn_ports.add(port)
+                # Established-session return traffic: acknowledged, not
+                # initiating, sent from a service port to one of our ephemeral
+                # ports. That is a reply, and replies are not probes.
+                reply = (
+                    not initiating
+                    and "A" in flags
+                    and port is not None
+                    and port >= self.EPHEMERAL_PORT_FLOOR
+                    and x.get("sport") is not None
+                    and (x["sport"] < 1024 or x["sport"] in self.COMMON_SERVICE_PORTS)
+                )
+                if port is not None and not reply:
+                    scan_ports.add(port)
                 if port in self.COMMON_SERVICE_PORTS:
                     service_ports.add(port)
-                    service_count += 1
+                    # Count connection attempts, not packets. The rule is named
+                    # for connections and a single TLS session is dozens of
+                    # packets, so counting packets made ordinary browsing trip
+                    # a threshold meant to describe a burst of connections.
+                    if initiating:
+                        service_count += 1
                 if port is not None:
                     endpoint[(dst, port)] = endpoint.get((dst, port), 0) + 1
                     # Stealth probes are defined purely by flag combination.
@@ -845,6 +876,7 @@ class ThreatDetector:
                 udp_count += 1
                 if port is not None:
                     udp_ports.add(port)
+                    scan_ports.add(port)
             elif proto == "ICMP":
                 icmp_count += 1
                 icmp_bytes += size
@@ -861,7 +893,7 @@ class ThreatDetector:
 
         return {
             "source_internal": source_internal,
-            "ports": ports, "destinations": destinations,
+            "ports": ports, "scan_ports": scan_ports, "destinations": destinations,
             "tcp_syn": tcp_syn, "tcp_syn_ports": tcp_syn_ports,
             "udp_ports": udp_ports, "udp_count": udp_count,
             "icmp_destinations": icmp_destinations,

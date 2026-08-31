@@ -117,10 +117,38 @@ running system rather than the unit suite.
   The credentials used were the operator's and are not stored in this
   repository.
 
+### Fixed (found by capturing on a physical interface)
+
+Capture was run on a real Ethernet NIC (virtio_net, MTU 1400) carrying this
+host's own routed traffic to real remote hosts — 186 packets, correct
+link-layer parsing, real addresses. It exercised what loopback cannot: Ethernet
+framing, genuine remote endpoints, and **both directions of every conversation**.
+Two detection-quality bugs surfaced immediately, and both would have fired
+continuously on any ordinary deployment.
+
+- **Every busy server was reported as a port scanner.** NEMOS is designed
+  around unidirectional flows, but most people point it at a normal interface,
+  where replies are visible too. A web server answering several client
+  connections sends to many *ephemeral* ports of this host, which the scan rule
+  counted as scanned ports. The observed finding had all 8 ports ephemeral,
+  `syn_ratio 0.0`, one source port (443) and one destination — the inverse of a
+  scan in every dimension. Established-session return traffic (acknowledged,
+  not initiating, from a service port to an ephemeral port) is now excluded
+  from the scanned-port set. SYN probes are never excluded, so a real sweep
+  from a service source port still fires.
+- **SERVICE_CONNECTION_BURST counted packets, not connections.** The rule is
+  named for connections and its threshold of 40 reads as a burst of them, but a
+  single TLS session is dozens of packets — four ordinary HTTPS requests
+  crossed it. It now counts connection attempts.
+
+After both fixes the same live traffic produces no findings, and all 27 rules
+still fire on the shapes they target.
+
 ### Known limitations
 
-- Capture is verified on loopback with real packets and real sockets. A
-  physical interface under sustained production load has not been exercised.
+- Capture is verified on loopback and on a physical Ethernet interface with
+  real routed traffic. A production link under sustained high load, and a
+  span/tap port carrying other hosts' traffic, have not been exercised.
 
 ## 4.0.0
 

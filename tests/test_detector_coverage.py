@@ -650,3 +650,117 @@ class CatalogIntegrityTests(unittest.TestCase):
         for technique in TECHNIQUES.values():
             first = technique.tactic.split("/")[0].strip().split()[0].lower()
             self.assertIn(first, js.lower(), f"{technique.tactic} has no chain stage")
+
+
+class BidirectionalInterfaceTests(unittest.TestCase):
+    """Traffic as seen on a normal NIC, not a one-way tap.
+
+    NEMOS is designed around unidirectional flows, but most people will point
+    it at an ordinary interface, where both directions are visible. Capturing
+    on a real NIC showed the consequence: a web server answering several client
+    connections was reported as a vertical PORT_SCAN, because its replies land
+    on many ephemeral ports of this host. Every characteristic was the inverse
+    of a scan -- all destination ports ephemeral, syn_ratio 0.0, one source
+    port, one destination -- and it would have fired against every busy server
+    on the network, continuously.
+    """
+
+    def _server_replies(self, count=12):
+        """A service answering client connections from many ephemeral ports."""
+        detector = ThreatDetector()
+        found = []
+        for i in range(count):
+            found += detector.process(TrafficEvent(
+                "2026-01-01T00:00:00Z", "203.0.113.10", "10.0.0.5", "TCP",
+                source_port=443, destination_port=40000 + i * 7,
+                packet_size=1400, flags="PA"))
+        return found
+
+    def test_server_replies_are_not_a_port_scan(self):
+        self.assertNotIn("PORT_SCAN", threats(self._server_replies()))
+
+    def test_a_real_scan_from_a_high_source_port_still_fires(self):
+        """The guard must not blind the detector to actual scanning."""
+        detector = ThreatDetector()
+        found = []
+        for port in range(20, 40):
+            found += detector.process(TrafficEvent(
+                "2026-01-01T00:00:00Z", "203.0.113.10", "10.0.0.5", "TCP",
+                source_port=54321, destination_port=port,
+                packet_size=60, flags="S"))
+        self.assertIn("PORT_SCAN", threats(found))
+
+    def test_syn_probes_to_ephemeral_ports_still_count(self):
+        """Only acknowledged replies are excluded, never probes."""
+        detector = ThreatDetector()
+        found = []
+        for i in range(12):
+            found += detector.process(TrafficEvent(
+                "2026-01-01T00:00:00Z", "203.0.113.10", "10.0.0.5", "TCP",
+                source_port=443, destination_port=40000 + i * 7,
+                packet_size=60, flags="S"))
+        self.assertIn("PORT_SCAN", threats(found),
+                      "a SYN sweep was excluded as if it were reply traffic")
+
+    def test_replies_from_a_high_source_port_still_count(self):
+        """Exclusion requires a service source port, not merely an ACK."""
+        detector = ThreatDetector()
+        found = []
+        for i in range(12):
+            found += detector.process(TrafficEvent(
+                "2026-01-01T00:00:00Z", "203.0.113.10", "10.0.0.5", "TCP",
+                source_port=51000, destination_port=40000 + i * 7,
+                packet_size=60, flags="PA"))
+        self.assertIn("PORT_SCAN", threats(found))
+
+    def test_udp_scanning_is_unaffected(self):
+        detector = ThreatDetector()
+        found = []
+        for port in range(100, 120):
+            found += detector.process(TrafficEvent(
+                "2026-01-01T00:00:00Z", "203.0.113.10", "10.0.0.5", "UDP",
+                source_port=40000, destination_port=port, packet_size=60, flags=""))
+        self.assertTrue({"PORT_SCAN", "UDP_PORT_SCAN"} & threats(found))
+
+
+class ServiceBurstCountsConnectionsTests(unittest.TestCase):
+    """The rule is named for connections; it was counting packets.
+
+    A single TLS session is dozens of packets, so four ordinary HTTPS requests
+    crossed a threshold meant to describe a burst of forty connections. Seen on
+    a real interface: browsing tripped it.
+    """
+
+    def test_a_few_conversations_do_not_trip_it(self):
+        detector = ThreatDetector()
+        found = []
+        for session in range(4):
+            for _ in range(30):          # 120 packets, only 4 connections
+                found += detector.process(TrafficEvent(
+                    "2026-01-01T00:00:00Z", "10.0.0.5", "203.0.113.7", "TCP",
+                    source_port=40000 + session, destination_port=443,
+                    packet_size=1400, flags="PA"))
+        self.assertNotIn("SERVICE_CONNECTION_BURST", threats(found))
+
+    def test_many_connection_attempts_still_trip_it(self):
+        detector = ThreatDetector()
+        found = []
+        for i in range(45):
+            found += detector.process(TrafficEvent(
+                "2026-01-01T00:00:00Z", "10.0.0.5", f"10.0.0.{i % 20 + 10}", "TCP",
+                source_port=40000 + i, destination_port=443,
+                packet_size=60, flags="S"))
+        self.assertIn("SERVICE_CONNECTION_BURST", threats(found))
+
+    def test_the_count_reported_is_connections(self):
+        detector = ThreatDetector()
+        found = []
+        for i in range(45):
+            for _ in range(3):           # each connection sends several packets
+                found += detector.process(TrafficEvent(
+                    "2026-01-01T00:00:00Z", "10.0.0.5", f"10.0.0.{i % 20 + 10}", "TCP",
+                    source_port=40000 + i, destination_port=443,
+                    packet_size=60, flags="S" if _ == 0 else "PA"))
+        alert = next(a for a in found if a.threat == "SERVICE_CONNECTION_BURST")
+        self.assertLessEqual(alert.evidence["service_connections"], 45,
+                             "packets are still being counted as connections")

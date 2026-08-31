@@ -151,6 +151,17 @@ the observation does not support. Technique IDs are stored on alerts; names and
 tactics live in the catalog so presentation metadata can be corrected without
 rewriting historical alerts.
 
+### Deployment on a bidirectional interface
+
+The flow model is unidirectional, but nothing stops an operator pointing NEMOS
+at an ordinary interface, and most will. Both directions are then visible, and
+the scan rules must not mistake replies for probes: a server answering several
+clients sends to many ephemeral ports, which counts as a vertical scan unless
+return traffic is recognised. Acknowledged, non-initiating packets from a
+service port to an ephemeral port are therefore excluded from the scanned-port
+set. Probes are never excluded — only packets that are unambiguously part of an
+established session.
+
 ## Unidirectional flows
 
 The flow key is `(source, destination, source_port, destination_port, protocol)`

@@ -79,7 +79,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 491 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 499 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -315,6 +315,12 @@ Three of these are worth singling out:
 
 Port-based identifications (mining, Tor, non-standard ports) are heuristics and
 are labelled as such in their own evidence, with confidence set accordingly.
+
+On an ordinary (bidirectional) interface NEMOS also sees the replies to your own
+connections. Those are recognised and excluded from scan analysis — otherwise
+every server that answered several clients would be reported as a port scanner.
+Probes are never excluded, so a genuine sweep still fires whatever source port
+it comes from.
 
 ### Statistical baseline
 
@@ -716,7 +722,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 491 tests
+python -m pytest -q                              # 499 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
