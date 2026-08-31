@@ -11,19 +11,20 @@ output defensible rather than impressive.
 **The score measures depth into the training distribution's tail, and is not a
 probability.** scikit-learn's ``decision_function`` returns an unbounded,
 scale-free number that is meaningless on its own. At training time NEMOS records
-that value's distribution across the training set; at inference a window is
-placed against three reference points from it -- the median, the 5th percentile
-and the minimum. Roughly 95% of training-like traffic therefore scores under 40,
-and only a window more extreme than anything the model was fitted on reaches the
-top band. See :meth:`AnomalyEngine._tail_score` for the exact mapping.
+that value's distribution; at inference a window's position is expressed in
+robust deviation units against two anchors from it -- the median and the 5th
+percentile. See :meth:`AnomalyEngine._tail_score` for the exact mapping and for
+why the training *minimum* is deliberately not used as an anchor.
 
 A plain percentile rank is the obvious alternative and is wrong: it spreads
 training data uniformly over 0-100, so half of ordinary traffic would score
 above 50.
 
-**The feature schema is versioned.** A model records the schema it was fitted
-against and refuses to score a vector built by a different one. Silently scoring
-a reordered vector would produce confident nonsense.
+**The feature contract is versioned and enforced.** A model records the schema
+version, the feature names *and* the aggregation window it was fitted against,
+and refuses to load against a mismatch. Counts and rates scale with the window,
+so a model fitted on 10s windows applied to 2s windows would score a
+distribution it never saw -- confidently, and wrongly.
 
 **Absence is not failure.** scikit-learn is optional. If it is not installed, or
 no model has been trained, or the model file is corrupt, the engine reports
@@ -62,10 +63,11 @@ MIN_TRAINING_SAMPLES = 50
 # checked separately.
 MIN_DISTINCT_SAMPLES = 20
 
-# Interpretation bands for the 0-100 anomaly score. Aligned with the mapping in
-# AnomalyEngine._tail_score: roughly 95% of training-like traffic lands under
-# BAND_NORMAL, and BAND_SUSPICIOUS is reached only below the training minimum.
-# These are triage starting points, not thresholds with statistical meaning.
+# Interpretation bands for the 0-100 anomaly score, aligned with the mapping in
+# AnomalyEngine._tail_score. Measured on the bundled scenarios, held-out normal
+# traffic stayed under BAND_NORMAL and every abnormal scenario reached
+# BAND_SUSPICIOUS or above. These are triage starting points, not thresholds
+# with statistical meaning.
 BAND_NORMAL = 40
 BAND_SUSPICIOUS = 70
 BAND_ANOMALOUS = 90
@@ -377,6 +379,12 @@ class AnomalyEngine:
             )
             return False
         try:
+            # SECURITY: joblib.load deserialises, which can execute code if the
+            # file is attacker-controlled. The model is treated as trusted
+            # operator input: it is written by tools/train_model.py into a
+            # 0700 directory with 0600 permissions, and is never fetched from a
+            # network or accepted through the API. Do not point NEMOS_MODEL_DIR
+            # at a directory other users can write to.
             import joblib
 
             metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))

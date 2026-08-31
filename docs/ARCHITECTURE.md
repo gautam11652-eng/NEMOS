@@ -23,15 +23,30 @@ network interface
       ▼
 capture.py ──────────► TrafficEvent
       │                     │
-      │                     ├──────────────► storage.py ──► SQLite (WAL)
-      │                     │                                    │
-      ▼                     ▼                                    ▼
-detector.py ◄────► behavioral.py                            api.py
-      │                                                          │
-      ▼                                                          ▼
-   Alert ──┬──► storage.py (persist first)                  dashboard
-           └──► notify.py (deliver second, best effort)
+      │        ┌────────────┼────────────────► storage.py ──► SQLite (WAL)
+      │        │            │                                      │
+      ▼        ▼            ▼                                      ▼
+detector.py  flows.py    (traffic rows)                        api.py
+   (rules)   (unidirectional flow table)                           │
+      │        │                                                   ▼
+      │        │  ── analysis.py: background thread ──         dashboard
+      │        │     window expiry                                 ┊
+      │        ▼        │                                          ┊ optional
+      │     features.py │  24 features per source per window       ▼
+      │        │        │                                     analyst.py
+      │        ├────────┴──► ml.py (Isolation Forest)         (explains only)
+      │        └───────────► behavioral.py (EMA baseline)
+      │                          │
+      └──────────────────────────┴──► fusion.py
+                                          │
+                                       Alert ──┬──► storage.py  (persist first)
+                                               └──► notify.py   (deliver second)
 ```
+
+The split matters: `detector.py` runs inline on the capture thread because its
+rules are cheap and should fire on the packet that triggers them. Everything
+inside `analysis.py` runs on its own thread on a fixed cadence, so feature
+extraction and model inference can never add latency to packet capture.
 
 ## Modules
 
@@ -43,6 +58,12 @@ detector.py ◄────► behavioral.py                            api.py
 | `nemos/capture.py` | The only Scapy adapter. Translates packets into typed `TrafficEvent` objects and reports capture state |
 | `nemos/models.py` | `TrafficEvent` and `Alert` dataclasses — the boundary types between layers |
 | `nemos/detector.py` | Deterministic rules over bounded sliding windows; owns incident correlation |
+| `nemos/flows.py` | Unidirectional flow aggregation, bounded with O(1) LRU eviction |
+| `nemos/features.py` | 24 numeric features per source per window; no ML dependency |
+| `nemos/ml.py` | Isolation Forest: training, persistence, calibration, scoring |
+| `nemos/fusion.py` | Transparent combination of rules, baseline and ML into one risk |
+| `nemos/analysis.py` | The background windowed-analysis thread tying those together |
+| `nemos/analyst.py` | Optional LLM explanation layer; performs no detection |
 | `nemos/behavioral.py` | Per-source exponentially weighted baseline over four traffic features |
 | `nemos/intelligence.py` | Incident-level triage scoring and analyst recommendations |
 | `nemos/attack.py` | MITRE ATT&CK catalog and presentation-only alert enrichment |
@@ -53,8 +74,9 @@ detector.py ◄────► behavioral.py                            api.py
 
 ## Detection
 
-Detection has two independent layers that are kept distinguishable in both the
-data model and the interface.
+Detection has three independent layers, kept distinguishable in the data model,
+the API and the interface. They answer different questions and can evidence
+different things: only deterministic rules can name a MITRE ATT&CK technique.
 
 ### Deterministic rules
 
@@ -106,6 +128,52 @@ an unmapped signal with a stated reason rather than being assigned a technique
 the observation does not support. Technique IDs are stored on alerts; names and
 tactics live in the catalog so presentation metadata can be corrected without
 rewriting historical alerts.
+
+## Unidirectional flows
+
+The flow key is `(source, destination, source_port, destination_port, protocol)`
+used exactly as observed. There is no canonicalisation, so A→B and B→A are two
+records that are never merged — a one-way tap is a first-class deployment, and
+direction is what distinguishes one host contacting two hundred destinations
+from two hundred hosts answering.
+
+The table is bounded with O(1) least-recently-observed eviction via an
+`OrderedDict`. That is not a micro-optimisation: a flow key contains
+attacker-controlled values, so a spoofing flood creates a new key per packet.
+An earlier implementation scanned for the oldest entry, making eviction O(n) per
+packet exactly when the table was full — turning the bound that exists to
+survive the flood into the bottleneck.
+
+## Machine learning
+
+`ml.py` wraps a scikit-learn Isolation Forest. Three properties make its output
+defensible rather than merely impressive:
+
+- **The score is not a probability.** It measures depth into the tail of the
+  training distribution in robust deviation units anchored on the median and
+  5th percentile — never the minimum, which is a single sample that one unusual
+  training window can use to set the entire scale.
+- **The feature contract is versioned and enforced.** Schema version, feature
+  names *and* the aggregation window are recorded at training time and checked
+  at load. Counts and rates scale with the window, so a model fitted on 10s
+  windows applied to 2s windows would score a distribution it never saw; NEMOS
+  refuses rather than reporting confident, wrong numbers.
+- **Absence degrades, never fails.** scikit-learn missing, no model, a corrupt
+  file or a mismatched schema all leave the engine unavailable with a stated
+  reason while rules and the baseline continue unaffected.
+
+Training is out-of-band by design (`tools/train_model.py`). A sensor that
+retrained itself on live traffic would learn to accept whatever it is currently
+seeing, including an intrusion in progress.
+
+## Fusion
+
+`fusion.py` combines the layers under rules that encode what each can actually
+evidence: deterministic findings set the risk floor and are the only source of a
+MITRE ATT&CK technique; statistical layers may raise a score but never lower it,
+and alone are capped below CRITICAL. Every assessment carries the arithmetic in
+its `explanation` field — a reviewer who cannot reproduce the score by hand has
+found a bug.
 
 ## Storage
 

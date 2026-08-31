@@ -8,8 +8,8 @@ public issues.
 
 | Version | Supported |
 | --- | --- |
-| 3.3.x | Yes |
-| < 3.3 | No — please upgrade |
+| 4.0.x | Yes |
+| < 4.0 | No — please upgrade |
 
 Fixes are applied to the latest release. There is no long-term support branch.
 
@@ -54,6 +54,17 @@ the traffic pattern instead — those reports are genuinely useful.
 - Run packet capture with the minimum Linux capability required (`CAP_NET_RAW`).
   Do not run the web application as root.
 - Keep `.env` out of version control and readable only by the service account.
+- **Treat the trained model as trusted input.** Loading it deserialises a
+  scikit-learn object, which can execute code if the file is attacker-controlled.
+  NEMOS writes it 0600 inside a 0700 directory and never fetches a model over the
+  network or accepts one through the API. Do not point `NEMOS_MODEL_DIR` at a
+  location other users can write to, and do not install a model from an
+  untrusted source.
+- The optional LLM analyst is off unless `NEMOS_LLM_PROVIDER` is set. When
+  enabled with a hosted provider, evidence bundles describing your network are
+  sent to that provider. Use the `ollama` provider to keep everything local.
+  NEMOS refuses to redirect a hosted provider's endpoint, so a misconfigured
+  variable cannot retarget that data.
 - Keep Python and dependencies patched; `pip-audit` runs in CI but only against
   pinned versions at the time of the run.
 - Treat alerts as detection signals, not proof of compromise.

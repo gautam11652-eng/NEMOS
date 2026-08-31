@@ -1,5 +1,118 @@
 # Changelog
 
+## 4.0.0
+
+Major release: NEMOS gains a genuine machine-learning detection layer alongside
+the existing deterministic rules, built around an explicit unidirectional flow
+model. The existing detector is unchanged in behaviour and remains the
+authoritative layer.
+
+### Added
+
+- **Unidirectional flow aggregation** (`nemos/flows.py`). The five-tuple is used
+  exactly as observed with no canonicalisation, so A->B and B->A are separate
+  records that are never merged. A one-way tap is a first-class deployment, and
+  no feature requires a response packet. `reverse_of()` correlates the opposite
+  direction without merging either side.
+- **Feature engineering** (`nemos/features.py`). 24 features per source per
+  window: volume, rates, per-flow statistics, fan-out counts, Shannon entropy
+  over destinations and ports, packet-size statistics, TCP flag ratios and
+  protocol ratios. Free of any ML dependency so it is testable and reusable on
+  its own. Ordered and schema-versioned.
+- **Unsupervised ML anomaly detection** (`nemos/ml.py`). An Isolation Forest
+  from scikit-learn, trained locally on the operator's own benign traffic. No
+  labelled attack data, no cloud service and no internet access are required.
+  Reproducible via a fixed seed; model, calibration and provenance metadata are
+  persisted atomically.
+- **Explainability.** The model exposes no per-feature attribution, so NEMOS
+  reports which features are furthest from their training mean in standard
+  deviations. Every assessment carries those alongside the score.
+- **Hybrid risk fusion** (`nemos/fusion.py`). Deterministic rules set the risk
+  floor and are the only source of an ATT&CK technique; statistical layers may
+  raise a score but never lower it, and alone cannot reach CRITICAL. Every
+  result carries the arithmetic that produced it.
+- **Explicit baseline states**: `NO_BASELINE`, `NORMAL`, `DEVIATING`,
+  `HIGHLY_DEVIATING`. A host without enough history is `NO_BASELINE` -- never
+  "normal" and never "anomalous".
+- **Windowed analysis engine** (`nemos/analysis.py`) on its own thread. The
+  capture path does one dictionary operation per packet; expiry, feature
+  extraction, batched inference and fusion happen off it.
+- **Model lifecycle CLI** (`tools/train_model.py`): train from captured traffic
+  or synthetic data, dry-run inspection, JSON output. Training is out-of-band by
+  design -- a sensor that retrained itself on live traffic would learn to accept
+  an intrusion in progress.
+- **Controlled demonstration** (`tools/demo.py`, `tools/scenarios.py`) across
+  nine traffic shapes, generated in memory using RFC 5737 documentation
+  addresses. Nothing is transmitted and no host is contacted.
+- **Optional LLM analyst** (`nemos/analyst.py`). Explains findings the other
+  layers already made; performs no detection and is never in the packet path.
+  Responses are verified against the evidence bundle and discarded if they
+  reference an IP address or technique that is not in it. Hosted provider
+  endpoints cannot be redirected by configuration; `ollama` must be loopback.
+- **API**: `/api/flows`, `/api/analysis`, `/api/anomalies`, `/api/windows`,
+  `/api/baselines`, `/api/baselines/<ip>`, `/api/analyst`, and
+  `POST /api/analyst/ask`, which takes a target and never caller-supplied
+  evidence so it cannot be used as an open LLM proxy.
+- **Dashboard**: a ML Detection section showing model state and provenance,
+  per-assessment anomaly score, baseline state, the hybrid arithmetic and the
+  contributing features. A test pins that every field maps to a real backend
+  value and forbids overstated wording.
+- Flows are persisted through the existing batched writer as a third item kind,
+  treated as telemetry for backpressure so they are dropped before findings.
+
+### Fixed
+
+- **Flow-table eviction was O(n) per packet.** It scanned for the oldest entry,
+  so the bound that exists to survive a spoofing flood became the bottleneck
+  exactly when full. Now an `OrderedDict` with O(1) LRU, matching the detector
+  and profiler. A 200,000-packet benchmark did not finish before this fix; it
+  now sustains 189,000 packets/sec. A test pins the complexity.
+- **The anomaly score anchored on the training minimum**, a single sample, so
+  one unusual training window set the whole scale. Measured here the minimum was
+  -0.255 against a 5th percentile of -0.030, stretching the band until a
+  259-port SYN scan scored 65. The score now uses robust deviation units
+  anchored on the median and 5th percentile, with bands from measured
+  separation. Scenario scores moved from 64-69 to 84-100 with normal traffic
+  still producing no finding.
+- **The aggregation window was not part of the model contract.** Counts and
+  rates scale with it, so a model fitted on 10s windows applied to 2s windows
+  scored a distribution it had never seen. Training now records the window,
+  mixed-window corpora are refused, and loading refuses a mismatch with a
+  message naming both fixes.
+- **Training accepted a degenerate corpus.** The minimum sample count counted
+  rows, so many copies of one window passed while teaching the forest nothing --
+  and a scan then scored *lower* than normal traffic. A distinct-sample minimum
+  now applies, and constant features are reported.
+- `ThreatDetector.process()` and `observe_arp()` accept an optional `now`.
+  They previously always read the monotonic clock, so replaying an hour of
+  traffic in a second placed every event in one window and manufactured
+  findings. Live capture is unchanged.
+- `/api/packet` now also feeds the windowed flow pipeline, so synthetic traffic
+  exercises flow aggregation, features and ML rather than only reaching storage.
+  It deliberately does not invoke the deterministic detector, whose per-source
+  state is owned by the capture thread.
+
+### Changed
+
+- Version 3.3.0 -> 4.0.0.
+- `scikit-learn` and `joblib` are runtime dependencies, but every import is
+  guarded: without them NEMOS runs deterministic rules plus the statistical
+  baseline exactly as before, and reports why ML is unavailable.
+- Documentation rewritten to describe the three layers separately and to state
+  plainly what each can and cannot evidence.
+
+### Testing
+
+278 -> 338 tests. Measured on this machine: 189,356 packets/sec capture-path
+ingest (5.28 us/packet), feature extraction 52.76 ms for 20,000 flows into 50
+source vectors, batched inference 15.08 ms for 50 vectors (0.302 ms per
+source-window).
+
+**Real Telegram delivery was not tested**: no credentials were present in this
+environment. The delivery path is covered by tests using a recording transport,
+which verify request shape, retry, redaction, suppression and non-blocking
+behaviour, but no message was sent to Telegram.
+
 ## 3.3.0
 
 ### Added
