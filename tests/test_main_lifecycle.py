@@ -15,6 +15,7 @@ class MainLifecycleTests(unittest.TestCase):
             capture_enabled=False, interface=None, host="127.0.0.1", port=0,
             analysis_enabled=True, analysis_window=10.0, max_flows=100,
             persist_flows=True, model_dir=Path("/tmp/nemos-test-model"),
+            heartbeat_seconds=0.0, watchdog_poll_seconds=15.0,
         )
 
         class Writer:

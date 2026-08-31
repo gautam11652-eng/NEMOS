@@ -16,6 +16,7 @@ from nemos.env import load_dotenv
 from nemos.models import TrafficEvent
 from nemos.notify import AlertNotifier, NotifierConfig
 from nemos.storage import BatchWriter
+from nemos.watchdog import SensorWatchdog
 
 
 class ShutdownRequested(Exception):
@@ -125,7 +126,24 @@ def main() -> int:
             if alert:
                 record(alert)
 
+    def watchdog_notify(alert: dict) -> bool:
+        """Log a sensor-health finding before attempting delivery.
+
+        notifier.submit() is a no-op with no channel configured or an
+        unreachable one -- exactly the condition a "sensor is blind" alert
+        most needs to survive. The log line is unconditional so the finding
+        is never silent even when delivery is.
+        """
+        log.error("SENSOR HEALTH %s: %s", alert.get("threat"), alert.get("reason"))
+        return notifier.submit(alert)
+
     capture = PacketCapture(settings.interface, event) if settings.capture_enabled else None
+    watchdog = SensorWatchdog(
+        capture_status=capture.status if capture is not None else None,
+        notify=watchdog_notify,
+        heartbeat_seconds=settings.heartbeat_seconds,
+        poll_seconds=settings.watchdog_poll_seconds,
+    )
     server = None
     stopped = threading.Event()
 
@@ -155,6 +173,7 @@ def main() -> int:
             )
         else:
             log.info("capture disabled")
+        watchdog.start()
 
         app = create_app(settings, writer, capture, notifier, analysis, analyst)
 
@@ -188,6 +207,13 @@ def main() -> int:
         log.info("shutdown requested during startup")
         return 0
     finally:
+        try:
+            # Before capture.stop(): a stopped capture thread looks identical
+            # to a dead one, and the watchdog must not alert on a shutdown it
+            # was asked to perform.
+            watchdog.stop(timeout=5)
+        except Exception:
+            log.exception("failed to stop sensor watchdog")
         if capture is not None:
             try:
                 capture.stop(timeout=5)

@@ -12,6 +12,13 @@ EnvironmentFile=-/etc/nemos/nemos.env
 ExecStart=/opt/nemos/.venv/bin/python /opt/nemos/main.py
 Restart=on-failure
 RestartSec=3
+# NEMOS pings this watchdog itself (nemos/watchdog.py) whenever packet
+# capture is healthy, and stops pinging the moment it is not -- so a capture
+# thread that dies without the process exiting still gets the process
+# restarted, which Restart=on-failure alone cannot do. NotifyAccess=main is
+# required for systemd to honour sd_notify() calls from a Type=simple unit.
+NotifyAccess=main
+WatchdogSec=90
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

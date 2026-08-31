@@ -85,17 +85,82 @@ class DetectionConfig:
             return max(lo, min(hi, value)) if isfinite(value) else default
 
         return cls(
+            # Every rule threshold below is tunable so an operator whose
+            # network genuinely runs hotter or quieter than the defaults can
+            # adjust detection without a code change and a rebuild. The
+            # defaults themselves are unchanged; each clamp only bounds what
+            # an operator can set them to, the same discipline NEMOS_API_RATE
+            # and NEMOS_MAX_EVENTS already follow.
+            window=integer("NEMOS_DETECT_WINDOW", defaults.window, 2, 300),
+            port_scan=integer("NEMOS_DETECT_PORT_SCAN", defaults.port_scan, 2, 10_000),
+            syn_flood=integer("NEMOS_DETECT_SYN_FLOOD", defaults.syn_flood, 10, 1_000_000),
+            syn_flood_concentration=real(
+                "NEMOS_DETECT_SYN_FLOOD_CONCENTRATION", defaults.syn_flood_concentration, 0.05, 1.0),
+            icmp_flood=integer("NEMOS_DETECT_ICMP_FLOOD", defaults.icmp_flood, 10, 1_000_000),
+            fanout=integer("NEMOS_DETECT_FANOUT", defaults.fanout, 2, 100_000),
+            dns_burst=integer("NEMOS_DETECT_DNS_BURST", defaults.dns_burst, 5, 1_000_000),
+            service_burst=integer("NEMOS_DETECT_SERVICE_BURST", defaults.service_burst, 2, 1_000_000),
+            udp_scan=integer("NEMOS_DETECT_UDP_SCAN", defaults.udp_scan, 2, 100_000),
+            icmp_sweep=integer("NEMOS_DETECT_ICMP_SWEEP", defaults.icmp_sweep, 2, 100_000),
+            stealth_scan=integer("NEMOS_DETECT_STEALTH_SCAN", defaults.stealth_scan, 1, 100_000),
+            lateral_hosts=integer("NEMOS_DETECT_LATERAL_HOSTS", defaults.lateral_hosts, 2, 100_000),
+            brute_force=integer("NEMOS_DETECT_BRUTE_FORCE", defaults.brute_force, 2, 1_000_000),
+            exfil_bytes=integer(
+                "NEMOS_DETECT_EXFIL_BYTES", defaults.exfil_bytes, 1_000_000, 10_000_000_000),
+            dns_tunnel_packets=integer(
+                "NEMOS_DETECT_DNS_TUNNEL_PACKETS", defaults.dns_tunnel_packets, 5, 1_000_000),
+            dns_tunnel_mean_size=integer(
+                "NEMOS_DETECT_DNS_TUNNEL_MEAN_SIZE", defaults.dns_tunnel_mean_size, 50, 65_535),
+            mining_packets=integer("NEMOS_DETECT_MINING_PACKETS", defaults.mining_packets, 1, 1_000_000),
+            tor_packets=integer("NEMOS_DETECT_TOR_PACKETS", defaults.tor_packets, 1, 1_000_000),
+            spray_hosts=integer("NEMOS_DETECT_SPRAY_HOSTS", defaults.spray_hosts, 2, 100_000),
+            spray_max_attempts=integer(
+                "NEMOS_DETECT_SPRAY_MAX_ATTEMPTS", defaults.spray_max_attempts, 1, 100_000),
+            icmp_tunnel_packets=integer(
+                "NEMOS_DETECT_ICMP_TUNNEL_PACKETS", defaults.icmp_tunnel_packets, 2, 1_000_000),
+            icmp_tunnel_mean_size=integer(
+                "NEMOS_DETECT_ICMP_TUNNEL_MEAN_SIZE", defaults.icmp_tunnel_mean_size, 50, 65_535),
+            service_dos=integer("NEMOS_DETECT_SERVICE_DOS", defaults.service_dos, 10, 1_000_000),
+            amplification_packets=integer(
+                "NEMOS_DETECT_AMPLIFICATION_PACKETS", defaults.amplification_packets, 5, 1_000_000),
+            ingress_bytes=integer(
+                "NEMOS_DETECT_INGRESS_BYTES", defaults.ingress_bytes, 1_000_000, 10_000_000_000),
+            nonstandard_packets=integer(
+                "NEMOS_DETECT_NONSTANDARD_PACKETS", defaults.nonstandard_packets, 5, 1_000_000),
+            nonstandard_min_port=integer(
+                "NEMOS_DETECT_NONSTANDARD_MIN_PORT", defaults.nonstandard_min_port, 1024, 65_535),
+            beacon_min_intervals=integer(
+                "NEMOS_DETECT_BEACON_MIN_INTERVALS", defaults.beacon_min_intervals, 3, 1000),
+            beacon_max_jitter=real(
+                "NEMOS_DETECT_BEACON_MAX_JITTER", defaults.beacon_max_jitter, 0.01, 1.0),
+            beacon_min_period=real(
+                "NEMOS_DETECT_BEACON_MIN_PERIOD", defaults.beacon_min_period, 0.5, 3600.0),
+            beacon_horizon=real(
+                "NEMOS_DETECT_BEACON_HORIZON", defaults.beacon_horizon, 60.0, 86_400.0),
+            cooldown=integer("NEMOS_DETECT_COOLDOWN", defaults.cooldown, 0, 3600),
+            correlation_window=integer(
+                "NEMOS_DETECT_CORRELATION_WINDOW", defaults.correlation_window, 5, 3600),
+            max_sources=integer("NEMOS_DETECT_MAX_SOURCES", defaults.max_sources, 64, 1_000_000),
             # Per-packet detection cost is linear in how many events a window
             # holds, so this is the dial for trading detection depth against
             # capture-path throughput. The floor stays above the largest rule
             # threshold (syn_flood at 150) so lowering it cannot silently
-            # disable a rule by starving it of evidence.
+            # disable a rule by starving it of evidence. Raising syn_flood
+            # above the default means raising this too, or the flood rule
+            # loses evidence to the eviction it competes against.
             max_events=integer("NEMOS_MAX_EVENTS", defaults.max_events, 200, 100_000),
             baseline_alpha=real("NEMOS_BEHAVIOR_ALPHA", defaults.baseline_alpha, 0.01, 1.0),
             baseline_min_samples=integer("NEMOS_BEHAVIOR_MIN_SAMPLES", defaults.baseline_min_samples, 2, 1000),
+            baseline_multiplier=real(
+                "NEMOS_DETECT_BASELINE_MULTIPLIER", defaults.baseline_multiplier, 1.0, 20.0),
+            baseline_min_events=integer(
+                "NEMOS_DETECT_BASELINE_MIN_EVENTS", defaults.baseline_min_events, 2, 100_000),
             baseline_sigma_threshold=real("NEMOS_BEHAVIOR_SIGMA", defaults.baseline_sigma_threshold, 1.0, 10.0),
-            baseline_sample_interval=real("NEMOS_BEHAVIOR_SAMPLE_SECONDS", defaults.baseline_sample_interval, 0.0, 300.0),
-            baseline_extreme_sigma=real("NEMOS_BEHAVIOR_EXTREME_SIGMA", defaults.baseline_extreme_sigma, 3.0, 15.0),
+            baseline_sample_interval=real(
+                "NEMOS_BEHAVIOR_SAMPLE_SECONDS", defaults.baseline_sample_interval, 0.0, 300.0),
+            baseline_extreme_sigma=real(
+                "NEMOS_BEHAVIOR_EXTREME_SIGMA", defaults.baseline_extreme_sigma, 3.0, 15.0),
+            min_confidence=integer("NEMOS_DETECT_MIN_CONFIDENCE", defaults.min_confidence, 0, 100),
         )
 
 

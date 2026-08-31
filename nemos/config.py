@@ -45,6 +45,10 @@ class Settings:
     max_flows: int = 20_000
     persist_flows: bool = True
     model_dir: Path | None = None
+    # Sensor watchdog: 0 disables the silence check (see nemos/watchdog.py
+    # for why that one is opt-in rather than on by default).
+    heartbeat_seconds: float = 0.0
+    watchdog_poll_seconds: float = 15.0
     @property
     def remote(self): return self.host not in {"127.0.0.1","localhost","::1"}
 
@@ -85,6 +89,8 @@ def load_settings(base: Path | None = None) -> Settings:
         _int("NEMOS_MAX_FLOWS", 20_000, 100, 1_000_000),
         _bool("NEMOS_PERSIST_FLOWS", True),
         Path(os.getenv("NEMOS_MODEL_DIR", str(data/"model"))).expanduser(),
+        _float("NEMOS_HEARTBEAT_SECONDS", 0.0, 0.0, 86_400.0),
+        _float("NEMOS_WATCHDOG_POLL_SECONDS", 15.0, 5.0, 300.0),
     )
     if s.remote and not s.api_token:
         raise ValueError("Remote bind requires NEMOS_API_TOKEN; keep host=127.0.0.1 for local use.")

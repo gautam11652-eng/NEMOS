@@ -50,6 +50,31 @@ running system rather than the unit suite.
   client mint unlimited identities. Both client tables are bounded with LRU
   eviction. Limits are clamped so a misconfigured low value cannot lock an
   operator out of their own sensor.
+- **Every deterministic-rule threshold is now tunable**, named
+  `NEMOS_DETECT_<FIELD>` after the `DetectionConfig` field it sets (34
+  variables covering window size, every flood/scan/tunnel/exfiltration
+  threshold, cooldown and correlation window). Previously only `NEMOS_MAX_EVENTS`
+  and the adaptive-baseline settings were reachable without a code change; an
+  operator whose network genuinely runs hotter or quieter than the defaults
+  had no other way to say so. Every value is clamped on load, matching the
+  discipline `NEMOS_API_RATE` already established, so a bad setting cannot
+  silently disable a rule.
+- **`nemos/watchdog.py`: a sensor watchdog.** Closes a real gap found this
+  session -- a capture thread can die while the process keeps running and
+  answering the dashboard, which is exactly the "starting forever" bug fixed
+  below, and nothing else in NEMOS notices. The watchdog polls capture health
+  on its own thread: the moment capture is reported unhealthy it submits a
+  finding through the normal alert-delivery pipeline (always logged first, so
+  the finding is never silent even when no notification channel is
+  configured or reachable), and while capture is healthy it pings systemd's
+  own watchdog (`sd_notify(WATCHDOG=1)`) so `WatchdogSec=` in the unit file
+  lets systemd restart a hung process, which `Restart=on-failure` alone
+  cannot do. A second, opt-in check (`NEMOS_HEARTBEAT_SECONDS`, off by
+  default) can also alert on prolonged silence from a capture that is
+  otherwise healthy; it defaults off because a quiet link and a cable pull
+  are indistinguishable from packet volume alone, unlike capture death.
+  `packaging/systemd/nemos.service` now sets `NotifyAccess=main` and
+  `WatchdogSec=90`.
 
 ### Fixed
 

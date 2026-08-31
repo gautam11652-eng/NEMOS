@@ -79,7 +79,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 511 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 539 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -191,6 +191,17 @@ never overridden by a stale file. Copy `.env.example` to `.env` to begin.
 | `NEMOS_TRUSTED_HOSTS` | *(none)* | Required for wildcard binds |
 | `NEMOS_LOG_LEVEL` | `INFO` | Logging level |
 
+### Sensor watchdog
+
+Detects a capture thread that has died without the process exiting — a real
+failure mode found on a live deployment, and one `Restart=on-failure` alone
+cannot catch. See [Deployment](#deployment).
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NEMOS_HEARTBEAT_SECONDS` | `0` (off) | Alert if capture goes this long with no packets. Off by default — a quiet link and a cable pull look identical from packet volume alone |
+| `NEMOS_WATCHDOG_POLL_SECONDS` | `15` | How often the watchdog checks capture health and pings systemd |
+
 ### Retention and throughput
 
 | Variable | Default | Purpose |
@@ -237,6 +248,55 @@ about your network cannot be retargeted by a misconfigured variable.
 | `NEMOS_BEHAVIOR_MIN_SAMPLES` | `8` | Warm-up before the baseline can alert |
 | `NEMOS_BEHAVIOR_SIGMA` | `3.0` | Deviation threshold |
 | `NEMOS_BEHAVIOR_SAMPLE_SECONDS` | `5.0` | Sampling cadence |
+
+### Detection rule tuning
+
+Every deterministic-rule threshold is overridable, named `NEMOS_DETECT_<FIELD>`
+after the `DetectionConfig` field it sets. The defaults were tuned against
+real traffic (including a live nmap sweep and SYN flood, see
+[Testing](#testing)) and are the right starting point for most networks; these
+exist for the network that genuinely runs hotter or quieter than that. Every
+value is clamped on load, so a bad setting cannot silently disable a rule.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NEMOS_DETECT_WINDOW` | `10` | Detection window, seconds |
+| `NEMOS_DETECT_PORT_SCAN` | `8` | Distinct ports probed to flag a scan |
+| `NEMOS_DETECT_SYN_FLOOD` | `150` | SYNs in the window to flag a flood |
+| `NEMOS_DETECT_SYN_FLOOD_CONCENTRATION` | `0.30` | Share of SYNs on one port that separates a flood from a scan |
+| `NEMOS_DETECT_ICMP_FLOOD` | `100` | ICMP packets to flag a flood |
+| `NEMOS_DETECT_FANOUT` | `25` | Distinct destinations to flag network fan-out |
+| `NEMOS_DETECT_DNS_BURST` | `80` | DNS queries to flag a burst |
+| `NEMOS_DETECT_SERVICE_BURST` | `40` | Connections to one service to flag a burst |
+| `NEMOS_DETECT_UDP_SCAN` | `12` | Distinct UDP ports to flag a scan |
+| `NEMOS_DETECT_ICMP_SWEEP` | `12` | Distinct hosts pinged to flag a sweep |
+| `NEMOS_DETECT_STEALTH_SCAN` | `6` | FIN/NULL/Xmas packets to flag a stealth scan |
+| `NEMOS_DETECT_LATERAL_HOSTS` | `5` | Internal hosts touched to flag lateral movement |
+| `NEMOS_DETECT_BRUTE_FORCE` | `20` | Auth attempts to flag brute forcing |
+| `NEMOS_DETECT_EXFIL_BYTES` | `25000000` | Outbound bytes to flag exfiltration |
+| `NEMOS_DETECT_DNS_TUNNEL_PACKETS` | `30` | DNS packets, combined with mean size, to flag tunneling |
+| `NEMOS_DETECT_DNS_TUNNEL_MEAN_SIZE` | `180` | Mean DNS packet size (bytes) that flags tunneling |
+| `NEMOS_DETECT_MINING_PACKETS` | `10` | Packets to known mining ports to flag mining |
+| `NEMOS_DETECT_TOR_PACKETS` | `10` | Packets to known Tor ports to flag Tor use |
+| `NEMOS_DETECT_SPRAY_HOSTS` | `8` | Hosts touched with repeated auth attempts to flag password spraying |
+| `NEMOS_DETECT_SPRAY_MAX_ATTEMPTS` | `6` | Attempts per host before it counts toward spraying |
+| `NEMOS_DETECT_ICMP_TUNNEL_PACKETS` | `12` | ICMP packets, combined with mean size, to flag tunneling |
+| `NEMOS_DETECT_ICMP_TUNNEL_MEAN_SIZE` | `200` | Mean ICMP packet size (bytes) that flags tunneling |
+| `NEMOS_DETECT_SERVICE_DOS` | `120` | Packets to one service endpoint to flag denial of service |
+| `NEMOS_DETECT_AMPLIFICATION_PACKETS` | `60` | Packets from known amplifier ports to flag reflection abuse |
+| `NEMOS_DETECT_INGRESS_BYTES` | `25000000` | Inbound bytes to flag an ingress transfer |
+| `NEMOS_DETECT_NONSTANDARD_PACKETS` | `40` | Packets on high, unexpected ports to flag non-standard traffic |
+| `NEMOS_DETECT_NONSTANDARD_MIN_PORT` | `10000` | Port floor for the rule above |
+| `NEMOS_DETECT_BEACON_MIN_INTERVALS` | `5` | Timing samples required before beaconing can be flagged |
+| `NEMOS_DETECT_BEACON_MAX_JITTER` | `0.15` | Maximum timing variance still counted as periodic |
+| `NEMOS_DETECT_BEACON_MIN_PERIOD` | `2.0` | Shortest interval (seconds) considered beaconing, not chatter |
+| `NEMOS_DETECT_BEACON_HORIZON` | `900.0` | How far back (seconds) beacon timing history is kept |
+| `NEMOS_DETECT_COOLDOWN` | `30` | Seconds before the same rule can refire for the same source |
+| `NEMOS_DETECT_CORRELATION_WINDOW` | `60` | Seconds findings from one source share an incident id |
+| `NEMOS_DETECT_MAX_SOURCES` | `4096` | Distinct sources tracked at once, LRU-evicted beyond this |
+| `NEMOS_DETECT_BASELINE_MULTIPLIER` | `3.0` | Deviation multiplier for the adaptive-baseline rules |
+| `NEMOS_DETECT_BASELINE_MIN_EVENTS` | `20` | Minimum events before the adaptive baseline can flag a source |
+| `NEMOS_DETECT_MIN_CONFIDENCE` | `55` | Confidence floor (0-100) below which a finding is dropped |
 
 ## Unidirectional traffic
 
@@ -723,7 +783,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 511 tests
+python -m pytest -q                              # 539 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
@@ -762,6 +822,13 @@ The unit grants `CAP_NET_RAW` only and keeps the application process
 unprivileged, while permitting the `AF_PACKET` and `AF_NETLINK` socket families
 Scapy needs. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the manual
 layout and for the post-install smoke test.
+
+The unit also sets `WatchdogSec=90`. NEMOS pings systemd itself
+(`nemos/watchdog.py`) whenever packet capture is healthy and stops the moment
+it is not, so a capture thread that dies without the process exiting still
+gets the process restarted — `Restart=on-failure` alone only helps a process
+that actually exits. This was found as a real gap: on a live deployment the
+dashboard kept answering while capture underneath it had already died.
 
 ### Remote access
 

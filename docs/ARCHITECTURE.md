@@ -70,6 +70,7 @@ extraction and model inference can never add latency to packet capture.
 | `nemos/storage.py` | The single SQLite writer thread: batching, retention, backpressure |
 | `nemos/database.py` | Schema, indexes, pragmas and additive migrations |
 | `nemos/notify.py` | Outbound alert delivery to Telegram and webhooks |
+| `nemos/watchdog.py` | Detects a dead capture thread and pings systemd's own watchdog |
 | `nemos/api.py` | The Flask application: JSON API, auth, security headers |
 
 ## Detection
@@ -263,8 +264,33 @@ endpoints reject cross-site browser writes even when no token is configured.
 Production deployments should still place HTTPS and network controls in front of
 the application.
 
+## Sensor watchdog
+
+`nemos/watchdog.py` polls `PacketCapture.status()` on its own thread. A dead
+capture thread does not raise anywhere else in NEMOS — confirmed on a real
+deployment where the Flask/waitress process kept answering the dashboard
+while capture underneath it had already exited, so `/api/status` reported
+"starting" forever. Two things follow from that:
+
+- The moment capture is reported unhealthy, the watchdog submits a finding
+  through the same delivery pipeline as every other alert (and always logs
+  it first, so the finding survives even if no notification channel is
+  configured or reachable — the case where it matters most).
+- While capture is healthy, the watchdog pings systemd's own watchdog
+  (`sd_notify(WATCHDOG=1)`) if `WatchdogSec=` is set in the unit file, and
+  stops pinging the instant it is not. `Restart=on-failure` only restarts a
+  process that exits; this lets systemd restart one that is merely hung.
+  Outside systemd, `NOTIFY_SOCKET` is unset and every call is a no-op.
+
+A second, opt-in check (`NEMOS_HEARTBEAT_SECONDS`, off by default) alerts if
+capture is healthy but has seen no packets for that long. It is off by
+default because a quiet link and a cable pull are indistinguishable from
+packet volume alone — unlike capture death, which is unambiguous.
+
 ## Shutdown
 
-`main.py` closes the HTTP server, stops capture, drains delivery, then drains the
-writer — in that order, so nothing still producing alerts outlives the machinery
-that stores them.
+`main.py` stops the watchdog before capture, so a shutdown in progress is
+never mistaken for the failure the watchdog exists to catch. It then closes
+the HTTP server, stops capture, drains delivery, then drains the writer — in
+that order, so nothing still producing alerts outlives the machinery that
+stores them.
