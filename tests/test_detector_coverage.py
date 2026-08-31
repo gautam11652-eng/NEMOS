@@ -764,3 +764,126 @@ class ServiceBurstCountsConnectionsTests(unittest.TestCase):
         alert = next(a for a in found if a.threat == "SERVICE_CONNECTION_BURST")
         self.assertLessEqual(alert.evidence["service_connections"], 45,
                              "packets are still being counted as connections")
+
+
+class SynFloodVersusScanTests(unittest.TestCase):
+    """A flood and a sweep both emit many SYNs; where they land differs.
+
+    Reported from a Kali deployment: `sudo nmap -sS -p 1-1000 10.0.2.2` was
+    detected as PORT_SCAN and TCP_SYN_SCAN -- correctly -- and also as
+    SYN_FLOOD_PATTERN at risk 90 with T1498.001. A 1000-port sweep sends well
+    past the 150-SYN threshold, so counting SYNs alone could not tell
+    enumeration from denial of service. A flood concentrates on a service in
+    order to exhaust it; a scan spreads across ports in order to enumerate them.
+    """
+
+    def _run(self, make, count=200):
+        detector = ThreatDetector()
+        found = []
+        for i in range(count):
+            found += detector.process(make(i))
+        return found
+
+    def test_nmap_style_sweep_is_not_a_flood(self):
+        found = self._run(lambda i: TrafficEvent(
+            "t", "10.0.2.15", "10.0.2.2", "TCP", 44000 + i, 1 + i, 60, "S"))
+        names = threats(found)
+        self.assertNotIn("SYN_FLOOD_PATTERN", names)
+        self.assertIn("PORT_SCAN", names, "the sweep must still be detected as a scan")
+
+    def test_flood_against_one_service_still_fires(self):
+        found = self._run(lambda i: TrafficEvent(
+            "t", "10.0.2.15", "10.0.2.2", "TCP", 44000 + i, 80, 60, "S"))
+        self.assertIn("SYN_FLOOD_PATTERN", threats(found))
+
+    def test_distributed_flood_against_one_service_still_fires(self):
+        """Many victims, one service: concentration is by port, not by host."""
+        found = self._run(lambda i: TrafficEvent(
+            "t", "10.0.2.15", f"10.0.2.{i % 200}", "TCP", 44000 + i, 80, 60, "S"))
+        self.assertIn("SYN_FLOOD_PATTERN", threats(found))
+
+    def test_evidence_names_the_targeted_service(self):
+        found = self._run(lambda i: TrafficEvent(
+            "t", "10.0.2.15", "10.0.2.2", "TCP", 44000 + i, 443, 60, "S"))
+        alert = next(a for a in found if a.threat == "SYN_FLOOD_PATTERN")
+        self.assertEqual(alert.evidence["targeted_port"], 443)
+        self.assertGreaterEqual(alert.evidence["port_concentration"], 0.30)
+        self.assertIn("concentration", alert.reason.lower() + alert.evidence["note"])
+
+    def test_a_flood_hidden_inside_a_scan_is_still_caught(self):
+        """Concentration is a ratio, so volume on one port still dominates."""
+        def traffic(i):
+            # One port takes most of the SYNs; the rest sweep.
+            port = 80 if i % 2 == 0 else 1000 + i
+            return TrafficEvent("t", "10.0.2.15", "10.0.2.2", "TCP", 44000 + i, port, 60, "S")
+        self.assertIn("SYN_FLOOD_PATTERN", threats(self._run(traffic, 400)))
+
+    def test_threshold_is_configurable(self):
+        from nemos.detector import DetectionConfig as _Config
+        self.assertEqual(_Config().syn_flood_concentration, 0.30)
+        loose = ThreatDetector(_Config(syn_flood_concentration=0.0))
+        found = []
+        for i in range(200):
+            found += loose.process(TrafficEvent(
+                "t", "10.0.2.15", "10.0.2.2", "TCP", 44000 + i, 1 + i, 60, "S"))
+        self.assertIn("SYN_FLOOD_PATTERN", threats(found),
+                      "an operator must be able to restore the old behaviour")
+
+
+class SudoOwnershipTests(unittest.TestCase):
+    """Files the sensor creates under sudo must stay usable without it.
+
+    Reported from the same deployment: `sudo python main.py` left
+    data/nemos.db owned by root, and training then failed to open a database
+    the operator appeared to own.
+    """
+
+    def test_not_root_means_no_change(self):
+        import os
+        from unittest import mock
+        from nemos.ownership import sudo_owner
+        with mock.patch.object(os, "geteuid", return_value=1000):
+            self.assertIsNone(sudo_owner())
+
+    def test_root_without_sudo_is_left_alone(self):
+        """A root login or systemd unit intends root ownership."""
+        import os
+        from unittest import mock
+        from nemos.ownership import sudo_owner
+        with mock.patch.object(os, "geteuid", return_value=0), \
+             mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(sudo_owner())
+
+    def test_root_via_sudo_returns_the_invoking_user(self):
+        import os
+        from unittest import mock
+        from nemos.ownership import sudo_owner
+        with mock.patch.object(os, "geteuid", return_value=0), \
+             mock.patch.dict(os.environ, {"SUDO_UID": "1000", "SUDO_GID": "1000"}):
+            self.assertEqual(sudo_owner(), (1000, 1000))
+
+    def test_sudo_to_root_is_not_re_owned(self):
+        """`sudo -u root` should not chown root's files to root."""
+        import os
+        from unittest import mock
+        from nemos.ownership import sudo_owner
+        with mock.patch.object(os, "geteuid", return_value=0), \
+             mock.patch.dict(os.environ, {"SUDO_UID": "0", "SUDO_GID": "0"}):
+            self.assertIsNone(sudo_owner())
+
+    def test_malformed_sudo_uid_is_ignored(self):
+        import os
+        from unittest import mock
+        from nemos.ownership import sudo_owner
+        with mock.patch.object(os, "geteuid", return_value=0), \
+             mock.patch.dict(os.environ, {"SUDO_UID": "not-a-number"}):
+            self.assertIsNone(sudo_owner())
+
+    def test_give_back_is_a_no_op_off_sudo_and_never_raises(self):
+        import tempfile
+        from pathlib import Path
+        from nemos.ownership import give_back
+        target = Path(tempfile.mkdtemp()) / "x.db"
+        target.write_text("")
+        give_back(target, target.with_name("absent.db"))   # must not raise
+        self.assertTrue(target.exists())

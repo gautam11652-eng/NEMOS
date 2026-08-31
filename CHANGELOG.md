@@ -144,6 +144,44 @@ continuously on any ordinary deployment.
 After both fixes the same live traffic produces no findings, and all 27 rules
 still fire on the shapes they target.
 
+### Fixed (found by an operator testing on Kali with real Nmap)
+
+- **A port scan was also reported as a denial-of-service flood.**
+  `sudo nmap -sS -p 1-1000` sends far more than the 150-SYN threshold, so
+  SYN_FLOOD_PATTERN fired alongside PORT_SCAN and TCP_SYN_SCAN at risk 90 with
+  T1498.001. Counting SYNs alone cannot tell enumeration from denial of
+  service. A flood concentrates on a service to exhaust it; a scan spreads
+  across ports to enumerate them. The rule now requires that a share of the
+  SYNs (`syn_flood_concentration`, default 0.30) land on one destination port,
+  and the evidence names that port and the measured concentration. Both flood
+  shapes still fire — a single service on one host, and the same service across
+  many hosts — because concentration is measured per port, not per host. The
+  threshold is configurable, so the previous behaviour can be restored.
+- **Files created under sudo were left owned by root.** Capture needs
+  CAP_NET_RAW, so the sensor is usually started with `sudo python main.py`;
+  `data/nemos.db` then came out root-owned and training, run without sudo,
+  could not open it. NEMOS now hands the data directory, the database and its
+  write-ahead log, and the trained model back to the user behind sudo. A root
+  login or a systemd unit running as root sets no SUDO_UID and is deliberately
+  left alone, since root ownership is intended there.
+
+### Reviewed, not changed
+
+- **Overlapping detections on one event are intentional.** A single Nmap run
+  producing PORT_SCAN, TCP_SYN_SCAN and (previously) SYN_FLOOD_PATTERN is
+  multi-label detection: each rule states a different observed fact, and each
+  carries its own evidence. They are already correlated — every alert from a
+  source inside the correlation window shares an `incident_id`, which the
+  dashboard groups by and every Telegram message carries. Consolidating them
+  into one finding would discard evidence, so the rules stay separate; the
+  SYN-flood entry above was a misclassification, not redundancy.
+- **Constant features in a small training set.** Training warned that
+  `udp_ratio` and `icmp_ratio` were constant across 72 windows captured from
+  TCP-only traffic. That warning is working as intended: a constant feature
+  contributes nothing to an Isolation Forest, and the model is simply blind to
+  those dimensions until the training data contains that traffic. It is a
+  statement about the corpus, not a defect.
+
 ### Known limitations
 
 - Capture is verified on loopback and on a physical Ethernet interface with

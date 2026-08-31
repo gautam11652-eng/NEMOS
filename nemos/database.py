@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from .ownership import give_back
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS traffic (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,6 +80,10 @@ CREATE INDEX IF NOT EXISTS idx_flows_protocol ON flows(protocol);
 def connect(path: Path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Under sudo these belong to the invoking user, not root: see
+    # nemos/ownership.py. Without it, a later non-root command -- training,
+    # most often -- cannot open the database the sensor just created.
+    give_back(path.parent)
     try:
         path.parent.chmod(0o700)
     except OSError:
@@ -209,3 +215,8 @@ def initialize(path: Path):
         c.commit()
     finally:
         c.close()
+    # SQLite creates the database and its write-ahead log itself, so those need
+    # handing back separately from the directory. Done after close, when WAL
+    # and shared-memory files exist and are no longer being written.
+    path = Path(path)
+    give_back(path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm"))

@@ -79,7 +79,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 499 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 511 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -208,6 +208,7 @@ never overridden by a stale file. Copy `.env.example` to `.env` to begin.
 | `NEMOS_ANALYSIS` | `true` | Enable windowed flow analysis and ML scoring |
 | `NEMOS_ANALYSIS_WINDOW` | `10.0` | Aggregation window in seconds — **must match the model's training window** |
 | `NEMOS_MAX_FLOWS` | `20000` | Bound on the in-memory flow table |
+| `NEMOS_INTERNAL_NETWORKS` | RFC 1918 + loopback | Comma-separated CIDRs treated as internal |
 | `NEMOS_MAX_EVENTS` | `1000` | Events retained per source for the rules. Detection cost per packet is linear in this — see [Performance](#performance) |
 | `NEMOS_PERSIST_FLOWS` | `true` | Store aggregated flows in SQLite |
 | `NEMOS_MODEL_DIR` | `data/model` | Where the trained model is loaded from |
@@ -297,7 +298,7 @@ claim says so in its own evidence.
 | Lateral movement | `LATERAL_MOVEMENT` (names RDP, SMB, SSH, VNC or WinRM from the observed port) |
 | Command and control | `C2_BEACONING`, `DNS_TUNNELING_PATTERN`, `ICMP_TUNNELING_PATTERN`, `TOR_CONNECTION_PATTERN`, `NON_STANDARD_PORT_TRAFFIC`, `INGRESS_TOOL_TRANSFER`, `DNS_BURST` |
 | Exfiltration | `DATA_EXFILTRATION_VOLUME`, `DATA_EXFILTRATION_OVER_C2` |
-| Impact | `SYN_FLOOD_PATTERN`, `ICMP_FLOOD_PATTERN`, `SERVICE_DENIAL_OF_SERVICE`, `REFLECTION_AMPLIFICATION`, `CRYPTO_MINING_PATTERN` |
+| Impact | `SYN_FLOOD_PATTERN` (requires SYNs concentrated on one service — a port sweep of the same volume is a scan, not a flood), `ICMP_FLOOD_PATTERN`, `SERVICE_DENIAL_OF_SERVICE`, `REFLECTION_AMPLIFICATION`, `CRYPTO_MINING_PATTERN` |
 
 Three of these are worth singling out:
 
@@ -722,7 +723,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 499 tests
+python -m pytest -q                              # 511 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit

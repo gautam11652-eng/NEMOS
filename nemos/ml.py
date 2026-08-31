@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Sequence
 
+from .ownership import give_back
 from .features import FEATURE_NAMES, FEATURE_SCHEMA_VERSION, FeatureVector
 
 log = logging.getLogger(__name__)
@@ -360,6 +361,10 @@ class AnomalyEngine:
                 path.chmod(0o600)
             except OSError:
                 pass
+        # Training may itself be run under sudo, or into a directory the sensor
+        # created as root. Either way the model should stay readable by the
+        # operator who trained it rather than only by root.
+        give_back(self.model_dir, self.model_path, self.metadata_path)
 
     # -------------------------------------------------------------- loading
 

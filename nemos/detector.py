@@ -20,6 +20,10 @@ class DetectionConfig:
     window: int = 10
     port_scan: int = 8
     syn_flood: int = 150
+    # A flood concentrates on a service; a scan spreads across ports. Without
+    # this, an nmap -sS sweep -- which sends far more than syn_flood SYNs -- was
+    # reported as a denial-of-service flood as well as a scan.
+    syn_flood_concentration: float = 0.30
     icmp_flood: int = 100
     fanout: int = 25
     dns_burst: int = 80
@@ -355,13 +359,34 @@ class ThreatDetector:
                 evidence={"scan_type": "icmp_sweep", "destinations": sorted(icmp_destinations)[:100]},
             )
 
-        if len(tcp_syn) >= self.cfg.syn_flood:
+        # A denial-of-service flood and a port sweep both emit a great many
+        # SYNs; what separates them is where those SYNs land. A flood
+        # concentrates on a service in order to exhaust it, while a scan spreads
+        # across ports in order to enumerate them. Counting SYNs alone reported
+        # `nmap -sS -p 1-1000` as a flood -- observed on a real deployment --
+        # which both overstates the finding and misnames the technique.
+        syn_per_port = agg["syn_per_port"]
+        busiest_port_syns = max(syn_per_port.values(), default=0)
+        concentration = busiest_port_syns / max(1, len(tcp_syn))
+        if (len(tcp_syn) >= self.cfg.syn_flood
+                and concentration >= self.cfg.syn_flood_concentration):
+            targeted = max(syn_per_port, key=lambda k: syn_per_port[k])
             add(
                 "SYN_FLOOD_PATTERN", "NETWORK_DENIAL_OF_SERVICE", 90,
-                f"{len(tcp_syn)} SYN packets in {self.cfg.window}s",
+                f"{busiest_port_syns} of {len(tcp_syn)} SYN packets targeted port "
+                f"{targeted} in {self.cfg.window}s",
                 "T1498.001", confidence=min(99, 75 + min(24, len(tcp_syn) // 10)),
                 packets=len(tcp_syn), destinations=len(destinations), ports=len(ports),
-                evidence={"syn_ratio": round(len(tcp_syn) / max(1, len(bucket)), 3)},
+                evidence={
+                    "syn_ratio": round(len(tcp_syn) / max(1, len(bucket)), 3),
+                    "syn_packets": len(tcp_syn),
+                    "targeted_port": targeted,
+                    "syns_to_targeted_port": busiest_port_syns,
+                    "port_concentration": round(concentration, 3),
+                    "concentration_threshold": self.cfg.syn_flood_concentration,
+                    "note": "concentration separates a flood from a port sweep; "
+                            "a sweep of comparable volume is reported as a scan",
+                },
             )
 
         if icmp_count >= self.cfg.icmp_flood:
@@ -780,6 +805,7 @@ class ThreatDetector:
         destinations: set[str] = set()
         tcp_syn: list[dict[str, Any]] = []
         tcp_syn_ports: set[int] = set()
+        syn_per_port: dict[int, int] = {}
         udp_ports: set[int] = set()
         udp_count = 0
         icmp_destinations: set[str] = set()
@@ -830,6 +856,7 @@ class ThreatDetector:
                     tcp_syn.append(x)
                     if port is not None:
                         tcp_syn_ports.add(port)
+                        syn_per_port[port] = syn_per_port.get(port, 0) + 1
                 # Established-session return traffic: acknowledged, not
                 # initiating, sent from a service port to one of our ephemeral
                 # ports. That is a reply, and replies are not probes.
@@ -895,6 +922,7 @@ class ThreatDetector:
             "source_internal": source_internal,
             "ports": ports, "scan_ports": scan_ports, "destinations": destinations,
             "tcp_syn": tcp_syn, "tcp_syn_ports": tcp_syn_ports,
+            "syn_per_port": syn_per_port,
             "udp_ports": udp_ports, "udp_count": udp_count,
             "icmp_destinations": icmp_destinations,
             "icmp_count": icmp_count, "icmp_bytes": icmp_bytes,

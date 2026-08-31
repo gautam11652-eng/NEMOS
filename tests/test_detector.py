@@ -28,8 +28,14 @@ class DetectorV2Tests(unittest.TestCase):
             alerts += d.process(TrafficEvent("x", "10.0.0.5", "10.0.0.10", "TCP", None, port, 60, "S"))
         first = next(a for a in alerts if a.threat == "PORT_SCAN")
         # A different detection for the same source should share the incident.
+        # The flood needs a flood's shape, not just its volume: SYNs have to
+        # concentrate on one service, or the rule correctly reads them as more
+        # of the scan already in the window.
         d.cfg = d.cfg.__class__(syn_flood=1)
-        second = d.process(TrafficEvent("x", "10.0.0.5", "10.0.0.11", "TCP", None, 443, 60, "S"))
+        second = []
+        for _ in range(6):
+            second += d.process(
+                TrafficEvent("x", "10.0.0.5", "10.0.0.11", "TCP", None, 443, 60, "S"))
         syn = next(a for a in second if a.threat == "SYN_FLOOD_PATTERN")
         self.assertEqual(first.incident_id, syn.incident_id)
 

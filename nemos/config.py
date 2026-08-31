@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 
+from .ownership import give_back
+
 def _int(name: str, default: int, lo: int, hi: int) -> int:
     try: value = int(os.getenv(name, default))
     except (TypeError, ValueError): value = default
@@ -50,6 +52,7 @@ def load_settings(base: Path | None = None) -> Settings:
     base = (base or Path.cwd()).resolve()
     data = base / "data"
     data.mkdir(parents=True, exist_ok=True)
+    give_back(data)
     try:
         data.chmod(0o700)
     except OSError:
