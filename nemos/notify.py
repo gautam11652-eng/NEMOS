@@ -25,6 +25,7 @@ import queue
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -196,6 +197,46 @@ def http_post(method: str, url: str, headers: Mapping[str, str], body: bytes,
             # body is not itself worth surfacing or failing over.
             log.debug("could not read error body from %s", urlsplit(url).hostname)
         return int(exc.code), detail
+
+
+def telegram_api(token: str, method: str, params: Mapping[str, Any] | None = None,
+                 timeout: float = 15.0, api_base: str = TELEGRAM_API_BASE) -> dict[str, Any]:
+    """Call one Bot API method and return its ``result``.
+
+    Used by setup tooling for the read-only methods (getMe, getUpdates) that
+    delivery itself never needs. It goes through the same non-redirecting
+    opener as delivery, and raises DeliveryError with the token redacted, so
+    setup cannot become the one path that leaks the credential.
+    """
+    query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
+    url = f"{api_base.rstrip('/')}/bot{token}/{method}"
+    if query:
+        url = f"{url}?{query}"
+    request = urllib.request.Request(url, method="GET")  # noqa: S310
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:  # noqa: S310
+            status, raw = int(response.status), response.read(1_000_000)
+    except urllib.error.HTTPError as exc:
+        status, raw = int(exc.code), exc.read(64_000)
+    except urllib.error.URLError as exc:
+        raise DeliveryError(f"could not reach Telegram: {redact(str(exc.reason), token)}") from exc
+
+    text = raw.decode("utf-8", "replace")
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise DeliveryError(
+            f"{method} returned {status} with an unparseable body: "
+            f"{redact(text, token)[:200]}"
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        description = ""
+        if isinstance(payload, dict):
+            description = str(payload.get("description") or "")
+        raise DeliveryError(
+            f"{method} failed ({status}): {redact(description, token)[:200] or status}"
+        )
+    return payload.get("result")
 
 
 def format_alert_text(alert: Mapping[str, Any]) -> str:
@@ -563,6 +604,7 @@ class AlertNotifier:
 
 
 __all__ = [
+    "telegram_api",
     "AlertNotifier",
     "DeliveryError",
     "NotifierConfig",

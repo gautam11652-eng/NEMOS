@@ -27,6 +27,17 @@ running system rather than the unit suite.
   palette, and light/dark themes.
 - **`tools/benchmark.py`**, a reproducible capture-path benchmark. Every
   performance number in the documentation now comes from it.
+- **`tools/connect_telegram.py`** — chat-id auto-detection. Telegram has no
+  anonymous send path, so a bot token is always required, but the chat id no
+  longer has to be copied out of a raw `getUpdates` response. The tool
+  validates the token with `getMe`, prints a `t.me` deep link carrying a
+  one-time code, waits for Start, binds that chat and writes
+  `TELEGRAM_CHAT_ID` to `.env` at 0600. The code is what makes this safe:
+  without it the tool would bind whichever chat messaged the bot first. It is
+  compared in constant time, the update backlog is drained first so an older
+  Start cannot be replayed, and the token is never printed, never written by
+  the tool and never accepted as a command-line argument, where other users
+  could read it from the process table.
 - **API request limiting.** Two independent per-client buckets: a general limit
   (`NEMOS_API_RATE`, 240/min) bounding resource use, and a much tighter one
   (`NEMOS_API_AUTH_RATE`, 10/min) bounding rejected credentials, incremented
