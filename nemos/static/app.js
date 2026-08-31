@@ -1,66 +1,755 @@
-const esc=x=>String(x??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
-const TOKEN_KEY="NEMOS.api.token", TOKEN_STORE=sessionStorage;
-let refreshing=false,lastPackets=null,lastPacketTime=null,refreshTimer=null;
-const $=id=>document.getElementById(id);
-const token=()=>TOKEN_STORE.getItem(TOKEN_KEY)||"";
-function setToken(v){v?TOKEN_STORE.setItem(TOKEN_KEY,v):TOKEN_STORE.removeItem(TOKEN_KEY)}
-function sev(v){return ["CRITICAL","HIGH","MEDIUM","LOW"].includes(v)?v:"LOW"}
-function riskClass(v){return v>=90?"CRITICAL":v>=75?"HIGH":v>=50?"MEDIUM":"LOW"}
-function fmtTime(v){if(!v)return "—";const d=new Date(v);return Number.isNaN(d.getTime())?String(v):d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"})}
-function fmtNum(v){return Number(v||0).toLocaleString()}
-function headers(){const h={Accept:"application/json"};const t=token();if(t)h["X-NEMOS-Token"]=t;return h}
-function updateKpis(s){
- const vals={packets:s.packets,tcp:s.tcp,udp:s.udp,dns:s.dns,threats:s.threats,critical:s.critical};
- Object.entries(vals).forEach(([k,v])=>{if($(k))$(k).textContent=fmtNum(v)});
- const packets=Number(s.packets||0);
- ["tcp","udp","dns"].forEach(k=>{const el=$(k+"-share");if(el)el.textContent=(packets?(Number(s[k]||0)/packets*100):0).toFixed(1)+"%"});
- const now=performance.now();if(lastPackets!==null&&lastPacketTime!==null){const dt=(now-lastPacketTime)/1000;if($("pps"))$("pps").textContent=(dt>0?Math.max(0,(packets-lastPackets)/dt):0).toFixed(1)+" pkt/s"}lastPackets=packets;lastPacketTime=now;
- $("threat-state").textContent=Number(s.critical||0)>0?"Immediate investigation":"No critical events";
+/* NEMOS operations console.
+ *
+ * No framework and no build step: the sensor serves two static files and a
+ * JSON API, and a dashboard that needs a toolchain to render is a dashboard an
+ * operator cannot debug at 3am.
+ *
+ * Structure: fetch -> normalise -> render pure functions -> paint. Every render
+ * takes the state it needs as an argument so nothing reaches into the DOM to
+ * discover what it should draw.
+ */
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+/* ── State ──────────────────────────────────────────────────────────── */
+
+const state = {
+  view: "overview",
+  live: true,
+  data: null,
+  alerts: [],          // detections with evidence, from /api/alerts
+  analysis: null,
+  notify: null,
+  detFilter: { text: "", severity: "ALL" },
+  detPage: 0,
+  hostFilter: "",
+  hostPage: 0,
+  paletteIndex: 0,
+};
+
+const PAGE = 25;
+const VIEWS = ["overview", "incidents", "detections", "hosts", "attack", "sensor"];
+
+const TITLES = {
+  overview:   ["Overview", "Live security posture"],
+  incidents:  ["Incidents", "Correlated findings by source"],
+  detections: ["Detections", "Every finding and its evidence"],
+  hosts:      ["Hosts", "Per-source risk rollup"],
+  attack:     ["ATT&CK", "Technique coverage and what has been observed"],
+  sensor:     ["Sensor", "Capture, storage, model and delivery"],
+};
+
+/* The order intrusions actually progress in. Findings are placed on the
+ * tactic their technique evidences, so the chain shows how far an actor has
+ * got rather than merely how many alerts fired. */
+const CHAIN = [
+  { key: "Discovery",         label: "Discovery",        match: /discovery/i },
+  { key: "Credential Access", label: "Credential Access", match: /credential/i },
+  { key: "Lateral Movement",  label: "Lateral Movement",  match: /lateral/i },
+  { key: "Command and Control", label: "Command & Control", match: /command/i },
+  { key: "Exfiltration",      label: "Exfiltration",      match: /exfil/i },
+  { key: "Impact",            label: "Impact",            match: /impact/i },
+];
+
+const SEV_CLASS = { CRITICAL: "sev-crit", HIGH: "sev-high", MEDIUM: "sev-med", LOW: "sev-low" };
+
+/* ── Utilities ──────────────────────────────────────────────────────── */
+
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => (
+  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+));
+
+const num = (v) => (Number(v) || 0).toLocaleString();
+
+function clock(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  return isNaN(d) ? String(ts).slice(11, 19) : d.toLocaleTimeString();
 }
-function renderTimeline(alerts){const el=$("timeline");if(!alerts.length){el.innerHTML='<div class="empty-state">No threats detected — sensor is monitoring normally.</div>';return}el.innerHTML=alerts.slice(0,12).map(a=>`<div class="timeline-item"><div class="timeline-time">${esc(fmtTime(a.timestamp))}</div><span class="timeline-node ${sev(a.severity)}"></span><div><div class="timeline-title">${esc(a.threat)}</div><div class="timeline-meta"><span>${esc(a.source)}</span><span>risk ${esc(a.risk_score)}/100</span><span>${esc(a.technique||"no ATT&amp;CK mapping")}</span></div></div><span class="severity ${sev(a.severity)}">${esc(a.severity)}</span></div>`).join("")}
-function renderIncidents(items){const el=$("incidents-body");if(!items.length){el.innerHTML='<tr><td colspan="8" class="empty-cell">No correlated incidents yet</td></tr>';return}el.innerHTML=items.slice(0,50).map(i=>`<tr><td><button class="incident-link mono" data-incident="${esc(i.incident_id)}">${esc(i.incident_id)}</button></td><td class="mono">${esc(i.sources||"—")}</td><td>${esc(i.threats||"—")}</td><td><span class="severity ${sev(i.severity)}">${esc(i.severity)}</span></td><td class="risk ${riskClass(Number(i.max_risk||0))}">${esc(i.max_risk)}/100</td><td>${esc(i.alert_count)}</td><td>${esc(fmtTime(i.last_seen))}</td><td>›</td></tr>`).join("");el.querySelectorAll("[data-incident]").forEach(b=>b.addEventListener("click",()=>openIncident(b.dataset.incident)))}
-function renderHosts(items){const el=$("hosts-body");if(!items.length){el.innerHTML='<tr><td colspan="6" class="empty-cell">No host risk data yet</td></tr>';return}el.innerHTML=items.slice(0,25).map(h=>`<tr><td><button class="host-link mono" data-host="${esc(h.host)}">${esc(h.host)}</button></td><td class="risk ${riskClass(Number(h.risk_score||0))}">${esc(h.risk_score)}/100</td><td>${esc(h.alert_count)}</td><td>${esc(h.critical_count)}</td><td>${fmtNum(h.packets)}</td><td>${esc(fmtTime(h.last_alert))}</td></tr>`).join("");el.querySelectorAll("[data-host]").forEach(b=>b.addEventListener("click",()=>openHost(b.dataset.host)))}
-function renderPosture(alerts){const counts={CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0};alerts.forEach(a=>counts[sev(a.severity)]++);$("posture-critical").textContent=counts.CRITICAL;$("posture-high").textContent=counts.HIGH;$("posture-medium").textContent=counts.MEDIUM;$("posture-low").textContent=counts.LOW;const score=Math.min(100,counts.CRITICAL*30+counts.HIGH*18+counts.MEDIUM*8+counts.LOW*2);$("posture-score").textContent=score;$("posture-ring").style.setProperty("--score",`${score*3.6}deg`);const label=score>=70?"ELEVATED":score>=35?"GUARDED":"NOMINAL";$("posture-label").textContent=label;$("posture-copy").textContent=score?"Triage priority is driven by observed detection severity and count.":"No elevated security findings in the current telemetry window."}
-function renderTechniques(data){const catalog=data.techniques||[],unmapped=data.unmapped||[];const observed=catalog.filter(x=>Number(x.count)>0),mappedCount=observed.length,total=catalog.length;const tactics=[...new Set(catalog.map(x=>x.tactic).filter(Boolean))];$("attack-summary").innerHTML=`<div class="attack-stat"><span>Catalog</span><strong>${total}</strong><small>supported techniques</small></div><div class="attack-stat"><span>Observed</span><strong>${mappedCount}</strong><small>with telemetry</small></div><div class="attack-stat"><span>Tactics</span><strong>${tactics.length}</strong><small>represented</small></div><div class="attack-stat"><span>Unmapped</span><strong>${unmapped.length}</strong><small>non-ATT&amp;CK signals</small></div>`;const max=Math.max(1,...catalog.map(x=>Number(x.count)||0));const mappedHtml=catalog.map(x=>{const count=Number(x.count)||0;const pct=Math.min(10,Math.ceil(count/max*10));return `<article class="attack-technique ${count?'observed':''}"><div class="attack-top"><span class="technique-id">${esc(x.technique_id)}</span><span class="attack-count">${count} observed</span></div><h3>${esc(x.name)}</h3><div class="attack-meta"><span>${esc(x.tactic)}</span><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">MITRE</a></div><p>${esc(x.description)}</p><div class="attack-bar"><i class="w${pct}"></i></div></article>`}).join("");const unmappedHtml=unmapped.map(x=>`<article class="attack-technique signal"><div class="attack-top"><span class="technique-id">SIGNAL</span><span class="attack-count">${esc(x.count)} observed</span></div><h3>${esc(x.signal?.name||x.threat)}</h3><div class="attack-meta"><span>Not mapped to ATT&amp;CK</span></div><p>${esc(x.signal?.reason||"The detector intentionally keeps this signal unmapped until evidence supports a technique.")}</p></article>`).join("");$("technique-list").innerHTML=(mappedHtml+unmappedHtml)||'<div class="empty-state">No ATT&amp;CK data available.</div>'}
-function renderTraffic(traffic){const el=$("traffic-body");if(!traffic.length){el.innerHTML='<tr><td colspan="6" class="empty-cell">No telemetry yet</td></tr>';return}el.innerHTML=traffic.slice(0,100).map(p=>`<tr><td>${esc(fmtTime(p.timestamp))}</td><td class="mono">${esc(p.source)}</td><td class="mono">${esc(p.destination)}</td><td>${esc(p.protocol)}</td><td>${esc((p.source_port??"—")+" → "+(p.destination_port??"—"))}</td><td>${fmtNum(p.packet_size)}</td></tr>`).join("")}
-function renderGraph(traffic,alerts){const el=$("network-graph");if(!traffic.length){el.innerHTML='<div class="empty-state">Waiting for network telemetry…</div>';return}const nodes=[...new Set(traffic.flatMap(p=>[p.source,p.destination]).filter(Boolean))].slice(0,12),edges=[],seen=new Set();traffic.forEach(p=>{if(!nodes.includes(p.source)||!nodes.includes(p.destination)||p.source===p.destination)return;const k=p.source+"|"+p.destination;if(!seen.has(k)){seen.add(k);edges.push([p.source,p.destination])}});const w=620,h=340,cx=w/2,cy=h/2,r=Math.min(120,45+nodes.length*5),pos={};nodes.forEach((n,i)=>{const a=Math.PI*2*i/Math.max(nodes.length,1)-Math.PI/2;pos[n]=[cx+Math.cos(a)*r,cy+Math.sin(a)*r]});const alertHosts=new Set(alerts.map(a=>a.source));let svg=`<svg class="graph-svg" viewBox="0 0 ${w} ${h}" role="img" aria-label="Network connection graph"><circle cx="${cx}" cy="${cy}" r="31" class="graph-core"/><text x="${cx}" y="${cy+3}" text-anchor="middle" class="graph-core-label">SENSOR</text>`;edges.forEach(([a,b])=>{const [x1,y1]=pos[a],[x2,y2]=pos[b];svg+=`<line class="graph-edge" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"/>`});nodes.forEach(n=>{const [x,y]=pos[n],bad=alertHosts.has(n);svg+=`<g><circle class="graph-node ${bad?'alert':''}" cx="${x}" cy="${y}" r="18"/><text x="${x}" y="${y+3}" text-anchor="middle" class="graph-label">${esc(n.length>12?n.slice(0,11)+"…":n)}</text></g>`});svg+='</svg>';el.innerHTML=svg}
-function renderDelivery(d){const active=Boolean(d.active),channels=d.channels||{},names=Object.keys(channels),failing=names.filter(n=>(channels[n].failed||0)>0&&!(channels[n].last_success)),badge=$("telegram-badge");let state,cls;if(!active){state=d.enabled===false?"DISABLED":"NOT CONFIGURED";cls="muted-badge"}else if(failing.length){state="FAILING";cls="bad"}else{state="ACTIVE";cls="good"}badge.textContent=state;badge.className=`sub-badge ${cls}`;const sent=names.reduce((t,n)=>t+(channels[n].sent||0),0),failed=names.reduce((t,n)=>t+(channels[n].failed||0),0),suppressed=(d.suppressed_severity||0)+(d.suppressed_cooldown||0)+(d.suppressed_rate||0),lastError=names.map(n=>channels[n].last_error).filter(Boolean)[0]||"";const rows=[["Status",`<strong class="${active?(failing.length?'bad-text':'ok'):'muted-text'}">${esc(state)}</strong>`],["Channels",`<strong>${names.length?esc(names.join(", ")):"none"}</strong>`],["Chat ID",`<strong class="mono">${esc(d.chat_id||'—')}</strong>`],["Delivered",`<strong>${fmtNum(sent)}</strong>`],["Failed",`<strong class="${failed?'bad-text':''}">${fmtNum(failed)}</strong>`],["Suppressed",`<strong>${fmtNum(suppressed)}</strong>`],["Min severity",`<strong>${esc(d.min_severity||'—')}</strong>`]];$("telegram-card").innerHTML=rows.map(([k,v])=>`<div class="bot-row"><span>${esc(k)}</span>${v}</div>`).join("")+(lastError?`<div class="bot-note bad-text">Last error: ${esc(lastError)}</div>`:`<div class="bot-note">Alerts reach Telegram or a webhook only when credentials are configured. NEMOS never displays the bot token, and suppressed alerts remain recorded locally.</div>`)}
-// Capture state arrives with the dashboard payload while writer metrics come
-// from /api/status, so the last known value of each is cached and both tiles
-// re-render whenever either source updates.
-const healthState={capture:{},writer:{}};
-// Every field here maps to a real value from /api/analysis or /api/anomalies.
-// Nothing is derived for display purposes; if the backend does not report it,
-// the tile shows a dash rather than an invented number.
-function renderAI(status,assessments){const model=(status&&status.model)||{},meta=model.metadata||{},badge=$("ai-badge");const available=Boolean(model.available);badge.textContent=available?"MODEL ACTIVE":(status&&status.window_seconds?"NOT TRAINED":"DISABLED");badge.className=`sub-badge ${available?'good':'muted-badge'}`;
-$("ai-model-state").textContent=available?"LOADED":"NOT TRAINED";$("ai-model-state").className=available?"ok":"muted-text";
-$("ai-model-version").textContent=meta.model_version||"—";
-$("ai-model-trained").textContent=meta.trained_at?fmtTime(meta.trained_at):"—";
-$("ai-model-samples").textContent=meta.samples!=null?fmtNum(meta.samples):"—";
-$("ai-scored").textContent=fmtNum(model.scored_windows||0);
-$("ai-window").textContent=status&&status.window_seconds?`${status.window_seconds}s`:"—";
-$("ai-note").textContent=available?`Isolation Forest over ${(meta.feature_names||[]).length||24} per-window flow features. The anomaly score measures how far a window falls into the sparse tail of the training distribution; it is not a probability of compromise.`:(model.reason||"Windowed flow analysis is disabled.");
-const el=$("ai-assessments");if(!assessments||!assessments.length){el.innerHTML='<div class="empty-state">No ML assessments recorded yet. Assessments appear once traffic has been observed for a full analysis window.</div>';return}
-el.innerHTML=assessments.slice(0,12).map(a=>{const e=a.explanation||{},layers=(a.detection_layers||[]).join(", ");const anomaly=a.anomaly_score==null?"—":`${a.anomaly_score}/100`;return `<article class="ai-card"><div class="ai-card-head"><div><strong class="mono">${esc(a.source)}</strong><div class="ai-verdict">${esc(String(a.verdict||"").replaceAll("_"," "))}</div></div><span class="severity ${sev(a.severity)}">${esc(a.severity)}</span></div><div class="ai-metrics"><div><span>Anomaly</span><strong>${esc(anomaly)}</strong></div><div><span>Confidence</span><strong>${esc(a.confidence||0)}%</strong></div><div><span>Risk</span><strong class="risk ${riskClass(Number(a.risk_score||0))}">${esc(a.risk_score||0)}/100</strong></div><div><span>Baseline</span><strong>${esc(String(a.baseline_state||"—").replaceAll("_"," "))}</strong></div></div><div class="ai-fusion"><span>HYBRID VERDICT</span>${esc(e.rule_floor||0)} rules + ${esc(e.ml_contribution||0)} ml + ${esc(e.baseline_contribution||0)} baseline + ${esc(e.corroboration_bonus||0)} corroboration = ${esc(e.subtotal||0)}, capped at ${esc(e.ceiling||100)}<div class="ai-layers">layers: ${esc(layers||"none")} · ATT&amp;CK: ${esc((a.techniques||[]).join(", ")||"none (not evidenced by rules)")}</div></div>${(a.reasons||[]).length?`<div class="ai-reasons"><span>WHY THIS WAS FLAGGED</span><ul>${a.reasons.slice(0,5).map(r=>`<li>${esc(r)}</li>`).join("")}</ul></div>`:""}</article>`}).join("")}
-function renderHealth(update){Object.assign(healthState,update||{});const c=healthState.capture||{},w=healthState.writer||{};$("health-capture").textContent=c.running?"ONLINE":String(c.state||"—").replaceAll("_"," ").toUpperCase();$("health-interface").textContent=c.interface||"default";$("health-packets").textContent=fmtNum(c.packets_seen||0);$("health-writer").textContent=w.queue_depth!=null?`${fmtNum(w.queue_depth)} / ${fmtNum(w.queue_capacity||0)} queued`:"—"}
-function riskPercent(v){return Math.max(0,Math.min(100,Number(v)||0))}
-function riskLabel(v){const n=riskPercent(v);return n>=90?"CRITICAL":n>=75?"HIGH":n>=50?"MEDIUM":"LOW"}
-function riskRing(v){const n=riskPercent(v),r=42,c=2*Math.PI*r,d=n/100*c;return `<div class="risk-ring ${riskLabel(n)}"><svg viewBox="0 0 100 100"><circle class="risk-track" cx="50" cy="50" r="${r}"/><circle class="risk-progress" cx="50" cy="50" r="${r}" stroke-dasharray="${d.toFixed(2)} ${c.toFixed(2)}"/></svg><div><strong>${n}</strong><span>/100</span></div></div>`}
-function evidenceSignals(alerts){const out=[],seen=new Set();alerts.forEach(a=>[["SOURCE",a.source],["TECHNIQUE",a.technique||"unmapped"],["SEVERITY",a.severity],["REASON",a.reason]].forEach(([k,v])=>{if(v&&v!=="unmapped"&&!seen.has(k+v)){seen.add(k+v);out.push([k,String(v)])}}));return out.slice(0,10)}
-function evidenceFingerprint(alerts){const raw=alerts.map(a=>[a.id,a.timestamp,a.source,a.threat,a.technique,a.risk_score].join("|")).join("\n");let h=2166136261;for(let i=0;i<raw.length;i++){h^=raw.charCodeAt(i);h=Math.imul(h,16777619)}return(h>>>0).toString(16).padStart(8,"0").toUpperCase()}
-function exportIncident(id,alerts,inc){const blob=new Blob([JSON.stringify({product:"NEMOS",incident_id:id,generated_at:new Date().toISOString(),summary:inc,alerts},null,2)],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=`NEMOS-${id}-evidence.json`;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url)}
-async function copyText(text,button){const old=button.textContent;try{if(navigator.clipboard&&window.isSecureContext)await navigator.clipboard.writeText(text);else{const ta=document.createElement("textarea");ta.value=text;document.body.appendChild(ta);ta.select();if(!document.execCommand("copy"))throw Error("copy failed");ta.remove()}button.textContent="Copied";setTimeout(()=>button.textContent=old,1200)}catch(_){button.textContent="Copy unavailable";setTimeout(()=>button.textContent=old,1500)}}
-function incidentStages(alerts){const stages=[],seen=new Set();alerts.forEach(a=>{const technique=a.technique||"UNMAPPED",key=technique+"|"+a.threat;if(seen.has(key))return;seen.add(key);stages.push({label:stages.length===0?"INITIAL SIGNAL":stages.length===1?"DISCOVERY / ACCESS":"FOLLOW-ON ACTIVITY",technique,name:a.attack?.name||a.technique||"Unmapped signal",source:a.source,risk:a.risk_score,severity:a.severity})});return stages.slice(0,6)}
-function renderAttackChain(alerts){const stages=incidentStages(alerts);if(!stages.length)return'<div class="empty-state">No attack-chain signals available.</div>';return`<div class="attack-chain">${stages.map((x,i)=>`<div class="chain-node"><div class="chain-index">${String(i+1).padStart(2,"0")}</div><div><span class="chain-label">${esc(x.label)}</span><strong>${esc(x.name)}</strong><div class="chain-meta"><span class="technique-id">${esc(x.technique)}</span><span>${esc(x.source)}</span><span class="risk ${riskClass(Number(x.risk||0))}">${esc(x.risk||0)}/100</span></div></div></div>${i<stages.length-1?'<div class="chain-arrow">↓</div>':''}`).join("")}</div>`}
-async function openIncident(id){const modal=$("incident-modal"),detail=$("incident-detail");modal.hidden=false;$("modal-title").textContent=`Incident // ${id}`;detail.innerHTML='<div class="empty-state">Loading incident evidence…</div>';try{const r=await fetch(`/api/incidents/${encodeURIComponent(id)}`,{headers:headers(),cache:"no-store"});if(!r.ok)throw Error(r.status);const d=await r.json(),a=d.alerts||[],inc=d.incident||{},actions=inc.recommendations||[],risk=riskPercent(inc.risk_score),signals=evidenceSignals(a),fingerprint=evidenceFingerprint(a);detail.innerHTML=`<div class="investigation-hero"><div><div class="panel-kicker">CORRELATED THREAT</div><h3 class="incident-title">${esc(inc.threat||a[0]?.threat||"Suspicious activity")}</h3><div class="incident-sub"><span class="mono">${esc(id)}</span><span>•</span><span>${esc(a[0]?.source||"Unknown source")}</span><span>•</span><span>fingerprint ${esc(fingerprint)}</span></div></div>${riskRing(risk)}</div><div class="detail-head"><div class="detail-stat"><span>Severity</span><strong class="severity ${sev(inc.severity)}">${esc(inc.severity||riskLabel(risk))}</strong></div><div class="detail-stat"><span>Confidence</span><strong>${esc(inc.confidence||0)}%</strong></div><div class="detail-stat"><span>Signals</span><strong>${esc(inc.evidence_signals||signals.length)}</strong></div><div class="detail-stat"><span>Last seen</span><strong>${esc(fmtTime(inc.last_seen||a.at(-1)?.timestamp))}</strong></div></div><div class="investigation-toolbar"><span>Evidence preserved locally</span><button class="ack-btn" id="export-evidence">Export evidence</button><button class="ack-btn" id="copy-fingerprint">Copy fingerprint</button></div><div class="investigation-grid"><section><div class="panel-kicker">ATTACK PATH // CORRELATION</div><div class="chain-panel">${renderAttackChain(a)}</div><div class="panel-kicker section-gap">DETECTION EVIDENCE</div>${a.map(x=>`<article class="evidence"><div class="evidence-title"><div><strong>${esc(x.threat)}</strong><div class="evidence-source mono">${esc(x.source)} · ${esc(fmtTime(x.timestamp))}</div></div><span class="severity ${sev(x.severity)}">${esc(x.severity)}</span></div><div class="evidence-grid"><div><span>Risk</span><strong class="risk ${riskClass(Number(x.risk_score||0))}">${esc(x.risk_score||0)}/100</strong></div><div><span>Confidence</span><strong>${esc(x.confidence||0)}%</strong></div><div><span>Technique</span><strong class="technique-id">${esc(x.technique||"unmapped")}</strong></div></div><div class="evidence-reason"><span>WHY IT FIRED</span>${esc(x.reason||"No reason supplied")}</div>${x.evidence?`<details><summary>Raw evidence</summary><pre>${esc(typeof x.evidence==='string'?x.evidence:JSON.stringify(x.evidence,null,2))}</pre></details>`:""}<button class="ack-btn ${x.acknowledged?'done':''}" data-ack="${x.id}" ${x.acknowledged?'disabled':''}>${x.acknowledged?'✓ Acknowledged':'Acknowledge alert'}</button></article>`).join("")||'<div class="empty-state">No evidence</div>'}</section><aside><div class="panel-kicker">RESPONSE // GUIDANCE</div><div class="response-card"><ul class="recommendations">${actions.map(x=>`<li>${esc(x)}</li>`).join("")||'<li>Validate the activity against expected behavior before containment.</li>'}</ul><div class="response-note">NEMOS does not execute containment actions from the dashboard.</div></div><div class="panel-kicker section-gap">SIGNAL SNAPSHOT</div><div class="signal-list">${signals.map(([k,v])=>`<div><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join("")||'<div class="empty-state">No structured signals.</div>'}</div></aside></div>`;detail.querySelectorAll("[data-ack]").forEach(b=>b.addEventListener("click",()=>ackAlert(b.dataset.ack,b)));$("export-evidence").addEventListener("click",()=>exportIncident(id,a,inc));$("copy-fingerprint").addEventListener("click",e=>copyText(fingerprint,e.currentTarget))}catch(e){detail.innerHTML='<div class="empty-state">Unable to load incident evidence.</div>'}}
-async function openHost(host){const modal=$("incident-modal"),detail=$("incident-detail");modal.hidden=false;$("modal-title").textContent=`Host // ${host}`;detail.innerHTML='<div class="empty-state">Loading host investigation…</div>';try{const r=await fetch(`/api/hosts/${encodeURIComponent(host)}`,{headers:headers(),cache:"no-store"});if(!r.ok)throw Error(r.status);const d=await r.json(),triage=d.triage||{},a=d.alerts||[],traffic=d.traffic||[],risk=riskPercent(triage.risk_score);detail.innerHTML=`<div class="investigation-hero"><div><div class="panel-kicker">HOST // ENTITY INVESTIGATION</div><h3 class="incident-title mono">${esc(host)}</h3><div class="incident-sub"><span>${esc(traffic.length)} recent network events</span><span>•</span><span>${esc((d.incidents||[]).length)} correlated incidents</span></div></div>${riskRing(risk)}</div><div class="detail-head"><div class="detail-stat"><span>Risk</span><strong class="risk ${riskClass(risk)}">${risk}/100</strong></div><div class="detail-stat"><span>Severity</span><strong class="severity ${sev(triage.severity)}">${esc(triage.severity||"LOW")}</strong></div><div class="detail-stat"><span>Alerts</span><strong>${esc(a.length)}</strong></div><div class="detail-stat"><span>Recent events</span><strong>${esc(traffic.length)}</strong></div></div><div class="investigation-grid"><section><div class="panel-kicker">HOST ACTIVITY // RECENT SIGNALS</div>${a.slice(0,20).map(x=>`<article class="evidence"><div class="evidence-title"><div><strong>${esc(x.threat)}</strong><div class="evidence-source mono">${esc(fmtTime(x.timestamp))} · ${esc(x.source)}</div></div><span class="severity ${sev(x.severity)}">${esc(x.severity)}</span></div><div class="evidence-reason"><span>WHY IT FIRED</span>${esc(x.reason||"No reason supplied")}</div></article>`).join("")||'<div class="empty-state">No alerts for this host.</div>'}</section><aside><div class="panel-kicker">DEFENSIVE GUIDANCE</div><div class="response-card"><ul class="recommendations">${(triage.recommendations||[]).map(x=>`<li>${esc(x)}</li>`).join("")||'<li>No elevated guidance. Continue monitoring.</li>'}</ul></div><div class="panel-kicker section-gap">NETWORK CONTEXT</div><div class="detail-list"><div><span>Recent events</span><strong>${esc(traffic.length)}</strong></div><div><span>Incidents</span><strong>${esc((d.incidents||[]).length)}</strong></div><div><span>Top protocol</span><strong>${esc(d.top_protocol||"—")}</strong></div></div></aside></div>`}catch(e){detail.innerHTML='<div class="empty-state">Unable to load host investigation.</div>'}}
-async function ackAlert(id,button){const h=headers();h["Content-Type"]="application/json";try{const r=await fetch(`/api/alerts/${encodeURIComponent(id)}/ack`,{method:"POST",headers:h});if(!r.ok)throw Error(r.status);button.textContent="✓ Acknowledged";button.disabled=true;button.classList.add("done");refresh()}catch(_){button.textContent="Retry acknowledgement"}}
-function closeModal(){$("incident-modal").hidden=true}
-async function refresh(){if(refreshing)return;refreshing=true;$("connection-label").textContent="SYNCING";const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),5000);try{const h=headers();if(window.dashboardETag)h["If-None-Match"]=window.dashboardETag;const r=await fetch("/api/dashboard?limit=100",{cache:"no-store",headers:h,signal:controller.signal});if(r.status===304){$("connection-label").textContent="LIVE";$("refresh").innerHTML='<span class="pulse"></span>LIVE';return}if(r.status===401){$("connection-label").textContent="AUTH REQUIRED";$("refresh").innerHTML='<span class="pulse"></span>AUTH';return}if(!r.ok)throw Error(r.status);const etag=r.headers.get("ETag");if(etag)window.dashboardETag=etag;const d=await r.json(),cap=d.capture||{};if(cap.state==="running"){$("sensor-state").textContent="CAPTURE ONLINE";$("sensor-meta").textContent=`${fmtNum(cap.packets_seen||0)} packets captured${cap.interface?` · ${cap.interface}`:""}`}else if(cap.state==="permission_denied"){$("sensor-state").textContent="CAPTURE BLOCKED";$("sensor-meta").textContent="CAP_NET_RAW capability required"}else{$("sensor-state").textContent=String(cap.state||"unknown").replaceAll("_"," ").toUpperCase();$("sensor-meta").textContent=cap.error||"Local sensor state"}updateKpis(d.stats||{});renderTimeline(d.alerts||[]);renderIncidents(d.incidents||[]);renderHosts(d.hosts||[]);renderPosture(d.alerts||[]);renderTraffic(d.traffic||[]);renderGraph(d.traffic||[],d.alerts||[]);renderHealth({capture:cap});$("updated").textContent=new Date().toLocaleTimeString();$("connection-label").textContent="LIVE";$("refresh").innerHTML='<span class="pulse"></span>LIVE';}catch(e){$("connection-label").textContent="OFFLINE";$("refresh").textContent="API OFFLINE";$("sensor-state").textContent="OFFLINE";$("sensor-meta").textContent=e?.name==="AbortError"?"API request timed out":"Unable to reach sensor API"}finally{clearTimeout(timeout);refreshing=false}}
-async function refreshSupplemental(){try{const [t,s,a]=await Promise.all([fetch("/api/techniques?",{headers:headers(),cache:"no-store"}),fetch("/api/status",{headers:headers(),cache:"no-store"}),fetch("/api/anomalies?limit=12",{headers:headers(),cache:"no-store"})]);if(t.ok)renderTechniques(await t.json());let analysis=null;if(s.ok){const status=await s.json();renderDelivery(status.notifications||{});renderHealth({writer:status.writer||{}});analysis=status.analysis||null}
-// /api/anomalies returns 503 when analysis is disabled; that is a state to
-// render, not an error to swallow silently.
-const assessments=a.ok?await a.json():[];renderAI(analysis,assessments)}catch(_){} }
-$("save-token")?.addEventListener("click",()=>{setToken($("api-token").value.trim());refresh();refreshSupplemental()});$("clear-token")?.addEventListener("click",()=>{setToken("");$("api-token").value="";refresh();refreshSupplemental()});$("theme-refresh").addEventListener("click",()=>{refresh();refreshSupplemental()});document.querySelectorAll("[data-close-modal]").forEach(x=>x.addEventListener("click",closeModal));document.addEventListener("keydown",e=>{if(e.key==="Escape")closeModal()});const saved=token();if(saved&&$("api-token"))$("api-token").value=saved;
-function setActiveNav(id){document.querySelectorAll('.nav-item').forEach(link=>link.classList.toggle('active',link.getAttribute('href')===`#${id}`))}document.querySelectorAll('.nav-item').forEach(link=>link.addEventListener('click',()=>setActiveNav(link.getAttribute('href').slice(1))));const sections=[...document.querySelectorAll('.main > [id], .main > header[id]')];if('IntersectionObserver'in window){const observer=new IntersectionObserver(entries=>{const visible=entries.filter(e=>e.isIntersecting).sort((a,b)=>b.intersectionRatio-a.intersectionRatio)[0];if(visible)setActiveNav(visible.target.id)},{rootMargin:'-20% 0px -65% 0px',threshold:[0,.25,.5,1]});sections.forEach(section=>observer.observe(section))}
-function scheduleRefresh(){if(refreshTimer)clearTimeout(refreshTimer);if(document.hidden)return;refreshTimer=setTimeout(async()=>{refreshTimer=null;await refresh();await refreshSupplemental();scheduleRefresh()},10000)}document.addEventListener('visibilitychange',()=>{if(document.hidden){if(refreshTimer)clearTimeout(refreshTimer);refreshTimer=null}else{refresh();refreshSupplemental();scheduleRefresh()}});refresh();refreshSupplemental();scheduleRefresh();
+
+function ago(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  if (isNaN(d)) return String(ts);
+  const s = Math.max(0, (Date.now() - d.getTime()) / 1000);
+  if (s < 60) return `${Math.round(s)}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return d.toLocaleDateString();
+}
+
+function bytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return `${v} B`;
+  if (v < 1048576) return `${(v / 1024).toFixed(1)} KB`;
+  if (v < 1073741824) return `${(v / 1048576).toFixed(1)} MB`;
+  return `${(v / 1073741824).toFixed(2)} GB`;
+}
+
+/* Reasons come from the backend as fragments; give them terminal punctuation
+   so they read as sentences next to the guidance that follows. */
+const sentence = (v) => {
+  const text = String(v ?? "").trim();
+  if (!text) return "";
+  return /[.!?]$/.test(text) ? text : `${text}.`;
+};
+
+const sevClass = (s) => SEV_CLASS[String(s || "").toUpperCase()] || "sev-low";
+
+function emptyState(mark, title, body) {
+  return `<div class="empty"><span class="empty-mark" aria-hidden="true">${mark}</span>
+          <b>${esc(title)}</b><p>${body}</p></div>`;
+}
+
+function toast(message) {
+  const el = $("toast");
+  el.textContent = message;
+  el.hidden = false;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { el.hidden = true; }, 2600);
+}
+
+/* ── Token handling ─────────────────────────────────────────────────── */
+
+const tokenKey = "nemos.token";
+const getToken = () => { try { return localStorage.getItem(tokenKey) || ""; } catch { return ""; } };
+const setToken = (v) => { try { v ? localStorage.setItem(tokenKey, v) : localStorage.removeItem(tokenKey); } catch { /* private mode */ } };
+
+async function api(path) {
+  const headers = {};
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(path, { headers, cache: "no-store" });
+  if (response.status === 401) { $("authbar").hidden = false; throw new Error("unauthorized"); }
+  // A disabled subsystem answers 503. That is a state to render, not a failure
+  // to report: the sensor is working exactly as configured.
+  if (response.status === 503) return { unavailable: true };
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+/* ── Rendering: overview ────────────────────────────────────────────── */
+
+function renderChain(alerts) {
+  const worst = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
+  const buckets = CHAIN.map((stage) => {
+    const hits = alerts.filter((a) => stage.match.test(a.attack?.tactic || ""));
+    let top = "";
+    for (const a of hits) {
+      if ((worst[a.severity] || 0) > (worst[top] || 0)) top = a.severity;
+    }
+    return { stage, count: hits.length, severity: top };
+  });
+
+  $("chain").innerHTML = buckets.map((b, i) => `
+    <li class="stage ${b.count ? `hit ${sevClass(b.severity)}` : ""}">
+      <span class="stage-n">STAGE ${i + 1}</span>
+      <b>${esc(b.stage.label)}</b>
+      <span class="stage-c">${b.count}</span>
+      <span class="stage-t">${b.count ? `${esc(b.severity || "")} observed` : "not observed"}</span>
+    </li>`).join("");
+
+  const reached = buckets.filter((b) => b.count).length;
+  const deepest = [...buckets].reverse().find((b) => b.count);
+  const verdict = $("chain-verdict");
+  if (!reached) {
+    verdict.textContent = "No activity";
+  } else {
+    verdict.textContent = `${reached}/${CHAIN.length} stages · deepest: ${deepest.stage.label}`;
+  }
+}
+
+function renderKpis(stats, capture) {
+  const cards = [
+    { k: "Packets", v: num(stats.packets), s: capture?.running ? "capturing" : "capture stopped" },
+    { k: "TCP", v: num(stats.tcp), s: pct(stats.tcp, stats.packets) },
+    { k: "UDP", v: num(stats.udp), s: pct(stats.udp, stats.packets) },
+    { k: "DNS", v: num(stats.dns), s: pct(stats.dns, stats.packets) },
+    { k: "Findings", v: num(stats.threats), s: "all severities" },
+    { k: "Critical", v: num(stats.critical), s: "needs review", alarm: Number(stats.critical) > 0 },
+  ];
+  $("kpis").innerHTML = cards.map((c) => `
+    <article class="kpi ${c.alarm ? "alarm" : ""}">
+      <div class="kpi-k">${esc(c.k)}</div>
+      <div class="kpi-v">${esc(c.v)}</div>
+      <div class="kpi-s">${esc(c.s)}</div>
+    </article>`).join("");
+}
+
+const pct = (part, total) => (Number(total) ? `${((Number(part) / Number(total)) * 100).toFixed(1)}% of traffic` : "no traffic yet");
+
+function renderPosture(alerts) {
+  const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  let peak = 0;
+  for (const a of alerts) {
+    if (counts[a.severity] !== undefined) counts[a.severity] += 1;
+    peak = Math.max(peak, Number(a.risk_score) || 0);
+  }
+
+  const ring = $("posture-ring");
+  ring.style.setProperty("--pct", peak);
+  const band = peak >= 90 ? "CRITICAL" : peak >= 75 ? "HIGH" : peak >= 50 ? "MEDIUM" : peak > 0 ? "LOW" : "";
+  ring.style.setProperty("--sev", band ? `var(--${band === "CRITICAL" ? "crit" : band === "HIGH" ? "high" : band === "MEDIUM" ? "med" : "low"})` : "var(--ok)");
+
+  $("posture-score").textContent = peak;
+  $("posture-label").textContent = peak >= 90 ? "Critical" : peak >= 75 ? "Elevated"
+    : peak >= 50 ? "Guarded" : peak > 0 ? "Low" : "Nominal";
+  $("posture-note").textContent = peak
+    ? "Highest risk score among recorded findings. A risk score is not a probability of compromise."
+    : "No findings recorded.";
+
+  const max = Math.max(1, ...Object.values(counts));
+  $("sev-list").innerHTML = Object.entries(counts).map(([sev, n]) => `
+    <li class="${sevClass(sev)}">
+      <span class="lbl">${esc(sev[0] + sev.slice(1).toLowerCase())}</span>
+      <span class="bar"><i></i></span>
+      <span class="n">${n}</span>
+    </li>`).join("");
+  // Widths are set as custom properties rather than inline style attributes.
+  [...$("sev-list").children].forEach((li, i) => {
+    li.querySelector(".bar i").style.setProperty("--pct", (Object.values(counts)[i] / max) * 100);
+  });
+}
+
+function feedRows(alerts, limit) {
+  if (!alerts.length) {
+    return emptyState("◌", "No detections yet",
+      "The sensor is running and nothing has crossed a threshold. That is the expected state on a quiet network.");
+  }
+  return `<div class="feed">${alerts.slice(0, limit).map((a) => `
+    <div class="feed-row row ${sevClass(a.severity)}" data-alert="${esc(a.id)}" tabindex="0" role="button">
+      <span class="feed-t">${esc(clock(a.timestamp))}</span>
+      <span class="feed-main">
+        <b>${esc(a.threat)}</b>
+        <span>${esc(a.source)} · ${esc(a.reason)}</span>
+      </span>
+      <span class="score">${esc(a.risk_score)}</span>
+    </div>`).join("")}</div>`;
+}
+
+/* ── Rendering: tables ──────────────────────────────────────────────── */
+
+function renderIncidents(incidents) {
+  $("inc-count").textContent = `${incidents.length} open`;
+  $("nav-incidents").textContent = incidents.length || "";
+  const body = $("inc-body");
+  const empty = $("inc-empty");
+  if (!incidents.length) {
+    body.innerHTML = "";
+    empty.innerHTML = emptyState("◇", "No incidents",
+      "An incident groups findings from one source inside the correlation window. None have formed.");
+    return;
+  }
+  empty.innerHTML = "";
+  body.innerHTML = incidents.map((i) => `
+    <tr class="row ${sevClass(i.severity)}" data-incident="${esc(i.incident_id)}">
+      <td class="mono">${esc(i.incident_id)}</td>
+      <td class="mono">${esc(i.sources)}</td>
+      <td class="wrap dim">${esc(i.threats)}</td>
+      <td class="num">${num(i.alert_count)}</td>
+      <td class="num score">${esc(i.max_risk)}</td>
+      <td><span class="sev">${esc(i.severity)}</span></td>
+      <td class="dim">${esc(ago(i.last_seen))}</td>
+    </tr>`).join("");
+}
+
+function filteredDetections() {
+  const { text, severity } = state.detFilter;
+  const needle = text.trim().toLowerCase();
+  return state.alerts.filter((a) => {
+    if (severity !== "ALL" && a.severity !== severity) return false;
+    if (!needle) return true;
+    return `${a.threat} ${a.source} ${a.reason} ${a.technique}`.toLowerCase().includes(needle);
+  });
+}
+
+function renderDetections() {
+  const rows = filteredDetections();
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  state.detPage = Math.min(state.detPage, pages - 1);
+  const page = rows.slice(state.detPage * PAGE, state.detPage * PAGE + PAGE);
+
+  $("det-count").textContent = `${rows.length} of ${state.alerts.length}`;
+  $("nav-detections").textContent = state.alerts.length || "";
+
+  const body = $("det-body");
+  const empty = $("det-empty");
+  if (!rows.length) {
+    body.innerHTML = "";
+    empty.innerHTML = state.alerts.length
+      ? emptyState("⌕", "No matches", "No finding matches this filter. Clear the search or pick another severity.")
+      : emptyState("◌", "No detections yet",
+          "Nothing has crossed a detection threshold. On a quiet network that is the correct result, not a failure.");
+    $("det-pager").hidden = true;
+    return;
+  }
+  empty.innerHTML = "";
+  $("det-pager").hidden = pages <= 1;
+  $("det-page").textContent = `Page ${state.detPage + 1} of ${pages}`;
+  $("det-prev").disabled = state.detPage === 0;
+  $("det-next").disabled = state.detPage >= pages - 1;
+
+  body.innerHTML = page.map((a) => `
+    <tr class="row ${sevClass(a.severity)}" data-alert="${esc(a.id)}">
+      <td class="dim mono">${esc(clock(a.timestamp))}</td>
+      <td><b>${esc(a.threat)}</b><br><span class="dim">${esc(a.reason)}</span></td>
+      <td class="mono">${esc(a.source)}</td>
+      <td class="num score">${esc(a.risk_score)}</td>
+      <td class="num dim">${esc(a.confidence)}%</td>
+      <td class="mono dim">${esc(a.technique || "—")}</td>
+      <td><span class="sev">${esc(a.severity)}</span></td>
+    </tr>`).join("");
+}
+
+function renderHosts(hosts) {
+  const needle = state.hostFilter.trim().toLowerCase();
+  const rows = hosts.filter((h) => !needle || String(h.host).toLowerCase().includes(needle));
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  state.hostPage = Math.min(state.hostPage, pages - 1);
+  const page = rows.slice(state.hostPage * PAGE, state.hostPage * PAGE + PAGE);
+
+  $("host-count").textContent = `${rows.length} hosts`;
+  const body = $("host-body");
+  const empty = $("host-empty");
+  if (!rows.length) {
+    body.innerHTML = "";
+    empty.innerHTML = emptyState("▢", "No hosts", "No traffic has been attributed to a source address yet.");
+    $("host-pager").hidden = true;
+    return;
+  }
+  empty.innerHTML = "";
+  $("host-pager").hidden = pages <= 1;
+  $("host-page").textContent = `Page ${state.hostPage + 1} of ${pages}`;
+  $("host-prev").disabled = state.hostPage === 0;
+  $("host-next").disabled = state.hostPage >= pages - 1;
+
+  body.innerHTML = page.map((h) => {
+    const risk = Number(h.max_risk) || 0;
+    const band = risk >= 90 ? "CRITICAL" : risk >= 75 ? "HIGH" : risk >= 50 ? "MEDIUM" : "LOW";
+    return `<tr class="row ${sevClass(band)}" data-host="${esc(h.host)}">
+      <td class="mono">${esc(h.host)}</td>
+      <td class="num score">${risk || "—"}</td>
+      <td class="num">${num(h.alert_count)}</td>
+      <td class="num">${num(h.critical_count)}</td>
+      <td class="num dim">${num(h.packets)}</td>
+      <td class="dim">${esc(h.last_alert ? ago(h.last_alert) : "—")}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderAttack(alerts, catalog) {
+  const seen = new Map();
+  for (const a of alerts) {
+    if (a.technique) seen.set(a.technique, (seen.get(a.technique) || 0) + 1);
+  }
+  const byTactic = new Map();
+  for (const t of catalog) {
+    const tactic = t.tactic || "Other";
+    if (!byTactic.has(tactic)) byTactic.set(tactic, []);
+    byTactic.get(tactic).push(t);
+  }
+  $("attack-count").textContent = `${seen.size} of ${catalog.length} observed`;
+  $("attack-matrix").innerHTML = [...byTactic.entries()].map(([tactic, techs]) => `
+    <div>
+      <div class="tactic-h"><span>${esc(tactic)}</span><span>${techs.filter((t) => seen.has(t.technique_id)).length}/${techs.length}</span></div>
+      ${techs.map((t) => `
+        <article class="tech ${seen.has(t.technique_id) ? "seen" : ""}">
+          ${seen.has(t.technique_id) ? `<span class="tech-badge">${seen.get(t.technique_id)}×</span>` : ""}
+          <span class="tech-id">${esc(t.technique_id)}</span>
+          <b>${esc(t.name)}</b>
+          <p>${esc(t.description)}</p>
+        </article>`).join("")}
+    </div>`).join("");
+}
+
+/* ── Rendering: sensor ──────────────────────────────────────────────── */
+
+const facts = (pairs) => pairs.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("");
+
+function renderSensor(data, status) {
+  const capture = status.capture || data.capture || {};
+  $("sensor-capture").innerHTML = facts([
+    ["State", capture.state || "unknown"],
+    ["Running", capture.running ? "yes" : "no"],
+    ["Interface", capture.interface || "auto-selected"],
+    ["Packets seen", num(capture.packets_seen)],
+    ["Last packet", capture.last_packet ? ago(capture.last_packet) : "—"],
+    ["Error", capture.error || "none"],
+  ]);
+
+  const w = status.writer || {};
+  $("sensor-storage").innerHTML = facts([
+    ["Thread alive", w.thread_alive ? "yes" : "no"],
+    ["Queue depth", `${num(w.queue_depth)} / ${num(w.queue_capacity)}`],
+    ["Queue high-water", num(w.queue_high_watermark)],
+    ["Batches written", num(w.batches_written)],
+    ["Dropped (traffic)", num(w.dropped_traffic)],
+    ["Dropped (alerts)", num(w.dropped_alerts)],
+    ["Write errors", num(w.write_errors)],
+  ]);
+
+  // ML model. Each branch is a real state the sensor can be in, and says what
+  // to do about it rather than rendering a row of dashes.
+  const analysis = status.analysis || {};
+  const model = $("sensor-model");
+  if (analysis.enabled === false) {
+    model.innerHTML = `<div class="notice"><b>Windowed analysis is disabled</b>
+      <p>${esc(sentence(analysis.reason) || "Not enabled.")} Set <code>NEMOS_ANALYSIS=true</code>
+         to enable flow aggregation, feature extraction and model scoring.
+         Deterministic rules and the statistical baseline are unaffected.</p></div>`;
+  } else if (!analysis.model?.available) {
+    model.innerHTML = `<div class="notice"><b>No trained model</b>
+      <p>${esc(sentence(analysis.model?.reason) || "No model is loaded.")}
+         Train one with <code>python tools/train_model.py --source database</code>.
+         NEMOS ships no pretrained model on purpose: a model fitted on another
+         network describes another network's normal.</p></div>`;
+  } else {
+    const meta = analysis.model.metadata || {};
+    model.innerHTML = `<dl class="facts">${facts([
+      ["State", "loaded"],
+      ["Schema version", analysis.model.schema_version ?? "—"],
+      ["Trained", meta.trained_at ? ago(meta.trained_at) : "—"],
+      ["Training samples", num(meta.samples)],
+      ["Window", `${analysis.window_seconds ?? "—"}s`],
+      ["Windows scored", num(analysis.model.scored_windows)],
+      ["scikit-learn", meta.sklearn_version || "—"],
+    ])}</dl>`;
+  }
+
+  // Delivery.
+  const n = status.notifications || {};
+  const d = $("sensor-delivery");
+  if (!n.enabled || !n.active) {
+    const configured = [n.telegram_configured && "Telegram", n.webhook_configured && "webhook"].filter(Boolean);
+    d.innerHTML = `<div class="notice"><b>Outbound delivery is off</b>
+      <p>${configured.length
+          ? `${esc(configured.join(" and "))} configured but delivery is not active.`
+          : "No channel is configured."}
+         Findings are still recorded and shown here — only the outbound copy is
+         affected. Set <code>TELEGRAM_BOT_TOKEN</code> and
+         <code>TELEGRAM_CHAT_ID</code>, or <code>NEMOS_WEBHOOK_URL</code>.</p></div>`;
+  } else {
+    d.innerHTML = `<dl class="facts">${facts([
+      ["Channels", Object.keys(n.channels || {}).join(", ") || "none"],
+      ["Accepted", num(n.accepted)],
+      ["Delivered", num(n.delivered)],
+      ["Failed", num(n.failed)],
+      ["Suppressed (severity)", num(n.suppressed_severity)],
+      ["Suppressed (cooldown)", num(n.suppressed_cooldown)],
+      ["Suppressed (rate)", num(n.suppressed_rate)],
+      ["Queue depth", num(n.queue_depth)],
+    ])}</dl>`;
+  }
+}
+
+/* ── Evidence drawer ────────────────────────────────────────────────── */
+
+function openDrawer(alert) {
+  if (!alert) return;
+  $("drawer-title").textContent = alert.threat;
+  $("drawer-sub").textContent = `${alert.source} · ${clock(alert.timestamp)} · ${alert.severity}`;
+
+  let evidence = alert.evidence;
+  if (typeof evidence === "string") {
+    try { evidence = JSON.parse(evidence); } catch { /* leave as text */ }
+  }
+
+  const parts = [];
+
+  parts.push(`<div class="sect"><h3>Why this fired</h3>
+    <p class="reason">${esc(alert.reason)}</p></div>`);
+
+  parts.push(`<div class="sect"><h3>Assessment</h3><dl class="kv">
+    ${[["Risk score", `${alert.risk_score} / 100`],
+       ["Confidence", `${alert.confidence}%`],
+       ["Severity", alert.severity],
+       ["Category", alert.category],
+       ["Incident", alert.incident_id || "—"],
+       ["Observed", new Date(alert.timestamp).toLocaleString()],
+      ].map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}
+    </dl></div>`);
+
+  // ATT&CK, or an explicit statement that the evidence does not support one.
+  if (alert.attack?.mapped) {
+    parts.push(`<div class="sect"><h3>ATT&amp;CK</h3><dl class="kv">
+      <div><dt>Technique</dt><dd><a href="${esc(alert.attack.url)}" rel="noreferrer noopener">${esc(alert.attack.technique_id)}</a></dd></div>
+      <div><dt>Name</dt><dd>${esc(alert.attack.name)}</dd></div>
+      <div><dt>Tactic</dt><dd>${esc(alert.attack.tactic)}</dd></div>
+      </dl><p class="reason">${esc(alert.attack.description)}</p></div>`);
+  } else {
+    parts.push(`<div class="sect"><h3>ATT&amp;CK</h3>
+      <p class="reason">Unmapped. ${esc(alert.signal?.reason
+        || "This finding is a behavioural signal; the evidence does not support naming a specific technique.")}</p></div>`);
+  }
+
+  // Beaconing gets a periodicity plot: regularity is the whole finding, and it
+  // is far easier to see than to read as a list of numbers.
+  if (evidence && Array.isArray(evidence.intervals_seconds) && evidence.intervals_seconds.length) {
+    const gaps = evidence.intervals_seconds;
+    const peak = Math.max(...gaps, 1);
+    parts.push(`<div class="sect"><h3>Contact periodicity</h3>
+      <div class="beacon">${gaps.map(() => "<i></i>").join("")}</div>
+      <p class="beacon-cap">Each bar is the gap between consecutive contacts.
+         Mean ${esc(evidence.mean_interval_seconds)}s, jitter ratio
+         ${esc(evidence.jitter_ratio)} (threshold ${esc(evidence.jitter_threshold)}).
+         Bars of near-equal height are what makes this a beacon rather than
+         ordinary traffic.</p></div>`);
+    // Heights via custom property, so no inline style attribute is emitted.
+    const bars = parts.length;
+    queueMicrotask(() => {
+      const el = $("drawer-body").querySelectorAll(".beacon i");
+      el.forEach((bar, i) => bar.style.setProperty("--pct", (gaps[i] / peak) * 100));
+      void bars;
+    });
+  }
+
+  if (evidence && typeof evidence === "object") {
+    parts.push(`<div class="sect"><h3>Evidence</h3>
+      <pre class="json">${esc(JSON.stringify(evidence, null, 2))}</pre></div>`);
+  }
+
+  $("drawer-body").innerHTML = parts.join("");
+  $("drawer").hidden = false;
+  $("scrim").hidden = false;
+  $("drawer-close").focus();
+}
+
+function closeDrawer() {
+  $("drawer").hidden = true;
+  $("scrim").hidden = true;
+}
+
+/* ── Command palette ────────────────────────────────────────────────── */
+
+function paletteItems(query) {
+  const q = query.trim().toLowerCase();
+  const items = VIEWS.map((v) => ({ label: TITLES[v][0], hint: "view", action: () => go(v) }));
+
+  for (const host of (state.data?.hosts || []).slice(0, 40)) {
+    items.push({
+      label: host.host, hint: "host",
+      action: () => { state.hostFilter = host.host; $("host-search").value = host.host; go("hosts"); },
+    });
+  }
+  for (const threat of [...new Set(state.alerts.map((a) => a.threat))]) {
+    items.push({
+      label: threat, hint: "threat",
+      action: () => { state.detFilter.text = threat; $("det-search").value = threat; state.detPage = 0; go("detections"); },
+    });
+  }
+  return items.filter((i) => !q || i.label.toLowerCase().includes(q)).slice(0, 12);
+}
+
+function renderPalette() {
+  const items = paletteItems($("palette-input").value);
+  state.paletteIndex = Math.min(state.paletteIndex, Math.max(0, items.length - 1));
+  $("palette-list").innerHTML = items.map((item, i) => `
+    <li class="${i === state.paletteIndex ? "on" : ""}" data-index="${i}">
+      ${esc(item.label)}<small>${esc(item.hint)}</small>
+    </li>`).join("") || `<li class="dim">No matches</li>`;
+  renderPalette._items = items;
+}
+
+function togglePalette(open) {
+  const wrap = $("palette");
+  wrap.hidden = !open;
+  if (open) {
+    $("palette-input").value = "";
+    state.paletteIndex = 0;
+    renderPalette();
+    $("palette-input").focus();
+  }
+}
+
+/* ── Routing ────────────────────────────────────────────────────────── */
+
+function go(view) {
+  if (!VIEWS.includes(view)) view = "overview";
+  state.view = view;
+  if (location.hash.slice(1) !== view) location.hash = view;
+
+  for (const v of VIEWS) $(`view-${v}`).hidden = v !== view;
+  for (const link of document.querySelectorAll(".rail-link")) {
+    link.classList.toggle("on", link.dataset.view === view);
+  }
+  const [title, sub] = TITLES[view];
+  $("view-title").textContent = title;
+  $("view-sub").textContent = sub;
+  window.scrollTo({ top: 0 });
+}
+
+/* ── Paint ──────────────────────────────────────────────────────────── */
+
+function paint() {
+  const data = state.data;
+  if (!data) return;
+
+  renderChain(state.alerts);
+  renderKpis(data.stats || {}, data.capture);
+  renderPosture(state.alerts);
+  $("ov-incidents").innerHTML = (data.incidents || []).length
+    ? `<div class="tablewrap"><table class="table"><tbody>${(data.incidents || []).slice(0, 6).map((i) => `
+        <tr class="row ${sevClass(i.severity)}" data-incident="${esc(i.incident_id)}">
+          <td class="mono">${esc(i.incident_id)}</td>
+          <td class="mono dim">${esc(i.sources)}</td>
+          <td class="num score">${esc(i.max_risk)}</td>
+          <td><span class="sev">${esc(i.severity)}</span></td>
+        </tr>`).join("")}</tbody></table></div>`
+    : emptyState("◇", "No incidents", "Findings from a single source are grouped into an incident. None have formed.");
+  $("ov-timeline").innerHTML = feedRows(state.alerts, 8);
+
+  renderIncidents(data.incidents || []);
+  renderDetections();
+  renderHosts(data.hosts || []);
+  renderAttack(state.alerts, state.catalog || []);
+  renderSensor(data, state.status || {});
+
+  const capture = data.capture || {};
+  const dot = $("conn-dot");
+  dot.className = `dot ${capture.running ? "ok" : capture.error ? "bad" : "warn"}`;
+  $("conn-text").textContent = capture.running ? "Capturing" : (capture.state || "Idle");
+  $("conn-sub").textContent = capture.interface || "no interface";
+  $("updated-at").textContent = new Date().toLocaleTimeString();
+}
+
+async function refresh() {
+  try {
+    const [dash, alerts, catalog, status] = await Promise.all([
+      api("/api/dashboard"),
+      api("/api/alerts?limit=500"),
+      api("/api/techniques"),
+      api("/api/status"),
+    ]);
+    state.data = dash;
+    state.alerts = Array.isArray(alerts) ? alerts : (alerts.alerts || []);
+    state.catalog = catalog.techniques || [];
+    state.status = status;
+    $("authbar").hidden = true;
+    paint();
+  } catch (error) {
+    if (String(error.message) !== "unauthorized") {
+      $("conn-dot").className = "dot bad";
+      $("conn-text").textContent = "Disconnected";
+      $("conn-sub").textContent = "retrying";
+    }
+  }
+}
+
+/* ── Wiring ─────────────────────────────────────────────────────────── */
+
+function alertById(id) {
+  return state.alerts.find((a) => String(a.id) === String(id));
+}
+
+function init() {
+  // Theme
+  try {
+    const saved = localStorage.getItem("nemos.theme");
+    if (saved) document.documentElement.dataset.theme = saved;
+  } catch { /* private mode */ }
+
+  $("theme-toggle").addEventListener("click", () => {
+    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("nemos.theme", next); } catch { /* private mode */ }
+  });
+
+  // Routing
+  window.addEventListener("hashchange", () => go(location.hash.slice(1)));
+  go(location.hash.slice(1) || "overview");
+
+  // Live polling
+  $("live-toggle").addEventListener("click", () => {
+    state.live = !state.live;
+    $("live-toggle").setAttribute("aria-pressed", String(state.live));
+    $("live-label").textContent = state.live ? "Live" : "Paused";
+    if (state.live) refresh();
+  });
+  $("refresh-now").addEventListener("click", refresh);
+
+  // Token
+  $("token-save").addEventListener("click", () => {
+    setToken($("token-input").value.trim());
+    $("token-input").value = "";
+    toast("Token saved");
+    refresh();
+  });
+  $("token-clear").addEventListener("click", () => { setToken(""); toast("Token cleared"); refresh(); });
+
+  // Detection filters
+  $("det-search").addEventListener("input", (e) => {
+    state.detFilter.text = e.target.value; state.detPage = 0; renderDetections();
+  });
+  $("det-severity").addEventListener("click", (e) => {
+    const button = e.target.closest("[data-sev]");
+    if (!button) return;
+    state.detFilter.severity = button.dataset.sev;
+    state.detPage = 0;
+    for (const seg of $("det-severity").children) seg.classList.toggle("on", seg === button);
+    renderDetections();
+  });
+  $("det-prev").addEventListener("click", () => { state.detPage = Math.max(0, state.detPage - 1); renderDetections(); });
+  $("det-next").addEventListener("click", () => { state.detPage += 1; renderDetections(); });
+
+  // Host filters
+  $("host-search").addEventListener("input", (e) => {
+    state.hostFilter = e.target.value; state.hostPage = 0; renderHosts(state.data?.hosts || []);
+  });
+  $("host-prev").addEventListener("click", () => { state.hostPage = Math.max(0, state.hostPage - 1); renderHosts(state.data?.hosts || []); });
+  $("host-next").addEventListener("click", () => { state.hostPage += 1; renderHosts(state.data?.hosts || []); });
+
+  // Row activation -> drawer, or host -> filtered detections
+  document.addEventListener("click", (e) => {
+    const alertRow = e.target.closest("[data-alert]");
+    if (alertRow) { openDrawer(alertById(alertRow.dataset.alert)); return; }
+
+    const hostRow = e.target.closest("[data-host]");
+    if (hostRow) {
+      state.detFilter.text = hostRow.dataset.host;
+      $("det-search").value = hostRow.dataset.host;
+      state.detPage = 0;
+      go("detections");
+      renderDetections();
+      return;
+    }
+    const incidentRow = e.target.closest("[data-incident]");
+    if (incidentRow) {
+      state.detFilter.text = "";
+      const first = state.alerts.find((a) => a.incident_id === incidentRow.dataset.incident);
+      if (first) openDrawer(first);
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.dataset?.alert) openDrawer(alertById(e.target.dataset.alert));
+  });
+
+  $("drawer-close").addEventListener("click", closeDrawer);
+  $("scrim").addEventListener("click", closeDrawer);
+
+  // Palette
+  $("open-palette").addEventListener("click", () => togglePalette(true));
+  $("palette-input").addEventListener("input", () => { state.paletteIndex = 0; renderPalette(); });
+  $("palette-list").addEventListener("click", (e) => {
+    const li = e.target.closest("[data-index]");
+    if (!li) return;
+    renderPalette._items[Number(li.dataset.index)].action();
+    togglePalette(false);
+  });
+  $("palette").addEventListener("click", (e) => { if (e.target === $("palette")) togglePalette(false); });
+
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); togglePalette($("palette").hidden); return; }
+    if (e.key === "Escape") { togglePalette(false); closeDrawer(); return; }
+    if ($("palette").hidden) return;
+    const items = renderPalette._items || [];
+    if (e.key === "ArrowDown") { e.preventDefault(); state.paletteIndex = Math.min(items.length - 1, state.paletteIndex + 1); renderPalette(); }
+    if (e.key === "ArrowUp") { e.preventDefault(); state.paletteIndex = Math.max(0, state.paletteIndex - 1); renderPalette(); }
+    if (e.key === "Enter" && items[state.paletteIndex]) { items[state.paletteIndex].action(); togglePalette(false); }
+  });
+
+  refresh();
+  setInterval(() => { if (state.live && !document.hidden) refresh(); }, 5000);
+}
+
+document.addEventListener("DOMContentLoaded", init);

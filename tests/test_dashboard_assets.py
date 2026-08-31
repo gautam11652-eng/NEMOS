@@ -1,3 +1,11 @@
+"""Static contract tests for the dashboard.
+
+These assert the things that break silently in a browser: an id the script
+writes into that the markup does not define, a syntax error, a view that has no
+route, or inline styles that would be refused by the Content-Security-Policy the
+API sets. They deliberately do not assert visual design.
+"""
+
 import re
 import shutil
 import subprocess
@@ -7,72 +15,102 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HTML = ROOT / "nemos" / "templates" / "index.html"
 JS = ROOT / "nemos" / "static" / "app.js"
+CSS = ROOT / "nemos" / "static" / "app.css"
+
+VIEWS = ("overview", "incidents", "detections", "hosts", "attack", "sensor")
 
 
-def test_dashboard_static_dom_contract():
+def test_every_scripted_id_exists_in_the_markup():
+    """$("x") with no matching id is a silent null dereference at runtime."""
     html = HTML.read_text()
-    js = JS.read_text()
     ids = set(re.findall(r'id="([^"]+)"', html))
-    refs = set(re.findall(r'\$\("([^"]+)"\)', js))
-    # These controls are created dynamically inside the incident modal.
-    dynamic = {"copy-fingerprint", "export-evidence"}
-    assert not (refs - ids - dynamic)
-    assert 'style=' not in js
-    assert 'style=' not in html
+    refs = set(re.findall(r'\$\("([^"]+)"\)', JS.read_text()))
+    missing = refs - ids
+    assert not missing, f"script references ids absent from the template: {sorted(missing)}"
 
 
-def test_dashboard_js_syntax_when_node_is_available():
+def test_no_inline_styles():
+    """The API sets default-src 'self'; inline style attributes are refused.
+
+    Dynamic sizing is done with custom properties via style.setProperty, which
+    is not an inline style attribute.
+    """
+    assert "style=" not in HTML.read_text()
+    assert "style=" not in JS.read_text()
+
+
+def test_javascript_parses_when_node_is_available():
     node = shutil.which("node")
     if not node:
         return
     result = subprocess.run(
-        [node, "--check", str(JS)],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=10,
+        [node, "--check", str(JS)], cwd=ROOT, capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 0, result.stderr
 
 
-def test_dashboard_branding_and_navigation_contract():
+def test_every_view_has_a_route_a_section_and_a_title():
+    html = HTML.read_text()
+    js = JS.read_text()
+    for view in VIEWS:
+        assert f'href="#{view}"' in html, f"no nav link for {view}"
+        assert f'data-view="{view}"' in html, f"no data-view for {view}"
+        assert f'id="view-{view}"' in html, f"no section for {view}"
+        assert f"{view}:" in js or f'"{view}"' in js, f"{view} missing from the router"
+
+
+def test_hidden_attribute_is_honoured():
+    """Every toggled element sets its own display, so [hidden] must outrank them.
+
+    Without this rule all six views, the drawer and the palette paint at once --
+    which is exactly what happened before it was added.
+    """
+    assert re.search(r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important", CSS.read_text())
+
+
+def test_favicon_is_a_served_file_not_a_data_uri():
+    """A data: URI favicon is blocked by the page's own CSP."""
+    html = HTML.read_text()
+    assert 'rel="icon"' in html
+    assert "data:image" not in html
+    assert (ROOT / "nemos" / "static" / "favicon.svg").is_file()
+
+
+def test_untrusted_values_are_escaped_before_insertion():
+    """Alert fields carry attacker-influenced values such as source addresses."""
+    js = JS.read_text()
+    assert "const esc =" in js
+    # Spot-check that the row renderers escape rather than interpolate raw.
+    assert "${esc(a.source)}" in js
+    assert "${esc(a.threat)}" in js
+
+
+def test_branding_and_attribution_are_present():
     html = HTML.read_text()
     assert "THREATCORE" not in html.upper()
-    for section in ("overview", "incidents", "hosts", "network", "techniques"):
-        assert f'href="#{section}"' in html
-        assert f'id="{section}"' in html
-    for element_id in ("packets", "tcp", "udp", "dns", "threats", "critical", "timeline", "posture-score", "incidents-body", "hosts-body", "technique-list", "attack-summary", "network-graph", "traffic-body", "telegram-card", "health-grid", "incident-modal"):
-        assert f'id="{element_id}"' in html
-    # ML detection section: every element the AI renderer writes into must exist.
-    for element_id in ("ai", "ai-badge", "ai-status", "ai-model-state", "ai-model-version",
-                       "ai-model-trained", "ai-model-samples", "ai-scored", "ai-window",
-                       "ai-note", "ai-assessments"):
-        assert f'id="{element_id}"' in html, element_id
-    assert 'href="#ai"' in html
     assert "THREATCORE" not in JS.read_text().upper()
     assert "Network Exposure Monitoring" in html
     assert "Created by" in html
     assert "gautam11652-eng/NEMOS" in html
     assert "gautam11652@gmail.com" in html
-    assert "risk-chart" not in html
-    assert "risk-chart" not in JS.read_text()
-    assert "TELEGRAM" in html.upper()
 
 
-def test_ai_section_does_not_overstate_the_model():
-    """The dashboard must not present the anomaly score as a probability."""
+def test_dashboard_states_its_own_limits():
+    """The interface must not imply more certainty than the sensor has."""
+    html = HTML.read_text()
     js = JS.read_text()
-    lowered = js.lower()
-    assert "not a probability" in lowered
-    for phrase in ("ai detected attack", "confirmed attack", "malware detected",
-                   "guaranteed", "100% accurate"):
-        assert phrase not in lowered, phrase
+    assert "not proof of compromise" in html
+    assert "not a probability" in js
 
 
-def test_dashboard_renders_only_backend_supplied_ai_fields():
-    """Each AI tile must be filled from a real API field, not a computed placeholder."""
+def test_only_real_api_endpoints_are_called():
+    """Guards against calling an endpoint that does not exist.
+
+    An earlier revision fetched /api/attack, which is not a route; the view
+    silently rendered empty.
+    """
     js = JS.read_text()
-    for source in ("model.available", "meta.model_version", "meta.trained_at",
-                   "meta.samples", "model.scored_windows", "status.window_seconds",
-                   "a.anomaly_score", "a.baseline_state", "explanation"):
-        assert source in js, source
+    called = set(re.findall(r'api\("(/api/[^"?]+)', js))
+    routes = set(re.findall(r'@app\.(?:get|post|route)\("(/api/[^"<]*)', (ROOT / "nemos" / "api.py").read_text()))
+    unknown = {c for c in called if c not in routes}
+    assert not unknown, f"dashboard calls endpoints that do not exist: {sorted(unknown)}"

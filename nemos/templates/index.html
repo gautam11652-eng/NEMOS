@@ -1,160 +1,303 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#070b11">
-<meta name="description" content="NEMOS — Network Exposure Monitoring & Operations System">
-<title>NEMOS // Security Operations</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>NEMOS — Network Exposure Monitoring &amp; Operations System</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
 <body>
-<div class="app-shell">
-  <aside class="sidebar" aria-label="NEMOS navigation">
-    <div class="brand-block">
-      <div class="brand-mark" aria-hidden="true"><span>N</span></div>
-      <div><div class="brand">NEMOS</div><div class="brand-sub">NETWORK EXPOSURE MONITORING<br>&amp; OPERATIONS SYSTEM</div></div>
+<a class="skip" href="#main">Skip to content</a>
+
+<div class="app">
+
+  <!-- ── Rail ──────────────────────────────────────────────────────── -->
+  <aside class="rail">
+    <div class="rail-brand">
+      <span class="mark" aria-hidden="true">N</span>
+      <span class="rail-brand-text">
+        <b>NEMOS</b>
+        <small>Network Exposure Monitoring<br>&amp; Operations System</small>
+      </span>
     </div>
-    <nav class="nav">
-      <a class="nav-item active" href="#overview"><span>▦</span> Dashboard</a>
-      <a class="nav-item" href="#incidents"><span>◉</span> Incidents</a>
-      <a class="nav-item" href="#ai"><span>◈</span> ML Detection</a>
-      <a class="nav-item" href="#hosts"><span>⌁</span> Hosts</a>
-      <a class="nav-item" href="#network"><span>◇</span> Network</a>
-      <a class="nav-item" href="#techniques"><span>⊙</span> MITRE ATT&amp;CK</a>
+
+    <nav class="rail-nav" aria-label="Primary">
+      <a class="rail-link" href="#overview"   data-view="overview"><i aria-hidden="true">◈</i>Overview</a>
+      <a class="rail-link" href="#incidents"  data-view="incidents"><i aria-hidden="true">◆</i>Incidents<span class="rail-count" id="nav-incidents"></span></a>
+      <a class="rail-link" href="#detections" data-view="detections"><i aria-hidden="true">▲</i>Detections<span class="rail-count" id="nav-detections"></span></a>
+      <a class="rail-link" href="#hosts"      data-view="hosts"><i aria-hidden="true">▣</i>Hosts</a>
+      <a class="rail-link" href="#attack"     data-view="attack"><i aria-hidden="true">⌗</i>ATT&amp;CK</a>
+      <a class="rail-link" href="#sensor"     data-view="sensor"><i aria-hidden="true">⏻</i>Sensor</a>
     </nav>
-    <div class="sidebar-bottom">
-      <div class="sensor-card">
-        <div class="eyebrow">SENSOR STATUS</div>
-        <div class="sensor-status"><span class="status-dot"></span><strong id="sensor-state">STARTING</strong></div>
-        <div class="sensor-meta" id="sensor-meta">Waiting for capture status</div>
+
+    <div class="rail-foot">
+      <div class="sensor-pill" id="sensor-pill">
+        <span class="dot" id="conn-dot" aria-hidden="true"></span>
+        <span>
+          <b id="conn-text">Connecting</b>
+          <small id="conn-sub">sensor state</small>
+        </span>
       </div>
-      <div class="side-note">LOCAL-FIRST<br>EXPLAINABLE · CORRELATED · OPEN SOURCE</div>
+      <p class="credit">
+        Created by <b>Gautam</b><br>
+        <a href="https://github.com/gautam11652-eng/NEMOS" rel="noreferrer noopener">gautam11652-eng/NEMOS</a><br>
+        <a href="mailto:gautam11652@gmail.com">gautam11652@gmail.com</a>
+      </p>
     </div>
   </aside>
 
-  <main class="main">
-    <header class="topbar" id="overview">
-      <div>
-        <div class="eyebrow"><span class="eyebrow-live"><i></i> SECURITY OPERATIONS</span></div>
-        <h1>NEMOS <span>// SECURITY OPERATIONS</span></h1>
-        <p>Network Exposure Monitoring &amp; Operations System — live telemetry, evidence-backed detection and incident triage.</p>
+  <!-- ── Main ──────────────────────────────────────────────────────── -->
+  <main class="main" id="main">
+    <header class="topbar">
+      <div class="topbar-title">
+        <h1 id="view-title">Overview</h1>
+        <p id="view-sub">Live security posture</p>
       </div>
-      <div class="top-actions">
-        <div class="connection-pill"><span class="status-dot"></span><span id="connection-label">CONNECTING</span><span class="divider"></span><span>LOCAL TELEMETRY</span><span class="divider"></span><span id="updated">—</span></div>
-        <button class="icon-btn" id="theme-refresh" title="Refresh telemetry" aria-label="Refresh telemetry">↻</button>
+
+      <div class="topbar-tools">
+        <button class="btn ghost" id="open-palette" type="button" title="Search (Ctrl+K)">
+          <span aria-hidden="true">⌕</span> Search <kbd>Ctrl K</kbd>
+        </button>
+        <button class="btn ghost" id="live-toggle" type="button" aria-pressed="true">
+          <span class="live-dot" aria-hidden="true"></span><span id="live-label">Live</span>
+        </button>
+        <button class="btn ghost icon" id="theme-toggle" type="button" title="Toggle theme" aria-label="Toggle theme">◐</button>
+        <button class="btn ghost icon" id="refresh-now" type="button" title="Refresh now" aria-label="Refresh now">⟳</button>
+        <span class="stamp" id="updated-at">—</span>
       </div>
     </header>
 
-    {% if token_configured %}
-    <section class="authbar" aria-label="API authentication">
-      <div class="auth-icon">LOCK</div><div class="auth-copy"><strong>Protected sensor</strong><span>Enter your NEMOS API token to view telemetry.</span></div>
-      <input id="api-token" type="password" autocomplete="off" placeholder="NEMOS_API_TOKEN">
-      <button id="save-token" class="btn primary">Connect</button><button id="clear-token" class="btn ghost">Clear</button>
-    </section>
-    {% endif %}
-
-    <section class="kpi-grid" aria-label="Security metrics">
-      <article class="kpi"><div class="kpi-head"><span>Packets observed</span><span>NET</span></div><div id="packets" class="kpi-value">0</div><div class="kpi-foot"><span id="pps">0 pkt/s</span><span class="muted">lifetime</span></div></article>
-      <article class="kpi cyan"><div class="kpi-head"><span>TCP traffic</span><span>TCP</span></div><div id="tcp" class="kpi-value">0</div><div class="kpi-foot"><span id="tcp-share">0.0%</span><span class="muted">observed</span></div></article>
-      <article class="kpi blue"><div class="kpi-head"><span>UDP traffic</span><span>UDP</span></div><div id="udp" class="kpi-value">0</div><div class="kpi-foot"><span id="udp-share">0.0%</span><span class="muted">observed</span></div></article>
-      <article class="kpi green"><div class="kpi-head"><span>DNS traffic</span><span>DNS</span></div><div id="dns" class="kpi-value">0</div><div class="kpi-foot"><span id="dns-share">0.0%</span><span class="muted">name traffic</span></div></article>
-      <article class="kpi amber"><div class="kpi-head"><span>Active threats</span><span>TRIAGE</span></div><div id="threats" class="kpi-value">0</div><div class="kpi-foot"><span>correlated detections</span><span class="muted">current</span></div></article>
-      <article class="kpi red"><div class="kpi-head"><span>Critical events</span><span>PRIORITY</span></div><div id="critical" class="kpi-value">0</div><div class="kpi-foot"><span id="threat-state">No critical events</span><span class="muted">immediate</span></div></article>
-    </section>
-
-    <section class="hero-grid">
-      <article class="panel timeline-panel">
-        <div class="panel-head"><div><div class="panel-kicker">DETECTION FEED</div><h2>Live detection timeline</h2></div><div id="refresh" class="live-badge"><span class="pulse"></span>LIVE</div></div>
-        <div id="timeline" class="timeline"><div class="empty-state">Waiting for telemetry…</div></div>
-      </article>
-      <article class="panel posture-panel">
-        <div class="panel-head"><div><div class="panel-kicker">SECURITY POSTURE</div><h2>Current posture</h2></div><span class="sub-badge">0–100 triage</span></div>
-        <div class="posture-body">
-          <div class="posture-score"><div class="score-ring" id="posture-ring"><div><strong id="posture-score">0</strong><span>RISK</span></div></div><div><strong id="posture-label">NOMINAL</strong><p id="posture-copy">No elevated security findings in the current telemetry window.</p></div></div>
-          <div class="posture-grid"><div><span>Critical</span><strong id="posture-critical">0</strong></div><div><span>High</span><strong id="posture-high">0</strong></div><div><span>Medium</span><strong id="posture-medium">0</strong></div><div><span>Low</span><strong id="posture-low">0</strong></div></div>
-        </div>
-      </article>
-    </section>
-
-    <section class="panel" id="incidents">
-      <div class="panel-head"><div><div class="panel-kicker">INCIDENTS // INVESTIGATION</div><h2>Correlated incidents</h2></div><span class="sub-badge">evidence preserved locally</span></div>
-      <div class="table-wrap"><table><thead><tr><th>Incident</th><th>Source</th><th>Threats</th><th>Severity</th><th>Risk</th><th>Alerts</th><th>Last seen</th><th></th></tr></thead><tbody id="incidents-body"><tr><td colspan="8" class="empty-cell">No correlated incidents yet</td></tr></tbody></table></div>
-    </section>
-
-    <section class="panel" id="ai">
-      <div class="panel-head">
-        <div>
-          <div class="panel-kicker">ML ANOMALY DETECTION // ISOLATION FOREST</div>
-          <h2>Model detection &amp; explainability</h2>
-        </div>
-        <span id="ai-badge" class="sub-badge">CHECKING</span>
+    <!-- Auth bar: only shown when the API answers 401. -->
+    <div class="authbar" id="authbar" hidden>
+      <div>
+        <b>This sensor requires an API token.</b>
+        <span>It is stored in this browser only and sent as a bearer token.</span>
       </div>
-      <div class="ai-status-grid" id="ai-status">
-        <div><span>Model</span><strong id="ai-model-state">—</strong></div>
-        <div><span>Version</span><strong id="ai-model-version" class="mono">—</strong></div>
-        <div><span>Trained</span><strong id="ai-model-trained">—</strong></div>
-        <div><span>Training windows</span><strong id="ai-model-samples">—</strong></div>
-        <div><span>Windows scored</span><strong id="ai-scored">0</strong></div>
-        <div><span>Analysis window</span><strong id="ai-window">—</strong></div>
+      <div class="authbar-actions">
+        <input id="token-input" type="password" placeholder="API token" autocomplete="off" spellcheck="false">
+        <button class="btn" id="token-save" type="button">Save</button>
+        <button class="btn ghost" id="token-clear" type="button">Clear</button>
       </div>
-      <div id="ai-note" class="bot-note">Checking model status…</div>
-      <div class="panel-kicker section-gap ai-subhead">RECENT ASSESSMENTS // WHY THIS WAS FLAGGED</div>
-      <div id="ai-assessments" class="ai-assessments"><div class="empty-state">No ML assessments yet.</div></div>
-    </section>
+    </div>
 
-    <section class="split-grid">
-      <article class="panel" id="hosts">
-        <div class="panel-head"><div><div class="panel-kicker">HOSTS // TRIAGE</div><h2>Host risk index</h2></div><span class="sub-badge">prioritized by risk</span></div>
-        <div class="table-wrap"><table><thead><tr><th>Host</th><th>Risk</th><th>Alerts</th><th>Critical</th><th>Packets</th><th>Last alert</th></tr></thead><tbody id="hosts-body"><tr><td colspan="6" class="empty-cell">Waiting for host telemetry…</td></tr></tbody></table></div>
-      </article>
-      <article class="panel bot-panel">
-        <div class="panel-head"><div><div class="panel-kicker">ALERT DELIVERY // TELEGRAM &amp; WEBHOOK</div><h2>Outbound alerting</h2></div><span id="telegram-badge" class="sub-badge">CHECKING</span></div>
-        <div id="telegram-card" class="bot-card"><div class="empty-state">Checking alert delivery…</div></div>
-      </article>
-    </section>
+    <div class="views">
 
-    <section class="panel attack-panel" id="techniques">
-      <div class="panel-head"><div><div class="panel-kicker">THREAT FRAMEWORK // MITRE ATT&amp;CK</div><h2>ATT&amp;CK coverage &amp; observed techniques</h2></div><span class="sub-badge">conservative mappings</span></div>
-      <div class="attack-summary" id="attack-summary"><div class="empty-state">Loading ATT&amp;CK catalog…</div></div>
-      <div class="attack-grid" id="technique-list"><div class="empty-state">No techniques observed</div></div>
-    </section>
+      <!-- ── Overview ────────────────────────────────────────────── -->
+      <section class="view" id="view-overview">
 
-    <section class="panel" id="network">
-      <div class="panel-head"><div><div class="panel-kicker">NETWORK // SENSOR TELEMETRY</div><h2>Connection activity</h2></div><span class="sub-badge">latest 100 events</span></div>
-      <div class="network-layout">
-        <div id="network-graph" class="network-graph"><div class="empty-state">Waiting for network telemetry…</div></div>
-        <div class="table-wrap compact"><table><thead><tr><th>Time</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Ports</th><th>Bytes</th></tr></thead><tbody id="traffic-body"><tr><td colspan="6" class="empty-cell">Waiting for packets…</td></tr></tbody></table></div>
-      </div>
-    </section>
+        <section class="card chain-card" aria-labelledby="chain-h">
+          <header class="card-head">
+            <div>
+              <h2 id="chain-h">Intrusion progression</h2>
+              <p>Observed findings placed on the ATT&amp;CK tactic they evidence. Only
+                 deterministic rules can name a technique — statistical findings
+                 appear as unmapped signals.</p>
+            </div>
+            <span class="chip" id="chain-verdict">No activity</span>
+          </header>
+          <ol class="chain" id="chain"></ol>
+        </section>
 
-    <section class="lower-grid">
-      <article class="panel system-panel">
-        <div class="panel-head"><div><div class="panel-kicker">RUNTIME // HEALTH</div><h2>Sensor health</h2></div><span class="sub-badge">local process</span></div>
-        <div class="health-grid" id="health-grid">
-          <div><span>Capture</span><strong id="health-capture">—</strong></div><div><span>Interface</span><strong id="health-interface">—</strong></div><div><span>Packets</span><strong id="health-packets">0</strong></div><div><span>Writer queue</span><strong id="health-writer">—</strong></div>
+        <section class="kpis" id="kpis" aria-label="Key metrics"></section>
+
+        <div class="grid-2">
+          <section class="card" aria-labelledby="ov-inc-h">
+            <header class="card-head">
+              <div><h2 id="ov-inc-h">Active incidents</h2>
+                   <p>Findings from one source correlated within a bounded window.</p></div>
+              <a class="btn ghost sm" href="#incidents">All incidents</a>
+            </header>
+            <div id="ov-incidents"></div>
+          </section>
+
+          <section class="card" aria-labelledby="ov-post-h">
+            <header class="card-head">
+              <div><h2 id="ov-post-h">Posture</h2><p>Highest observed risk, by severity.</p></div>
+            </header>
+            <div class="posture">
+              <div class="ring" id="posture-ring">
+                <span class="ring-num" id="posture-score">0</span>
+                <span class="ring-cap">risk</span>
+              </div>
+              <div class="posture-side">
+                <b class="posture-label" id="posture-label">Nominal</b>
+                <p id="posture-note">No findings recorded.</p>
+                <ul class="sev-list" id="sev-list"></ul>
+              </div>
+            </div>
+          </section>
         </div>
-      </article>
-      <article class="panel creator-panel">
-        <div class="creator-heading"><div class="creator-mark">N</div><div><div class="panel-kicker">PROJECT</div><h2>NEMOS</h2></div></div>
-        <div class="creator-line"><span>Created by</span><strong>Gautam</strong></div>
-        <div class="creator-links"><a href="https://github.com/gautam11652-eng/NEMOS" target="_blank" rel="noopener noreferrer">GitHub / gautam11652-eng/NEMOS</a><a href="mailto:gautam11652@gmail.com">gautam11652@gmail.com</a></div>
-      </article>
-    </section>
 
-    <footer><span>NEMOS</span><span>NETWORK EXPOSURE MONITORING &amp; OPERATIONS SYSTEM</span><span>LOCAL-FIRST SECURITY</span><span>© {{ version }}</span></footer>
+        <section class="card" aria-labelledby="ov-time-h">
+          <header class="card-head">
+            <div><h2 id="ov-time-h">Recent detections</h2>
+                 <p>Newest first. Select a row for the evidence behind it.</p></div>
+            <a class="btn ghost sm" href="#detections">All detections</a>
+          </header>
+          <div id="ov-timeline"></div>
+        </section>
+      </section>
+
+      <!-- ── Incidents ───────────────────────────────────────────── -->
+      <section class="view" id="view-incidents" hidden>
+        <section class="card">
+          <header class="card-head">
+            <div><h2>Correlated incidents</h2>
+                 <p>Alerts sharing a source within the correlation window share an incident.</p></div>
+            <span class="chip" id="inc-count">0</span>
+          </header>
+          <div class="tablewrap">
+            <table class="table">
+              <thead><tr>
+                <th>Incident</th><th>Sources</th><th>Threats</th>
+                <th class="num">Alerts</th><th class="num">Risk</th><th>Severity</th><th>Last seen</th>
+              </tr></thead>
+              <tbody id="inc-body"></tbody>
+            </table>
+          </div>
+          <div id="inc-empty"></div>
+        </section>
+      </section>
+
+      <!-- ── Detections ──────────────────────────────────────────── -->
+      <section class="view" id="view-detections" hidden>
+        <section class="card">
+          <header class="card-head">
+            <div><h2>Detections</h2><p>Every finding, with the evidence that produced it.</p></div>
+            <span class="chip" id="det-count">0</span>
+          </header>
+
+          <div class="filters">
+            <input id="det-search" type="search" placeholder="Filter by source, threat or reason…" spellcheck="false">
+            <div class="segmented" id="det-severity" role="group" aria-label="Severity filter">
+              <button class="seg on" type="button" data-sev="ALL">All</button>
+              <button class="seg" type="button" data-sev="CRITICAL">Critical</button>
+              <button class="seg" type="button" data-sev="HIGH">High</button>
+              <button class="seg" type="button" data-sev="MEDIUM">Medium</button>
+              <button class="seg" type="button" data-sev="LOW">Low</button>
+            </div>
+          </div>
+
+          <div class="tablewrap">
+            <table class="table">
+              <thead><tr>
+                <th>Time</th><th>Threat</th><th>Source</th>
+                <th class="num">Risk</th><th class="num">Conf.</th><th>Technique</th><th></th>
+              </tr></thead>
+              <tbody id="det-body"></tbody>
+            </table>
+          </div>
+          <div id="det-empty"></div>
+          <nav class="pager" id="det-pager" aria-label="Detections pages">
+            <button class="btn ghost sm" id="det-prev" type="button">Previous</button>
+            <span id="det-page">—</span>
+            <button class="btn ghost sm" id="det-next" type="button">Next</button>
+          </nav>
+        </section>
+      </section>
+
+      <!-- ── Hosts ───────────────────────────────────────────────── -->
+      <section class="view" id="view-hosts" hidden>
+        <section class="card">
+          <header class="card-head">
+            <div><h2>Host risk</h2><p>Per-source rollup. Select a host to filter detections.</p></div>
+            <span class="chip" id="host-count">0</span>
+          </header>
+          <div class="filters">
+            <input id="host-search" type="search" placeholder="Filter by address…" spellcheck="false">
+          </div>
+          <div class="tablewrap">
+            <table class="table">
+              <thead><tr>
+                <th>Host</th><th class="num">Risk</th><th class="num">Alerts</th>
+                <th class="num">Critical</th><th class="num">Packets</th><th>Last alert</th>
+              </tr></thead>
+              <tbody id="host-body"></tbody>
+            </table>
+          </div>
+          <div id="host-empty"></div>
+          <nav class="pager" id="host-pager" aria-label="Host pages">
+            <button class="btn ghost sm" id="host-prev" type="button">Previous</button>
+            <span id="host-page">—</span>
+            <button class="btn ghost sm" id="host-next" type="button">Next</button>
+          </nav>
+        </section>
+      </section>
+
+      <!-- ── ATT&CK ──────────────────────────────────────────────── -->
+      <section class="view" id="view-attack" hidden>
+        <section class="card">
+          <header class="card-head">
+            <div><h2>ATT&amp;CK coverage</h2>
+                 <p>The catalog holds only techniques the detector actually emits.
+                    A technique is <b>observed</b> once a finding has evidenced it.</p></div>
+            <span class="chip" id="attack-count">0</span>
+          </header>
+          <div class="matrix" id="attack-matrix"></div>
+        </section>
+      </section>
+
+      <!-- ── Sensor ──────────────────────────────────────────────── -->
+      <section class="view" id="view-sensor" hidden>
+        <div class="grid-2">
+          <section class="card">
+            <header class="card-head"><div><h2>Capture</h2><p>Packet source and throughput.</p></div></header>
+            <dl class="facts" id="sensor-capture"></dl>
+          </section>
+          <section class="card">
+            <header class="card-head"><div><h2>Storage</h2><p>The single SQLite writer.</p></div></header>
+            <dl class="facts" id="sensor-storage"></dl>
+          </section>
+        </div>
+        <div class="grid-2">
+          <section class="card">
+            <header class="card-head"><div><h2>ML anomaly model</h2>
+              <p>Absence degrades rather than fails: without a model, rules and the
+                 statistical baseline continue unaffected.</p></div></header>
+            <div id="sensor-model"></div>
+          </section>
+          <section class="card">
+            <header class="card-head"><div><h2>Alert delivery</h2>
+              <p>Findings are always recorded locally; this is the outbound copy only.</p></div></header>
+            <div id="sensor-delivery"></div>
+          </section>
+        </div>
+      </section>
+
+    </div>
+
+    <footer class="foot">
+      <span>NEMOS · defensive monitoring. Alerts are detection signals, not proof of compromise.</span>
+      <span>Only monitor networks you are authorized to monitor.</span>
+    </footer>
   </main>
 </div>
 
-<div id="incident-modal" class="modal" hidden>
-  <div class="modal-backdrop" data-close-modal></div>
-  <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-    <button class="modal-close" data-close-modal aria-label="Close">×</button>
-    <div class="panel-kicker">INVESTIGATION</div><h2 id="modal-title">Incident</h2>
-    <div id="incident-detail" class="incident-detail"><div class="empty-state">Loading…</div></div>
-  </section>
+<!-- ── Evidence drawer ───────────────────────────────────────────── -->
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden>
+  <header class="drawer-head">
+    <div>
+      <h2 id="drawer-title">Finding</h2>
+      <p id="drawer-sub">—</p>
+    </div>
+    <button class="btn ghost icon" id="drawer-close" type="button" aria-label="Close">✕</button>
+  </header>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<!-- ── Command palette ───────────────────────────────────────────── -->
+<div class="palette-wrap" id="palette" hidden>
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+    <input id="palette-input" type="text" placeholder="Jump to a view, host or threat…" autocomplete="off" spellcheck="false">
+    <ul class="palette-list" id="palette-list"></ul>
+  </div>
 </div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
 <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </body>
 </html>
