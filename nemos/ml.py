@@ -155,9 +155,15 @@ class AnomalyEngine:
     and scores. Training happens out of band via ``tools/train_model.py``.
     """
 
-    def __init__(self, model_dir: Path | str, *, random_state: int = 42):
+    def __init__(self, model_dir: Path | str, *, random_state: int = 42,
+                 window_seconds: float | None = None):
         self.model_dir = Path(model_dir)
         self.random_state = random_state
+        # The aggregation window is part of the feature contract: packet counts,
+        # rates and flow counts all scale with it, so a model fitted on 10s
+        # windows describes a different distribution from one fitted on 2s.
+        # Recorded at training time and checked at load.
+        self.window_seconds = window_seconds
         self._lock = threading.Lock()
         self._model: Any = None
         self._quantiles: list[float] = []
@@ -279,6 +285,17 @@ class AnomalyEngine:
         feature_mean = matrix.mean(axis=0).tolist()
         feature_std = matrix.std(axis=0).tolist()
 
+        # Every training vector carries the window it was built from; they must
+        # agree, or the corpus mixes incompatible feature scales.
+        windows = {round(float(v.window_seconds), 3) for v in vectors}
+        if len(windows) > 1:
+            raise ValueError(
+                f"training vectors mix aggregation windows {sorted(windows)}; "
+                f"packet counts and rates scale with the window, so a mixed "
+                f"corpus does not describe one distribution"
+            )
+        window_seconds = windows.pop()
+
         trained_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         model_version = f"{FEATURE_SCHEMA_VERSION}.{MODEL_FORMAT_VERSION}.{int(datetime.now(timezone.utc).timestamp())}"
         metadata = {
@@ -292,6 +309,7 @@ class AnomalyEngine:
             "random_state": self.random_state,
             "trained_at": trained_at,
             "sklearn_version": sklearn.__version__,
+            "window_seconds": window_seconds,
             "quantiles": quantiles,
             "feature_mean": feature_mean,
             "feature_std": feature_std,
@@ -397,6 +415,22 @@ class AnomalyEngine:
             self._set_unavailable("model calibration data is missing or malformed; retrain")
             return False
 
+        trained_window = metadata.get("window_seconds")
+        if self.window_seconds is not None and trained_window is not None:
+            if abs(float(trained_window) - float(self.window_seconds)) > 1e-6:
+                # Scoring across a window mismatch is worse than not scoring:
+                # every count and rate feature is on a different scale, so the
+                # model reports confident numbers about a distribution it was
+                # never fitted on.
+                self._set_unavailable(
+                    f"model was trained on {trained_window}s windows but this sensor "
+                    f"aggregates {self.window_seconds}s windows. Counts and rates scale "
+                    f"with the window, so the scores would be meaningless. Either set "
+                    f"NEMOS_ANALYSIS_WINDOW={trained_window} or retrain with "
+                    f"--window {self.window_seconds}."
+                )
+                return False
+
         with self._lock:
             self._model = model
             self._quantiles = [float(q) for q in quantiles]
@@ -476,44 +510,58 @@ class AnomalyEngine:
         """Convert a raw decision-function value into a 0-100 anomaly score.
 
         ``quantiles`` is the ascending training distribution, so a *lower* raw
-        value is more anomalous. The mapping is piecewise linear against three
-        reference points from that distribution -- the median, the 5th
-        percentile and the minimum:
+        value is more anomalous. The window's position is expressed in
+        **robust deviation units**: how far below the training median it sits,
+        measured in units of the median-to-5th-percentile spread.
 
-        ==========================  ==========  ====================
-        Where the window falls      Score       Band
-        ==========================  ==========  ====================
-        at or above the median        0         NORMAL
-        median down to p05            0-40      NORMAL
-        p05 down to training min      40-70     SUSPICIOUS
-        below anything in training    70-100    ANOMALOUS / HIGHLY
-        ==========================  ==========  ====================
+            deviation = (q50 - raw) / (q50 - q05)
 
-        A plain percentile rank was the obvious choice here and is wrong: it
+        Both anchors are robust. An earlier version used the training *minimum*
+        as the "edge of normal" anchor, and that was wrong in a way worth
+        recording: the minimum is by definition a single sample, so one unusual
+        training window set the entire scale. Measured on this project's
+        scenarios the minimum sat at -0.255 while the 5th percentile was
+        -0.030, which stretched the band so far that a 259-port SYN scan scored
+        65 -- indistinguishable from busy-but-benign traffic.
+
+        The bands below come from measured separation on the synthetic
+        scenarios, where held-out normal traffic reached 1.7 deviation units and
+        every abnormal scenario fell between 2.6 and 3.3:
+
+        ============================  ==========  ====================
+        Deviation from training       Score       Band
+        ============================  ==========  ====================
+        at or above the median          0         NORMAL
+        up to 1 unit below              0         NORMAL
+        1 to 2 units below              0-40      NORMAL
+        2 to 2.5 units below            40-70     SUSPICIOUS
+        beyond 2.5 units                70-100    ANOMALOUS / HIGHLY
+        ============================  ==========  ====================
+
+        A plain percentile rank is the obvious alternative and is also wrong: it
         distributes training data uniformly over 0-100 by construction, so half
-        of ordinary traffic would score above 50. Anchoring to the tail instead
-        keeps 95% of training-like traffic under 40 and reserves the top band
-        for windows more extreme than anything the model was fitted on.
+        of ordinary traffic would score above 50.
 
         The score says how far into the sparse tail of the training
         distribution a window sits. It is not a probability of compromise.
         """
         if not quantiles:
             return 0
-        q_min, q05, q50 = quantiles[0], quantiles[5], quantiles[50]
-
-        if raw >= q50:
+        q05, q50 = quantiles[5], quantiles[50]
+        scale = q50 - q05
+        if scale <= 1e-12:
+            # A degenerate training distribution carries no usable spread, so
+            # there is no defensible way to grade a deviation against it.
             return 0
-        if raw >= q05:
-            span = q50 - q05
-            return int(round(40 * (q50 - raw) / span)) if span > 1e-12 else 0
-        if raw >= q_min:
-            span = q05 - q_min
-            return int(round(40 + 30 * (q05 - raw) / span)) if span > 1e-12 else 40
-        # Beyond the range the model was fitted on. Scale by the width of the
-        # training distribution so "how far beyond" stays meaningful.
-        span = max(q50 - q_min, 1e-9)
-        return int(min(100, round(70 + 30 * (q_min - raw) / span)))
+        deviation = (q50 - raw) / scale
+
+        if deviation <= 1.0:
+            return 0
+        if deviation <= 2.0:
+            return int(round(40 * (deviation - 1.0)))
+        if deviation <= 2.5:
+            return int(round(40 + 60 * (deviation - 2.0)))
+        return int(min(100, round(70 + 60 * (deviation - 2.5))))
 
     @staticmethod
     def _contributions(vector: FeatureVector, mean: list[float], std: list[float],

@@ -19,6 +19,7 @@
     <nav class="nav">
       <a class="nav-item active" href="#overview"><span>▦</span> Dashboard</a>
       <a class="nav-item" href="#incidents"><span>◉</span> Incidents</a>
+      <a class="nav-item" href="#ai"><span>◈</span> ML Detection</a>
       <a class="nav-item" href="#hosts"><span>⌁</span> Hosts</a>
       <a class="nav-item" href="#network"><span>◇</span> Network</a>
       <a class="nav-item" href="#techniques"><span>⊙</span> MITRE ATT&amp;CK</a>
@@ -80,6 +81,27 @@
     <section class="panel" id="incidents">
       <div class="panel-head"><div><div class="panel-kicker">INCIDENTS // INVESTIGATION</div><h2>Correlated incidents</h2></div><span class="sub-badge">evidence preserved locally</span></div>
       <div class="table-wrap"><table><thead><tr><th>Incident</th><th>Source</th><th>Threats</th><th>Severity</th><th>Risk</th><th>Alerts</th><th>Last seen</th><th></th></tr></thead><tbody id="incidents-body"><tr><td colspan="8" class="empty-cell">No correlated incidents yet</td></tr></tbody></table></div>
+    </section>
+
+    <section class="panel" id="ai">
+      <div class="panel-head">
+        <div>
+          <div class="panel-kicker">ML ANOMALY DETECTION // ISOLATION FOREST</div>
+          <h2>Model detection &amp; explainability</h2>
+        </div>
+        <span id="ai-badge" class="sub-badge">CHECKING</span>
+      </div>
+      <div class="ai-status-grid" id="ai-status">
+        <div><span>Model</span><strong id="ai-model-state">—</strong></div>
+        <div><span>Version</span><strong id="ai-model-version" class="mono">—</strong></div>
+        <div><span>Trained</span><strong id="ai-model-trained">—</strong></div>
+        <div><span>Training windows</span><strong id="ai-model-samples">—</strong></div>
+        <div><span>Windows scored</span><strong id="ai-scored">0</strong></div>
+        <div><span>Analysis window</span><strong id="ai-window">—</strong></div>
+      </div>
+      <div id="ai-note" class="bot-note">Checking model status…</div>
+      <div class="panel-kicker section-gap ai-subhead">RECENT ASSESSMENTS // WHY THIS WAS FLAGGED</div>
+      <div id="ai-assessments" class="ai-assessments"><div class="empty-state">No ML assessments yet.</div></div>
     </section>
 
     <section class="split-grid">

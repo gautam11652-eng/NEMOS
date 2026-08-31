@@ -105,7 +105,7 @@ class AnalysisEngine:
             max_duration=self.window_seconds * 6,
         )
 
-        self.model = AnomalyEngine(model_dir)
+        self.model = AnomalyEngine(model_dir, window_seconds=self.window_seconds)
         self.profiler = profiler or AdaptiveBehaviorProfiler(sample_interval=0.0)
 
         self._state_lock = threading.Lock()

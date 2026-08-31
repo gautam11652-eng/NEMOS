@@ -89,6 +89,15 @@ class MainLifecycleTests(unittest.TestCase):
 
         fake_analysis = types.ModuleType("nemos.analysis")
         fake_analysis.AnalysisEngine = Analysis
+
+        class AnalystStub:
+            available = False
+            def __init__(self, config=None): pass
+            def status(self): return {"available": False}
+
+        fake_analyst = types.ModuleType("nemos.analyst")
+        fake_analyst.Analyst = AnalystStub
+        fake_analyst.AnalystConfig = types.SimpleNamespace(from_env=lambda: None)
         fake_storage = types.ModuleType("nemos.storage")
         fake_storage.BatchWriter = Writer
         fake_waitress = types.ModuleType("waitress")
@@ -99,7 +108,7 @@ class MainLifecycleTests(unittest.TestCase):
             "nemos.config": fake_config, "nemos.database": fake_database,
             "nemos.detector": fake_detector, "nemos.models": fake_models,
             "nemos.storage": fake_storage, "waitress": fake_waitress,
-            "nemos.analysis": fake_analysis,
+            "nemos.analysis": fake_analysis, "nemos.analyst": fake_analyst,
         }
         with patch.dict(sys.modules, modules):
             main_mod = importlib.reload(importlib.import_module("main"))

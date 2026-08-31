@@ -206,3 +206,47 @@ class SerializationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EvictionPerformanceTests(unittest.TestCase):
+    """Eviction must be O(1), not a linear scan for the oldest entry.
+
+    A spoofing flood creates a new flow key per packet. If eviction scanned the
+    table to find the oldest, the bound that exists to survive that flood would
+    itself become the bottleneck -- quadratic work exactly when under attack.
+    """
+
+    def test_sustained_flood_stays_linear(self):
+        import time as _time
+
+        table = FlowTable(max_flows=2000)
+
+        def elapsed(count):
+            start = _time.perf_counter()
+            for i in range(count):
+                table.observe(event(src=f"10.{i // 65536 % 256}.{i // 256 % 256}.{i % 256}",
+                                    dport=(i % 65000) + 1), now=float(i))
+            return _time.perf_counter() - start
+
+        elapsed(4000)                 # fill the table and warm up
+        first = elapsed(20_000)
+        second = elapsed(20_000)      # same work again, table already full
+
+        self.assertLessEqual(len(table), 2000)
+        self.assertGreater(table.evicted, 0)
+        # With O(1) eviction the second batch costs about the same as the first.
+        # With a linear scan it would grow with table size. Allow generous
+        # headroom so ordinary scheduling noise cannot fail this.
+        self.assertLess(second, first * 5,
+                        f"eviction appears superlinear: {first:.3f}s then {second:.3f}s")
+
+    def test_most_recently_seen_flows_survive_eviction(self):
+        table = FlowTable(max_flows=10)
+        for i in range(100):
+            table.observe(event(dport=1000 + i), now=float(i))
+        # Re-observing an old flow should protect it from the next eviction.
+        table.observe(event(dport=1090), now=200.0)
+        for i in range(100, 105):
+            table.observe(event(dport=1000 + i), now=float(i + 200))
+        ports = {f.key.destination_port for f in table.snapshot()}
+        self.assertIn(1090, ports)

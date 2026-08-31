@@ -30,6 +30,7 @@ least-recent activity.
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from math import sqrt
 from typing import Any
@@ -191,7 +192,11 @@ class FlowTable:
         self.max_flows = max(1, int(max_flows))
         self.idle_timeout = max(0.1, float(idle_timeout))
         self.max_duration = max(1.0, float(max_duration))
-        self._flows: dict[FlowKey, Flow] = {}
+        # OrderedDict, not dict: eviction is least-recently-observed, and a
+        # linear scan for the oldest entry would make eviction O(n) per packet
+        # exactly when the table is full -- turning the bound that exists to
+        # survive a spoofing flood into the bottleneck it was meant to prevent.
+        self._flows: OrderedDict[FlowKey, Flow] = OrderedDict()
         self.evicted = 0
         self.observed_packets = 0
 
@@ -222,6 +227,9 @@ class FlowTable:
                 self._evict_oldest()
             flow = Flow(key=key, first_seen=now, last_seen=now)
             self._flows[key] = flow
+        else:
+            # Refresh recency so eviction targets genuinely idle flows.
+            self._flows.move_to_end(key)
         flow.observe(event, now)
         self.observed_packets += 1
         return flow
@@ -234,9 +242,9 @@ class FlowTable:
         return self._flows.get(key.reversed())
 
     def _evict_oldest(self) -> None:
-        oldest = min(self._flows.values(), key=lambda f: f.last_seen, default=None)
-        if oldest is not None:
-            del self._flows[oldest.key]
+        """Drop the least recently observed flow. O(1)."""
+        if self._flows:
+            self._flows.popitem(last=False)
             self.evicted += 1
 
     def expire(self, now: float | None = None, *, force: bool = False) -> list[Flow]:

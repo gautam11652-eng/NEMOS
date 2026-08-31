@@ -16,6 +16,7 @@ from .config import Settings
 from .database import connect
 from .models import TrafficEvent
 from .intelligence import summarize_incident
+from .analyst import collect_evidence
 from .attack import catalog as attack_catalog, enrich_alert
 
 from .version import VERSION
@@ -80,6 +81,15 @@ def _host(value: str) -> bool:
     return isinstance(value, str) and len(value) <= 64 and _valid_ip(value)
 
 
+_INCIDENT_ID_CHARS = set(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
+
+def _valid_incident_id(value: str) -> bool:
+    return bool(value) and len(value) <= 64 and all(ch in _INCIDENT_ID_CHARS for ch in value)
+
+
 def _dashboard_etag(c, limit: int, capture_state: dict[str, Any] | None = None) -> str:
     """Build a stable change token for both telemetry and sensor state.
 
@@ -122,7 +132,8 @@ def _enrich_alert_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [enrich_alert(row) for row in rows]
 
 
-def create_app(settings: Settings, writer, capture=None, notifier=None, analysis=None) -> Flask:
+def create_app(settings: Settings, writer, capture=None, notifier=None, analysis=None,
+               analyst=None) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
     # Flask 3.x trusted-host protection. Keep local aliases usable for the
@@ -351,6 +362,7 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
                 "enabled": False,
                 "reason": "windowed flow analysis is disabled",
             }),
+            analyst=(analyst.status() if analyst is not None else {"available": False}),
         )
 
     @app.get("/api/metrics")
@@ -534,7 +546,7 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
 
     @app.get("/api/incidents/<incident_id>")
     def incident_detail(incident_id: str):
-        if not incident_id or len(incident_id) > 64 or any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for ch in incident_id):
+        if not _valid_incident_id(incident_id):
             return jsonify(ok=False, error="invalid incident id"), 400
         c = connect(settings.db_path)
         try:
@@ -707,6 +719,92 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
             return _analysis_unavailable()
         return jsonify(analysis.baseline_for(host))
 
+    @app.get("/api/analyst")
+    def analyst_status():
+        """Optional AI analyst status. Absence is a normal state, not an error."""
+        if analyst is None:
+            return jsonify({
+                "available": False,
+                "reason": "no LLM provider configured (set NEMOS_LLM_PROVIDER); "
+                          "NEMOS detection is unaffected",
+                "role": "Explains findings NEMOS has already made. It performs no detection.",
+            })
+        return jsonify(analyst.status())
+
+    @app.post("/api/analyst/ask")
+    def analyst_ask():
+        """Ask the optional AI analyst about an incident or host.
+
+        The caller names *what* to explain; it never supplies the evidence.
+        NEMOS assembles the bundle from its own stored findings, so this
+        endpoint cannot be used as a general-purpose LLM proxy, and the model
+        can only ever see facts NEMOS produced.
+        """
+        if analyst is None or not analyst.available:
+            return jsonify(
+                ok=False,
+                error="the AI analyst is not configured",
+                detail="set NEMOS_LLM_PROVIDER and the provider API key to enable it",
+                note="NEMOS detection and alerting do not require it.",
+            ), 503
+
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify(ok=False, error="JSON object required"), 400
+
+        question = str(data.get("question") or "").strip()
+        if not question:
+            return jsonify(ok=False, error="question required"), 400
+        if len(question) > 500:
+            return jsonify(ok=False, error="question too long"), 400
+
+        incident_id = str(data.get("incident_id") or "").strip()
+        host = str(data.get("host") or "").strip()
+        if not incident_id and not host:
+            return jsonify(ok=False, error="incident_id or host required"), 400
+
+        c = connect(settings.db_path)
+        try:
+            if incident_id:
+                if not _valid_incident_id(incident_id):
+                    return jsonify(ok=False, error="invalid incident id"), 400
+                rows = _enrich_alert_rows([dict(row) for row in c.execute(
+                    """SELECT id,timestamp,threat,category,source,severity,risk_score,
+                              confidence,reason,technique,incident_id,evidence
+                       FROM alerts WHERE incident_id=? ORDER BY id ASC LIMIT 50""",
+                    (incident_id,),
+                )])
+                if not rows:
+                    return jsonify(ok=False, error="incident not found"), 404
+                summary = summarize_incident(incident_id, rows)
+                bundle = collect_evidence(incident=summary.as_dict(), alerts=rows)
+            else:
+                if not _host(host):
+                    return jsonify(ok=False, error="invalid host"), 400
+                rows = _enrich_alert_rows([dict(row) for row in c.execute(
+                    """SELECT id,timestamp,threat,category,source,severity,risk_score,
+                              confidence,reason,technique,incident_id,evidence
+                       FROM alerts WHERE source=? ORDER BY id DESC LIMIT 50""",
+                    (host,),
+                )])
+                flows = [dict(row) for row in c.execute(
+                    """SELECT first_timestamp,last_timestamp,source,destination,
+                              source_port,destination_port,protocol,packets,bytes,duration
+                       FROM flows WHERE source=? ORDER BY id DESC LIMIT 40""",
+                    (host,),
+                )]
+                if not rows and not flows:
+                    return jsonify(ok=False, error="host not found"), 404
+                bundle = collect_evidence(
+                    alerts=rows, flows=flows,
+                    baseline=(analysis.baseline_for(host) if analysis is not None else None),
+                )
+        finally:
+            c.close()
+
+        result = analyst.explain(question, bundle)
+        return (jsonify(result), 200 if result.get("ok") else 502)
+
     @app.get("/api/notifications")
     def notification_status():
         """Report alert-delivery configuration and health without secrets."""
@@ -808,7 +906,18 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
         except (TypeError, ValueError):
             return jsonify(ok=False, error="invalid packet fields"), 400
 
-        return (jsonify(ok=True), 202) if writer.submit_traffic(event) else (
+        accepted = writer.submit_traffic(event)
+        if analysis is not None:
+            # Feed the same windowed flow pipeline live capture uses, so
+            # synthetic traffic exercises flow aggregation, feature extraction
+            # and ML scoring rather than only reaching storage.
+            #
+            # The deterministic detector is deliberately NOT called here: it
+            # holds unsynchronised per-source state and is owned by the single
+            # capture thread, whereas this runs on any of the WSGI worker
+            # threads. analysis.observe() takes a lock and is safe to share.
+            analysis.observe(event)
+        return (jsonify(ok=True), 202) if accepted else (
             jsonify(ok=False, error="write queue full"),
             503,
         )

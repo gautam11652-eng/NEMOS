@@ -74,31 +74,61 @@ class ClassificationTests(unittest.TestCase):
 
 
 class TailScoreTests(unittest.TestCase):
-    """The score mapping is pure arithmetic and testable without a model."""
+    """The score mapping is pure arithmetic and testable without a model.
+
+    Anchors are q50 and q05, so one deviation unit is (q50 - q05). With the
+    0..100 ramp below, q50 = 50, q05 = 5 and one unit = 45.
+    """
 
     quantiles = [float(q) for q in range(101)]  # ascending 0..100
+    UNIT = 45.0
 
     def score(self, raw):
         return AnomalyEngine._tail_score(raw, self.quantiles)
+
+    def at(self, deviation):
+        """The raw value sitting `deviation` robust units below the median."""
+        return self.score(50.0 - deviation * self.UNIT)
 
     def test_at_or_above_median_is_zero(self):
         self.assertEqual(self.score(50.0), 0)
         self.assertEqual(self.score(90.0), 0)
 
+    def test_within_one_unit_is_zero(self):
+        # The 5th percentile of training is unremarkable by construction.
+        self.assertEqual(self.at(0.5), 0)
+        self.assertEqual(self.at(1.0), 0)
+
     def test_bulk_of_training_scores_below_the_normal_band(self):
         # A plain percentile rank would put the median at 50; this must not.
         self.assertLess(self.score(50.0), BAND_NORMAL)
-        self.assertLess(self.score(20.0), BAND_NORMAL)
+        self.assertLess(self.at(1.7), BAND_NORMAL)  # measured normal worst case
 
-    def test_fifth_percentile_reaches_the_suspicious_band(self):
-        self.assertGreaterEqual(self.score(5.0), BAND_NORMAL)
+    def test_two_units_reaches_the_suspicious_band(self):
+        self.assertGreaterEqual(self.at(2.0), BAND_NORMAL)
+        self.assertLess(self.at(2.0), BAND_SUSPICIOUS)
 
-    def test_below_training_minimum_reaches_anomalous(self):
-        self.assertGreaterEqual(self.score(-1.0), BAND_SUSPICIOUS)
+    def test_measured_attack_separation_reaches_anomalous(self):
+        """Every synthetic attack scenario measured 2.58 units or deeper."""
+        for deviation in (2.58, 2.85, 3.26):
+            self.assertGreaterEqual(self.at(deviation), BAND_SUSPICIOUS, deviation)
+
+    def test_a_single_training_outlier_cannot_set_the_scale(self):
+        """The old mapping anchored on the minimum; one outlier rescaled everything.
+
+        Pushing the training minimum far out must not change how a window two
+        deviation units below the median is graded.
+        """
+        stretched = list(self.quantiles)
+        stretched[0] = -10_000.0
+        self.assertEqual(
+            AnomalyEngine._tail_score(50.0 - 2.6 * self.UNIT, stretched),
+            AnomalyEngine._tail_score(50.0 - 2.6 * self.UNIT, self.quantiles),
+        )
 
     def test_score_is_monotonic_and_bounded(self):
         previous = -1
-        for raw in range(120, -60, -5):
+        for raw in range(120, -400, -5):
             score = self.score(float(raw))
             self.assertGreaterEqual(score, previous)
             self.assertTrue(0 <= score <= 100)
@@ -109,8 +139,8 @@ class TailScoreTests(unittest.TestCase):
 
     def test_degenerate_calibration_does_not_divide_by_zero(self):
         flat = [7.0] * 101
-        self.assertTrue(0 <= AnomalyEngine._tail_score(7.0, flat) <= 100)
-        self.assertTrue(0 <= AnomalyEngine._tail_score(1.0, flat) <= 100)
+        self.assertEqual(AnomalyEngine._tail_score(7.0, flat), 0)
+        self.assertEqual(AnomalyEngine._tail_score(1.0, flat), 0)
 
 
 class UnavailableEngineTests(unittest.TestCase):
@@ -341,3 +371,56 @@ class GracefulDegradationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_sklearn
+class WindowContractTests(unittest.TestCase):
+    """The aggregation window is part of the feature contract.
+
+    Counts and rates scale with the window, so a model fitted on 10s windows
+    describes a different distribution from one applied to 2s windows. Scoring
+    across that mismatch produces confident numbers about a distribution the
+    model never saw.
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.dir = Path(self.td.name)
+
+    def _corpus(self, window, n=80):
+        return [
+            FeatureVector(f"192.0.2.{i}", window, normal_vector(f"192.0.2.{i}", seed=i).values)
+            for i in range(n)
+        ]
+
+    def test_training_records_the_window(self):
+        AnomalyEngine(self.dir).train(self._corpus(10.0))
+        metadata = json.loads((self.dir / "anomaly_model.json").read_text())
+        self.assertEqual(metadata["window_seconds"], 10.0)
+
+    def test_mixed_training_windows_are_refused(self):
+        mixed = self._corpus(10.0, 60) + self._corpus(2.0, 60)
+        with self.assertRaises(ValueError) as ctx:
+            AnomalyEngine(self.dir).train(mixed)
+        self.assertIn("window", str(ctx.exception))
+
+    def test_matching_window_loads(self):
+        AnomalyEngine(self.dir).train(self._corpus(10.0))
+        self.assertTrue(AnomalyEngine(self.dir, window_seconds=10.0).load())
+
+    def test_mismatched_window_is_refused_with_an_actionable_message(self):
+        AnomalyEngine(self.dir).train(self._corpus(10.0))
+        engine = AnomalyEngine(self.dir, window_seconds=2.0)
+        self.assertFalse(engine.load())
+        reason = engine.status()["reason"]
+        self.assertIn("10.0s windows", reason)
+        self.assertIn("2.0s windows", reason)
+        # The message must tell the operator how to fix it, both ways.
+        self.assertIn("NEMOS_ANALYSIS_WINDOW", reason)
+        self.assertIn("--window", reason)
+
+    def test_unspecified_window_skips_the_check(self):
+        """A tool inspecting a model need not commit to a runtime window."""
+        AnomalyEngine(self.dir).train(self._corpus(10.0))
+        self.assertTrue(AnomalyEngine(self.dir).load())

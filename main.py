@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 
 from nemos.analysis import AnalysisEngine
+from nemos.analyst import Analyst, AnalystConfig
 from nemos.api import create_app
 from nemos.capture import PacketCapture
 from nemos.config import load_settings
@@ -89,6 +90,13 @@ def main() -> int:
     else:
         log.info("windowed flow analysis disabled")
 
+    # Optional LLM explanation layer. It performs no detection; when it is not
+    # configured every other layer behaves identically.
+    analyst = Analyst(AnalystConfig.from_env())
+    if analyst.available:
+        log.info("AI analyst enabled: provider=%s model=%s",
+                 analyst.config.provider, analyst.config.model)
+
     def event(event: TrafficEvent, packet_type: str) -> None:
         writer.submit_traffic(event)
         if analysis is not None:
@@ -148,7 +156,7 @@ def main() -> int:
         else:
             log.info("capture disabled")
 
-        app = create_app(settings, writer, capture, notifier, analysis)
+        app = create_app(settings, writer, capture, notifier, analysis, analyst)
 
         try:
             from waitress import create_server
