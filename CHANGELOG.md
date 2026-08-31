@@ -1,5 +1,73 @@
 # Changelog
 
+## 4.1.0
+
+Detection coverage, a rebuilt interface, and two defects found by testing the
+running system rather than the unit suite.
+
+### Added
+
+- **Seventeen new detections**, all derived from metadata NEMOS already
+  captures. Beaconing (periodicity by coefficient of variation of contact
+  intervals), lateral movement, credential brute force and password spraying,
+  data exfiltration, stealth TCP flag scans, DNS and ICMP tunneling, endpoint
+  denial of service, reflection amplification, ingress tool transfer,
+  crypto-mining and Tor port heuristics, and non-standard port traffic.
+  Detection rules: 10 -> 27.
+- **ATT&CK coverage 5 -> 26 techniques**, spanning seven tactics where it
+  previously spanned two. Coverage was expanded by adding detections, never by
+  adding catalog entries: a test asserts the catalog contains no technique the
+  detector cannot emit.
+- **Exfiltration over an established C2 channel** (T1041) is distinguished from
+  generic exfiltration (T1048) by correlation — bulk transfer to a host the
+  same source was already beaconing to.
+- **Rebuilt dashboard**: six routed views, an intrusion-progression view
+  placing findings on the ATT&CK tactic they evidence, an evidence drawer, a
+  beacon periodicity plot, filtering and pagination throughout, a command
+  palette, and light/dark themes.
+- **`tools/benchmark.py`**, a reproducible capture-path benchmark. Every
+  performance number in the documentation now comes from it.
+
+### Fixed
+
+- **The dashboard could never authenticate.** The API reads `X-NEMOS-Token`;
+  the rewritten script sent `Authorization: Bearer`. Against a token-protected
+  sensor every request returned 401 and saving a token changed nothing. The
+  dashboard now sends the documented header, and the API additionally accepts
+  a standard bearer token because that is what scripts reach for by default.
+- **Detection scanned the window once per rule.** Cost per packet was rules
+  times window size: 130 -> 853 us/packet as rules were added. Detection runs
+  inline on the capture thread, so this was dropped traffic. Every windowed
+  statistic is now derived in one traversal; address parsing and TCP flag
+  classification are memoised with bounded caches. 853 -> 256 us/packet on the
+  same workload.
+- `[hidden]` was overridden by component display rules, so every dashboard
+  view, the drawer and the palette painted simultaneously.
+- The favicon was a `data:` URI, which the page's own Content-Security-Policy
+  refused; it is now a served file, which also fixes a 404 on every load.
+- The dashboard fetched `/api/attack`, which is not a route.
+- Port scanning from an external source is now reported as Reconnaissance
+  (T1595) rather than Discovery (T1046); host sweeps as Remote System Discovery
+  (T1018) rather than Network Service Discovery.
+
+### Changed
+
+- **Corrected a published performance claim.** 4.0.0 reported 189,356
+  packets/sec. That figure was measured on a benchmark whose event windows
+  stayed nearly empty and did not represent a busy network; it should not have
+  been published as a single headline number. Measured range is now 5,059
+  packets/sec (50 sources, windows full) to 38,319 (5,000 sources), and the
+  README documents why the slowest figure is the one to plan against.
+- Per-packet cost remains linear in window size. This predates 4.1.0 and is
+  documented as a known limitation rather than left implicit.
+
+### Known limitations
+
+- Real Telegram delivery is still **not tested**. No credentials are present in
+  the development environment; nothing has been sent.
+- Live packet capture is still **not exercised**; no interface is available in
+  the development environment.
+
 ## 4.0.0
 
 Major release: NEMOS gains a genuine machine-learning detection layer alongside
@@ -66,7 +134,10 @@ authoritative layer.
   so the bound that exists to survive a spoofing flood became the bottleneck
   exactly when full. Now an `OrderedDict` with O(1) LRU, matching the detector
   and profiler. A 200,000-packet benchmark did not finish before this fix; it
-  now sustains 189,000 packets/sec. A test pins the complexity.
+  now sustains a high ingest rate. A test pins the complexity.
+  (Correction, 4.1.0: the figure originally published here was measured on a
+  benchmark that kept event windows nearly empty and did not represent a busy
+  network. See tools/benchmark.py and the Performance section of the README.)
 - **The anomaly score anchored on the training minimum**, a single sample, so
   one unusual training window set the whole scale. Measured here the minimum was
   -0.255 against a 5th percentile of -0.030, stretching the band until a
@@ -103,8 +174,7 @@ authoritative layer.
 
 ### Testing
 
-278 -> 338 tests. Measured on this machine: 189,356 packets/sec capture-path
-ingest (5.28 us/packet), feature extraction 52.76 ms for 20,000 flows into 50
+278 -> 338 tests. Measured on this machine: feature extraction 52.76 ms for 20,000 flows into 50
 source vectors, batched inference 15.08 ms for 50 vectors (0.302 ms per
 source-window).
 

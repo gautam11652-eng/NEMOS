@@ -79,7 +79,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 338 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 438 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -114,8 +114,10 @@ Four rules govern this design:
 1. **The capture path stays cheap.** Per packet it does one dictionary
    operation under a short lock. Window expiry, feature extraction, batched
    inference and fusion all run on the analysis thread, so inference latency can
-   never reach packet capture. Measured: 189,000 packets/sec ingest, 0.3 ms of
-   inference per source-window.
+   never reach packet capture. Measured on the capture path: 5,000–38,000
+   packets/sec depending on window occupancy, and 0.3 ms of inference per
+   source-window off it. See [Performance](#performance) — the range matters
+   more than the peak.
 2. **Storage precedes delivery.** An alert is queued for persistence before it
    is queued for notification, so an unreachable Telegram API can never cost a
    recorded detection.
@@ -204,6 +206,7 @@ never overridden by a stale file. Copy `.env.example` to `.env` to begin.
 | `NEMOS_ANALYSIS` | `true` | Enable windowed flow analysis and ML scoring |
 | `NEMOS_ANALYSIS_WINDOW` | `10.0` | Aggregation window in seconds — **must match the model's training window** |
 | `NEMOS_MAX_FLOWS` | `20000` | Bound on the in-memory flow table |
+| `NEMOS_MAX_EVENTS` | `1000` | Events retained per source for the rules. Detection cost per packet is linear in this — see [Performance](#performance) |
 | `NEMOS_PERSIST_FLOWS` | `true` | Store aggregated flows in SQLite |
 | `NEMOS_MODEL_DIR` | `data/model` | Where the trained model is loaded from |
 
@@ -279,10 +282,37 @@ model, the API and the interface. They answer different questions:
 
 ### Deterministic rules
 
-Bounded, stateful counters over a sliding window produce findings such as
-`PORT_SCAN`, `TCP_SYN_SCAN`, `UDP_PORT_SCAN`, `ICMP_SWEEP`, `SYN_FLOOD_PATTERN`,
-`DNS_BURST` and `ARP_MAPPING_CHANGE`. Each finding carries the evidence that
-triggered it — the ports observed, the SYN ratio, the destination count.
+Bounded, stateful counters over a sliding window produce 27 findings. Each
+carries the evidence that triggered it — the ports observed, the SYN ratio, the
+destination count — and every finding whose evidence cannot support a stronger
+claim says so in its own evidence.
+
+| Stage | Findings |
+| --- | --- |
+| Reconnaissance | `PORT_SCAN` (external source), `TCP_SYN_SCAN`, `UDP_PORT_SCAN`, `TCP_NULL_SCAN`, `TCP_FIN_SCAN`, `TCP_XMAS_SCAN` |
+| Discovery | `PORT_SCAN` (internal source), `NETWORK_FANOUT`, `ICMP_SWEEP`, `SERVICE_CONNECTION_BURST` |
+| Credential access | `CREDENTIAL_BRUTE_FORCE`, `PASSWORD_SPRAYING`, `ARP_MAPPING_CHANGE` |
+| Lateral movement | `LATERAL_MOVEMENT` (names RDP, SMB, SSH, VNC or WinRM from the observed port) |
+| Command and control | `C2_BEACONING`, `DNS_TUNNELING_PATTERN`, `ICMP_TUNNELING_PATTERN`, `TOR_CONNECTION_PATTERN`, `NON_STANDARD_PORT_TRAFFIC`, `INGRESS_TOOL_TRANSFER`, `DNS_BURST` |
+| Exfiltration | `DATA_EXFILTRATION_VOLUME`, `DATA_EXFILTRATION_OVER_C2` |
+| Impact | `SYN_FLOOD_PATTERN`, `ICMP_FLOOD_PATTERN`, `SERVICE_DENIAL_OF_SERVICE`, `REFLECTION_AMPLIFICATION`, `CRYPTO_MINING_PATTERN` |
+
+Three of these are worth singling out:
+
+- **`C2_BEACONING`** measures the coefficient of variation of the intervals
+  between contacts with one destination. Periodicity is where a unidirectional
+  tap is strongest: the callback is visible without ever seeing a reply. Known
+  periodic services (NTP, DNS, DHCP) are excluded, because flagging them would
+  bury real callbacks in benign noise.
+- **`DATA_EXFILTRATION_OVER_C2`** is not a separate signal but a correlation:
+  bulk transfer to a host the same source was *already* beaconing to. Two
+  findings combining into a stronger claim than either supports alone.
+- **`PASSWORD_SPRAYING`** exists because `CREDENTIAL_BRUTE_FORCE` counts per
+  target and therefore cannot see it — few attempts each, across many hosts, is
+  precisely the shape that evades per-account lockout.
+
+Port-based identifications (mining, Tor, non-standard ports) are heuristics and
+are labelled as such in their own evidence, with confidence set accordingly.
 
 ### Statistical baseline
 
@@ -647,7 +677,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 338 tests
+python -m pytest -q                              # 438 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
@@ -700,6 +730,42 @@ python main.py
 
 NEMOS refuses to start on a wildcard bind without both. Put HTTPS and a reverse
 proxy in front of any deployment outside a trusted local network.
+
+## Performance
+
+Every number here comes from `tools/benchmark.py`, which ships in the
+repository so you can check it on your own hardware rather than trusting it:
+
+```bash
+python tools/benchmark.py
+```
+
+Measured on Python 3.11, 12,000 packets per profile:
+
+| Profile | Distinct sources | Packets/sec | µs/packet |
+| --- | ---: | ---: | ---: |
+| Small LAN | 50 | 5,059 | 197.7 |
+| Office | 500 | 29,147 | 34.3 |
+| Large segment | 5,000 | 38,319 | 26.1 |
+| Spoofing flood | 50,000 | 31,654 | 31.6 |
+
+**Read the slowest row, not the fastest.** Detection cost is driven by how many
+events sit in a source's window, not by the packet rate. A few busy hosts fill
+their windows to `max_events` and cost the most per packet; a spoofing flood
+spreads packets across thousands of short-lived windows and costs less each.
+Quoting the peak would overstate what the sensor does on exactly the small,
+busy network most people deploy it on.
+
+**Known limitation.** Per-packet cost is linear in window size. Every rule
+reads from one aggregate rather than scanning the window itself, but that
+aggregate is still built by a single pass per packet. Removing the linearity
+requires incremental counters maintained on append and eviction, which NEMOS
+does not do today. If your link exceeds these rates, lower `NEMOS_MAX_EVENTS`
+or run capture on a mirrored subset.
+
+Bounded state is verified by the same script: under 60,000 packets from
+spoofed sources, every map keyed by an attacker-controlled value stays inside
+its configured bound.
 
 ## Limitations
 

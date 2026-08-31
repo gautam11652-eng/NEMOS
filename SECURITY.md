@@ -8,8 +8,8 @@ public issues.
 
 | Version | Supported |
 | --- | --- |
-| 4.0.x | Yes |
-| < 4.0 | No — please upgrade |
+| 4.1.x | Yes |
+| < 4.1 | No — please upgrade |
 
 Fixes are applied to the latest release. There is no long-term support branch.
 

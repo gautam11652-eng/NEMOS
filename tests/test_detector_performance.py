@@ -100,3 +100,27 @@ class MemoisationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MaxEventsTests(unittest.TestCase):
+    """NEMOS_MAX_EVENTS is the documented dial for capture-path throughput."""
+
+    def test_env_var_is_honoured(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"NEMOS_MAX_EVENTS": "400"}):
+            self.assertEqual(DetectionConfig.from_env().max_events, 400)
+
+    def test_floor_keeps_every_rule_reachable(self):
+        """A window smaller than the largest threshold would disable that rule."""
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"NEMOS_MAX_EVENTS": "1"}):
+            cfg = DetectionConfig.from_env()
+        self.assertGreaterEqual(cfg.max_events, cfg.syn_flood)
+
+    def test_smaller_window_reduces_work(self):
+        detector_small = ThreatDetector(DetectionConfig(max_events=200))
+        self.assertEqual(detector_small.cfg.max_events, 200)
+        bucket = detector_small._bucket("10.0.0.5")
+        self.assertEqual(bucket.maxlen, 200)

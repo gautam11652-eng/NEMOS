@@ -80,10 +80,29 @@ different things: only deterministic rules can name a MITRE ATT&CK technique.
 
 ### Deterministic rules
 
-`detector.py` maintains a bounded deque of recent events per source. Within a
-sliding window it derives unique destination ports, unique destinations, SYN-only
-TCP packets, UDP ports, ICMP destinations and service-port hits, then applies
-explicit thresholds. Each finding carries the evidence that produced it.
+`detector.py` maintains a bounded deque of recent events per source and applies
+27 rules to it, spanning reconnaissance, discovery, credential access, lateral
+movement, command and control, exfiltration and impact. Each finding carries the
+evidence that produced it.
+
+**One traversal, many rules.** Every windowed statistic — port and destination
+sets, per-service counters, byte volumes, flag classifications — is derived by a
+single pass in `_aggregate()`, and the rules read from that result. This is not
+a micro-optimisation. When each rule scanned the window itself, per-packet cost
+was the rule count times the window size, measured at 853 µs/packet against 130
+before the rule set grew. Detection runs inline on the capture thread, so that
+cost is dropped traffic rather than a slow dashboard. A test asserts the window
+is traversed at most once per packet, structurally rather than by timing, so it
+cannot flake on a loaded runner.
+
+Per-packet cost remains linear in window size. Removing that needs incremental
+counters maintained on append and eviction; NEMOS does not do this today, and
+`tools/benchmark.py` reports the resulting range rather than a single figure.
+
+Beaconing is the exception to the window: periodicity cannot be seen inside 10
+seconds, so contact times are held per `(source, destination, port)` on a longer
+horizon, in a map bounded and LRU-evicted like every other attacker-keyed
+structure.
 
 A per-`(source, threat)` cooldown suppresses duplicate findings, and that
 cooldown map is itself bounded.
@@ -122,8 +141,11 @@ computation is deliberately arithmetic and readable rather than opaque.
 
 ### ATT&CK mapping
 
-`attack.py` holds a small catalog of only those techniques the detector actually
-emits. Mapping is evidence-backed: a generic behavioural anomaly is reported as
+`attack.py` holds a catalog of 26 techniques across seven tactics — only those
+the detector actually emits, plus any it emitted in an earlier release so stored
+alerts keep their names. A test asserts the catalog contains nothing
+unreachable, because a catalog listing techniques NEMOS cannot evidence would
+overstate its coverage. Mapping is evidence-backed: a generic behavioural anomaly is reported as
 an unmapped signal with a stated reason rather than being assigned a technique
 the observation does not support. Technique IDs are stored on alerts; names and
 tactics live in the catalog so presentation metadata can be corrected without

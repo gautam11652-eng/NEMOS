@@ -81,6 +81,12 @@ class DetectionConfig:
             return max(lo, min(hi, value)) if isfinite(value) else default
 
         return cls(
+            # Per-packet detection cost is linear in how many events a window
+            # holds, so this is the dial for trading detection depth against
+            # capture-path throughput. The floor stays above the largest rule
+            # threshold (syn_flood at 150) so lowering it cannot silently
+            # disable a rule by starving it of evidence.
+            max_events=integer("NEMOS_MAX_EVENTS", defaults.max_events, 200, 100_000),
             baseline_alpha=real("NEMOS_BEHAVIOR_ALPHA", defaults.baseline_alpha, 0.01, 1.0),
             baseline_min_samples=integer("NEMOS_BEHAVIOR_MIN_SAMPLES", defaults.baseline_min_samples, 2, 1000),
             baseline_sigma_threshold=real("NEMOS_BEHAVIOR_SIGMA", defaults.baseline_sigma_threshold, 1.0, 10.0),

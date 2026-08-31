@@ -66,5 +66,6 @@ ignore = [
 # tests and the demo. Reproducibility is the requirement; this is never used for
 # anything security-sensitive.
 "tools/scenarios.py" = ["S311"]
+"tools/benchmark.py" = ["S311"]
 "nemos/config.py" = ["S104"]
 "nemos/api.py" = ["S104", "S608"]
