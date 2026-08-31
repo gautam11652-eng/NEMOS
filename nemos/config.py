@@ -35,6 +35,8 @@ class Settings:
     dashboard_limit: int
     log_level: str
     trusted_hosts: tuple[str, ...] = ()
+    api_rate_limit: int = 240
+    api_auth_rate_limit: int = 10
     # Windowed flow analysis and ML anomaly detection.
     analysis_enabled: bool = True
     analysis_window: float = 10.0
@@ -69,6 +71,12 @@ def load_settings(base: Path | None = None) -> Settings:
         _int("NEMOS_DASHBOARD_LIMIT",100,10,500),
         os.getenv("NEMOS_LOG_LEVEL","INFO").upper(),
         trusted_hosts,
+        # Generous by default: the dashboard polls four endpoints every five
+        # seconds, roughly 48 requests a minute, so the limit must not fight
+        # normal use. The auth limit is the security-relevant one and is far
+        # tighter, because nothing legitimate retries a rejected token.
+        _int("NEMOS_API_RATE", 240, 10, 100_000),
+        _int("NEMOS_API_AUTH_RATE", 10, 1, 10_000),
         _bool("NEMOS_ANALYSIS", True),
         _float("NEMOS_ANALYSIS_WINDOW", 10.0, 1.0, 300.0),
         _int("NEMOS_MAX_FLOWS", 20_000, 100, 1_000_000),

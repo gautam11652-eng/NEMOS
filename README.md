@@ -79,7 +79,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 456 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 472 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -186,6 +186,8 @@ never overridden by a stale file. Copy `.env.example` to `.env` to begin.
 | `NEMOS_CAPTURE` | `true` | Enable packet capture |
 | `NEMOS_DB` | `data/nemos.db` | SQLite path |
 | `NEMOS_API_TOKEN` | *(none)* | Required for any non-loopback bind |
+| `NEMOS_API_RATE` | `240` | Requests per client per minute. Must stay above the dashboard's polling (~48/min) |
+| `NEMOS_API_AUTH_RATE` | `10` | Rejected credentials per client per minute before 429 |
 | `NEMOS_TRUSTED_HOSTS` | *(none)* | Required for wildcard binds |
 | `NEMOS_LOG_LEVEL` | `INFO` | Logging level |
 
@@ -693,7 +695,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 456 tests
+python -m pytest -q                              # 472 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
@@ -826,6 +828,24 @@ NEMOS is a monitoring tool, not a guarantee of security. Thresholds are
 conservative and should be tuned to the monitored environment. False positives
 are possible and expected. Keep the host OS, Python runtime and dependencies
 patched, and do not expose the application directly to untrusted networks.
+
+### Request limiting
+
+The API applies two independent per-client limits, because the two risks are
+different sizes. A general limit (`NEMOS_API_RATE`, 240/min) bounds resource
+use; a much tighter one (`NEMOS_API_AUTH_RATE`, 10/min) bounds *rejected*
+credentials, since nothing legitimate retries a wrong token. Exceeding either
+returns `429` with a `Retry-After` header. `/api/health` is never limited, so a
+liveness probe cannot exhaust a client's budget.
+
+Clients are identified by peer address. **`X-Forwarded-For` is deliberately
+ignored** — it is attacker-controlled, and honouring it by default would let a
+single client mint unlimited identities and bypass the limit entirely. If NEMOS
+runs behind a reverse proxy, apply rate limiting at the proxy, where the real
+client address is known.
+
+State is per-process and resets on restart. That is appropriate for a single
+sensor; it is not a distributed limiter.
 
 Only monitor networks you own or are explicitly authorized to monitor.
 

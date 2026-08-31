@@ -236,6 +236,16 @@ interface needs into one request, guarded by an ETag derived from the telemetry
 revision plus capture state, so a sensor failure invalidates the cache even when
 stored telemetry has not changed.
 
+Two per-client request limits sit in `before_request`, split because the risks
+differ in magnitude. The general bucket bounds resource use and must stay clear
+of the dashboard's own polling, so it is far too loose to slow a credential
+search; a second, much tighter bucket counts only *rejected* credentials and is
+incremented before the 401 is returned, so each guess costs the guesser. Both
+are keyed on peer address rather than `X-Forwarded-For` — that header is
+attacker-controlled, and trusting it would make the limit trivially bypassable
+— and both client tables are bounded with LRU eviction, like every other map in
+NEMOS keyed by a value an attacker influences.
+
 Defaults are loopback-only. A non-loopback bind requires an API token; a
 wildcard bind additionally requires an explicit trusted-host list. Mutating
 endpoints reject cross-site browser writes even when no token is configured.

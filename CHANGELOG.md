@@ -27,6 +27,18 @@ running system rather than the unit suite.
   palette, and light/dark themes.
 - **`tools/benchmark.py`**, a reproducible capture-path benchmark. Every
   performance number in the documentation now comes from it.
+- **API request limiting.** Two independent per-client buckets: a general limit
+  (`NEMOS_API_RATE`, 240/min) bounding resource use, and a much tighter one
+  (`NEMOS_API_AUTH_RATE`, 10/min) bounding rejected credentials, incremented
+  before the 401 so each guess at `NEMOS_API_TOKEN` costs the guesser. A single
+  shared limit could not do both: anything loose enough for the dashboard's
+  polling is far too loose to slow a token search. Exceeding either returns 429
+  with `Retry-After`; `/api/health` is never limited so a liveness probe cannot
+  exhaust a client's budget. Clients are keyed on peer address and never on
+  `X-Forwarded-For`, which is attacker-controlled and would otherwise let one
+  client mint unlimited identities. Both client tables are bounded with LRU
+  eviction. Limits are clamped so a misconfigured low value cannot lock an
+  operator out of their own sensor.
 
 ### Fixed
 

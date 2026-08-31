@@ -47,7 +47,9 @@ the traffic pattern instead — those reports are genuinely useful.
 - Keep the dashboard on loopback unless remote access is deliberately
   configured.
 - If remote access is enabled, set `NEMOS_API_TOKEN` and put HTTPS and a reverse
-  proxy in front of it.
+  proxy in front of it. The built-in request limits reduce the value of guessing
+  that token but do not replace network controls, and they are per-process:
+  behind a proxy, limit at the proxy, where the real client address is known.
 - For wildcard binds (`0.0.0.0`, `::`, `*`), also set `NEMOS_TRUSTED_HOSTS` to
   the exact hostnames or IPs clients will use. NEMOS refuses to start with an
   unbounded wildcard Host policy.

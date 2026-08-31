@@ -7,6 +7,7 @@ import threading
 import ipaddress
 import json
 import time
+from collections import OrderedDict
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -132,6 +133,70 @@ def _enrich_alert_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [enrich_alert(row) for row in rows]
 
 
+class RateLimiter:
+    """Fixed-window request limiting, bounded in the number of clients tracked.
+
+    A fixed window rather than a token bucket: the window boundary allows a
+    brief burst of at most one window's budget, which is harmless here, and the
+    state is a single counter and timestamp per client instead of a float
+    balance that has to be decayed on every read.
+
+    The client map is keyed by peer address, which an attacker on a local
+    segment can vary, so it is bounded and evicted least-recently-used like
+    every other attacker-keyed structure in NEMOS. Eviction under a spoofing
+    flood costs an attacker their own history, never another client's.
+    """
+
+    __slots__ = ("general", "auth_failures", "window", "_general", "_auth", "_max_clients", "_lock")
+
+    def __init__(self, general_per_minute: int = 240, auth_failures_per_minute: int = 10,
+                 window: float = 60.0, max_clients: int = 4096):
+        self.general = max(1, int(general_per_minute))
+        self.auth_failures = max(1, int(auth_failures_per_minute))
+        self.window = float(window)
+        self._general: OrderedDict[str, list[float]] = OrderedDict()
+        self._auth: OrderedDict[str, list[float]] = OrderedDict()
+        self._max_clients = max_clients
+        self._lock = threading.Lock()
+
+    def _hit(self, table: OrderedDict[str, list[float]], key: str,
+             limit: int, now: float) -> tuple[bool, int]:
+        entry = table.get(key)
+        if entry is None or now - entry[0] >= self.window:
+            if entry is None:
+                if len(table) >= self._max_clients:
+                    table.popitem(last=False)
+            else:
+                table.move_to_end(key)
+            table[key] = [now, 1.0]
+            return True, 0
+        table.move_to_end(key)
+        entry[1] += 1
+        if entry[1] > limit:
+            return False, max(1, int(self.window - (now - entry[0])) + 1)
+        return True, 0
+
+    def check(self, key: str) -> tuple[bool, int]:
+        """Count one request. Returns (allowed, retry_after_seconds)."""
+        with self._lock:
+            return self._hit(self._general, key, self.general, time.monotonic())
+
+    def record_auth_failure(self, key: str) -> tuple[bool, int]:
+        """Count one rejected credential. Returns (blocked, retry_after)."""
+        with self._lock:
+            allowed, retry = self._hit(self._auth, key, self.auth_failures, time.monotonic())
+            return (not allowed), retry
+
+    def metrics(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "general_per_minute": self.general,
+                "auth_failures_per_minute": self.auth_failures,
+                "tracked_clients": len(self._general),
+                "clients_with_auth_failures": len(self._auth),
+            }
+
+
 def create_app(settings: Settings, writer, capture=None, notifier=None, analysis=None,
                analyst=None) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
@@ -234,13 +299,57 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
         except ValueError:
             return False
 
+    # ---- Rate limiting -------------------------------------------------
+    # Two buckets per client, because the two risks are different sizes. The
+    # general one bounds resource use; the auth one bounds guesses at the API
+    # token, which is the only credential NEMOS has. A shared limit would have
+    # to be loose enough for the dashboard's polling, which is far too loose to
+    # slow a token search.
+    limiter = RateLimiter(
+        general_per_minute=settings.api_rate_limit,
+        auth_failures_per_minute=settings.api_auth_rate_limit,
+    )
+    app.extensions["nemos_rate_limiter"] = limiter
+
+    def client_key() -> str:
+        """Identify the caller for rate limiting.
+
+        Deliberately the peer address, never X-Forwarded-For: that header is
+        attacker-controlled, so honouring it by default would let one client
+        mint unlimited identities and bypass the limit entirely. Behind a
+        trusted reverse proxy, have the proxy do the limiting.
+        """
+        return request.remote_addr or "unknown"
+
     @app.before_request
     def guard():
-        # Health is intentionally public so service monitors can check liveness.
-        if request.path.startswith("/api/") and request.path != "/api/health" and not auth():
+        # Health is intentionally public so service monitors can check liveness,
+        # and unmetered so a monitor cannot exhaust a client's budget.
+        if not request.path.startswith("/api/") or request.path == "/api/health":
+            return None
+
+        who = client_key()
+        allowed, retry_after = limiter.check(who)
+        if not allowed:
+            response = jsonify(ok=False, error="rate limit exceeded")
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+
+        if not auth():
+            # Count the failure before answering, so a token search is slowed
+            # by the attempt rather than only by the eventual success.
+            blocked, retry_after = limiter.record_auth_failure(who)
+            if blocked:
+                response = jsonify(ok=False, error="too many failed attempts")
+                response.status_code = 429
+                response.headers["Retry-After"] = str(retry_after)
+                return response
             return jsonify(ok=False, error="authentication required"), 401
-        if request.path.startswith("/api/") and not same_origin_state_change():
+
+        if not same_origin_state_change():
             return jsonify(ok=False, error="cross-site request blocked"), 403
+        return None
 
     @app.after_request
     def headers(response):
@@ -374,6 +483,7 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
         return jsonify(
             ok=True, version=VERSION, capture=capture_state,
             writer=writer.metrics(), notifications=_notification_state(),
+            rate_limit=limiter.metrics(),
             analysis=(analysis.status() if analysis is not None else {
                 "enabled": False,
                 "reason": "windowed flow analysis is disabled",
