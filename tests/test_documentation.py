@@ -101,20 +101,30 @@ class PerformanceClaimTests(unittest.TestCase):
 
 
 class HonestyTests(unittest.TestCase):
-    def test_the_unproven_last_hop_stays_declared(self):
-        """Delivery to a real chat needs credentials this project does not have.
+    def test_limitations_are_still_declared(self):
+        """Delivery is now proven end to end, so the declared gap has moved.
 
-        Live capture and the Telegram transport are now genuinely verified, so
-        this no longer pins them as untested -- but the one step that cannot be
-        proven here must never quietly become an unqualified claim of success.
+        What must never happen is the section quietly disappearing: every
+        release states what it has *not* exercised. Capture on a physical
+        interface under load is the remaining one.
         """
         recent = CHANGELOG.split("## 4.0.0")[0]
         self.assertIn("Known limitations", recent)
         self.assertRegex(
             recent,
-            r"valid.{0,40}token has still not been performed|no message has arrived",
-            "the unverified Telegram hop is no longer declared",
+            r"physical interface|sustained production load",
+            "the remaining unexercised path is no longer declared",
         )
+
+    def test_no_credential_is_committed_with_the_verification_claim(self):
+        """Verifying delivery required real credentials; none may be stored."""
+        import re as _re
+        for path in (ROOT / "CHANGELOG.md", ROOT / "README.md", ROOT / ".env.example"):
+            text = path.read_text()
+            self.assertIsNone(
+                _re.search(r"\b\d{8,12}:AA[A-Za-z0-9_-]{30,}", text),
+                f"a Telegram bot token pattern appears in {path.name}",
+            )
 
     def test_verified_claims_name_how_they_were_verified(self):
         """A "verified" claim must say what was run, not merely assert it."""
@@ -122,7 +132,7 @@ class HonestyTests(unittest.TestCase):
         if "### Verified" in recent:
             block = recent.split("### Verified")[1].split("###")[0]
             self.assertIn("test_capture_live.py", block)
-            self.assertRegex(block, r"401|round trip")
+            self.assertRegex(block, r"delivered|confirmed by Telegram")
 
     def test_readme_still_states_what_nemos_is_not(self):
         self.assertIn("What NEMOS is not", README)

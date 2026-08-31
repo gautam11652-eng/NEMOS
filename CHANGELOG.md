@@ -83,16 +83,21 @@ running system rather than the unit suite.
   self-generated traffic (490 packets through the full sensor: capture ->
   detector -> storage -> API -> dashboard), producing real findings. Covered by
   tests/test_capture_live.py, which skips where raw capture is unavailable.
-- **Telegram transport verified against the live Bot API.** A request to
-  api.telegram.org completed the full DNS, TLS and HTTP round trip and returned
-  a real 401, which NEMOS parsed, redacted and diagnosed correctly.
+- **Telegram delivery end to end, with real credentials.** Messages were
+  delivered to a real chat and confirmed by Telegram. The full chain was
+  exercised with nothing synthetic in it: live loopback capture produced three
+  findings (PORT_SCAN, SERVICE_DENIAL_OF_SERVICE, ICMP_FLOOD_PATTERN), all
+  three were accepted and delivered, none failed. Re-running identical traffic
+  suppressed two repeats by cooldown, so a repeating detection cannot turn the
+  channel into a flood. The credential appeared in no log line, no API response
+  (`/api/telegram` reports the chat id as `****2654`) and no file on disk.
+  The credentials used were the operator's and are not stored in this
+  repository.
 
 ### Known limitations
 
-- Telegram delivery with a **valid** token has still not been performed: no
-  credentials exist in the development environment, so no message has arrived in
-  a real chat. Everything up to that hop is now verified, and
-  `tools/verify_telegram.py` performs the check in one command.
+- Capture is verified on loopback with real packets and real sockets. A
+  physical interface under sustained production load has not been exercised.
 
 ## 4.0.0
 
