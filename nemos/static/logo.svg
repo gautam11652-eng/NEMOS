@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" width="40" height="40"
+     role="img" aria-label="NEMOS">
+  <title>NEMOS</title>
+  <defs>
+    <linearGradient id="nemos-tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#132c42"/>
+      <stop offset="1" stop-color="#070d16"/>
+    </linearGradient>
+    <linearGradient id="nemos-stroke" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#1a86c4"/>
+      <stop offset="1" stop-color="#3ec8f4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- A hexagon reads as infrastructure without shouting, and unlike a shield
+       it is not the same mark every other security tool already uses. The mark
+       carries its own ground so it looks identical on a light page. -->
+  <path d="M20 2.2 L35 11 V29 L20 37.8 L5 29 V11 Z"
+        fill="url(#nemos-tile)" stroke="#3ec8f4" stroke-opacity="0.28" stroke-width="1.1"/>
+
+  <!-- The N is left plain on purpose: it is the only element here that still
+       resolves at 16px, which is where a mark spends most of its life. -->
+  <path d="M14 27 V13 L26 27 V13" fill="none" stroke="url(#nemos-stroke)"
+        stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
