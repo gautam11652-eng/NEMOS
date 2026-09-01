@@ -286,7 +286,8 @@ kbd {
   background: var(--surface); border: 1px solid var(--line);
 }
 .kpi-k { font: 600 10px var(--mono); letter-spacing: .09em; text-transform: uppercase; color: var(--text-3); }
-.kpi-v { font: 700 25px/1.15 var(--mono); margin: 7px 0 3px; letter-spacing: -.02em; }
+.kpi-v { font: 700 25px/1.15 var(--mono); margin: 7px 0 3px; letter-spacing: -.02em;
+  overflow-wrap: anywhere; min-width: 0; }
 .kpi-s { font-size: 11px; color: var(--text-3); }
 .kpi.alarm .kpi-v { color: var(--crit); }
 
@@ -365,6 +366,64 @@ kbd {
 }
 
 .score { font: 700 13px var(--mono); color: var(--sev); }
+.nowrap { white-space: nowrap; }
+
+/* Severity has to be legible at a glance, from across a desk. A row of
+   uniformly-styled chips makes an operator read every line to find the one
+   that matters; the accent bar and weight below make CRITICAL findable
+   without reading. */
+.table tbody tr.row { border-left: 3px solid transparent; }
+.table tbody tr.row.sev-crit,
+.table tbody tr.row.sev-high { border-left-color: var(--sev); }
+.table tbody tr.row.sev-crit { background: color-mix(in srgb, var(--crit) 7%, transparent); }
+.table tbody tr.row.sev-crit:hover { background: color-mix(in srgb, var(--crit) 12%, transparent); }
+.table tbody tr.row.sev-crit .score { font-size: 14px; }
+
+/* A finding column must never paint over the risk beside it. `max-width` on a
+   `td` does not constrain an auto-layout table, which is how a multi-technique
+   incident -- the most important row on the page -- came to render on top of
+   its own severity chip. A fixed layout plus a hard clip is the fix. */
+.table-incidents { table-layout: fixed; }
+.table-incidents th:nth-child(1), .table-incidents td:nth-child(1) { width: 30ch; }
+.table-incidents th:nth-child(3), .table-incidents td:nth-child(3) { width: 11ch; }
+.table-incidents th:nth-child(4), .table-incidents td:nth-child(4) { width: 10ch; }
+.table-incidents th:nth-child(5), .table-incidents td:nth-child(5) { width: 14ch; }
+.table-incidents th:nth-child(6), .table-incidents td:nth-child(6) { width: 14ch; }
+/* A fixed layout clips headers as readily as cells, so they get room to sit
+   in rather than an ellipsis where a column name should be. */
+.table-incidents th { white-space: nowrap; }
+.cell-threat {
+  white-space: normal; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
+}
+
+.tag {
+  display: inline-block; margin: 1px 5px 1px 0; padding: 2px 8px;
+  border-radius: 5px; background: var(--surface-2);
+  border: 1px solid var(--line-soft); color: var(--text-2);
+  font-size: 11.5px; max-width: 34ch; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; vertical-align: middle;
+}
+.more {
+  color: var(--text-3); font: 600 11px var(--mono);
+  white-space: nowrap;
+}
+.incident-id { opacity: .55; font-size: 11px; }
+
+/* A campaign collapsed to one line, with the count that makes it a campaign. */
+.count {
+  display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 20px;
+  background: color-mix(in srgb, var(--sev) 16%, transparent);
+  color: var(--sev); font: 600 10.5px var(--mono); white-space: nowrap;
+  vertical-align: middle;
+}
+.caret { margin-left: 8px; color: var(--text-3); font-size: 11px; }
+/* .feed-main is a column flex, so a chip inside it stretches the full row
+   width and reads as a progress bar rather than a count. */
+.feed-main .count { align-self: flex-start; margin: 3px 0 0; }
+.table tbody tr.child > td { background: var(--surface-2); font-size: 12px; }
+.table tbody tr.child > td:first-child { padding-left: 34px; }
+.row.multistage .tag:first-child { border-color: color-mix(in srgb, var(--sev) 45%, transparent); }
 
 .pager {
   display: flex; align-items: center; justify-content: flex-end; gap: 12px;

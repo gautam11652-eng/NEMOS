@@ -129,8 +129,43 @@ running system rather than the unit suite.
   method on the analysis thread and reset on train and load, so a freshly
   trained model cannot report drift against its own training data.
 
+- **The console leads with what matters.** Findings and incidents are ordered
+  by risk rather than arrival, and repeated findings are grouped. Both halves
+  are needed and neither works alone: ordering happens in SQL, because sorting
+  the page a client already holds cannot change which rows are on it, and
+  grouping happens before pagination, because grouping only the visible page
+  still hands the operator a first page made of one repeated campaign. On the
+  demonstration data this turns 68 findings across three pages into 14 groups
+  on one screen, and 48 incident rows into 9. `/api/alerts` and
+  `/api/incidents` keep their documented arrival order and take `sort=risk`;
+  `/api/dashboard` is risk-ordered without asking, since it exists only to
+  feed the console.
+- **Triage metrics replace traffic volume** on the overview: critical open,
+  high open, distinct sources, distinct techniques, capture state and model
+  health. Packet counts describe how busy the wire is, never what to look at
+  next, and they were occupying the most valuable strip of the screen to say
+  it.
+
 ### Fixed
 
+- **A campaign buried every critical finding.** Forty hosts beaconing to one
+  address produced forty separate findings and forty single-alert incidents;
+  listed chronologically they filled the first three pages and pushed a
+  CRITICAL SYN flood out of sight. The behaviour was correct and the
+  presentation made it useless -- a console that buries its worst finding
+  under repetition trains its operator to stop reading it.
+- **A multi-technique incident rendered on top of its own severity.** The
+  threat column was a raw comma-joined list of `SCREAMING_SNAKE` labels with
+  `max-width` set on a `td`, which does not constrain an auto-layout table.
+  It overran into the risk and severity columns, and did so worst on
+  multi-stage incidents -- the rows that matter most. The table now has a
+  fixed layout and truncates with a count.
+- **Threat identifiers were shown raw**, and a sentence helper meant for
+  prose appended a full stop to them, rendering `C2_BEACONING.`. They are now
+  humanised for display with the exact identifier kept on hover, since that
+  is the value that appears in the API, in Telegram and in syslog.
+- **Capture state was printed as a machine token**, so a sensor with capture
+  disabled showed `not_configured` in 25px type overflowing its own card.
 - **Feature drift was silently never assessed.** The engine keeps the
   training mean and spread in their own fields rather than in `_metadata`,
   and `status()` passed `_metadata` alone -- so the monitor had nothing to

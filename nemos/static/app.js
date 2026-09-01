@@ -26,6 +26,7 @@ const state = {
   hostFilter: "",
   hostPage: 0,
   paletteIndex: 0,
+  expanded: new Set(),   // detection groups the operator has opened
 };
 
 const PAGE = 25;
@@ -98,6 +99,26 @@ const sentence = (v) => {
 
 const sevClass = (s) => SEV_CLASS[String(s || "").toUpperCase()] || "sev-low";
 
+/* Threat labels are identifiers -- C2_BEACONING, SYN_FLOOD_PATTERN -- and they
+ * are also the values that appear in the API, in Telegram and in syslog. Show
+ * a readable form, keep the identifier available on hover and in the evidence
+ * drawer so an operator can still grep for exactly what the sensor emitted. */
+const ACRONYMS = new Set(["c2", "dns", "icmp", "tcp", "udp", "syn", "arp", "ndp", "ip"]);
+/* Capture states are machine tokens; the card needs a word, not the token. */
+const CAPTURE_LABEL = {
+  running: "Live", starting: "Starting", stopped: "Stopped", failed: "Failed",
+  permission_denied: "Blocked", unavailable: "Unavailable",
+  not_configured: "Off", error: "Failed",
+};
+const captureLabel = (c) => (c?.running ? "Live"
+  : CAPTURE_LABEL[String(c?.state || "").toLowerCase()] || "Off");
+
+const threatLabel = (v) => String(v ?? "").split("_").filter(Boolean).map((word, i) => {
+  const lower = word.toLowerCase();
+  if (ACRONYMS.has(lower)) return word.toUpperCase();
+  return i === 0 ? lower.charAt(0).toUpperCase() + lower.slice(1) : lower;
+}).join(" ");
+
 function emptyState(mark, title, body) {
   return `<div class="empty"><span class="empty-mark" aria-hidden="true">${mark}</span>
           <b>${esc(title)}</b><p>${body}</p></div>`;
@@ -164,14 +185,86 @@ function renderChain(alerts) {
   }
 }
 
+/* ── Grouping ───────────────────────────────────────────────────────────
+ * Forty hosts beaconing to one address is one campaign, not forty findings.
+ * Listed individually it fills the first three pages and pushes the single
+ * CRITICAL flood out of sight, which is how a console trains its operator to
+ * stop reading it. Identical findings are therefore collapsed into one row
+ * carrying the count and the sources behind it; nothing is discarded, and
+ * expanding a group shows every constituent.
+ */
+function groupKey(a) {
+  // Same detection, same severity, same technique -- the source is what
+  // varies across a campaign, so it is deliberately not part of the key.
+  return `${a.threat} ${a.severity} ${a.technique || ""} ${a.risk_score}`;
+}
+
+function groupFindings(alerts) {
+  const groups = new Map();
+  for (const a of alerts) {
+    const key = groupKey(a);
+    let g = groups.get(key);
+    if (!g) {
+      g = {
+        key, threat: a.threat, severity: a.severity, technique: a.technique,
+        risk_score: a.risk_score, confidence: a.confidence, reason: a.reason,
+        category: a.category, members: [], sources: new Set(),
+        latest: a.timestamp, id: a.id,
+      };
+      groups.set(key, g);
+    }
+    g.members.push(a);
+    g.sources.add(a.source);
+    if (String(a.timestamp) > String(g.latest)) g.latest = a.timestamp;
+  }
+  return [...groups.values()].sort(
+    (x, y) => (Number(y.risk_score) || 0) - (Number(x.risk_score) || 0)
+      || y.members.length - x.members.length,
+  );
+}
+
+const SEV_RANK = { CRITICAL: 3, HIGH: 2, MEDIUM: 1, LOW: 0 };
+
+function byTriage(a, b) {
+  return (SEV_RANK[b.severity] ?? -1) - (SEV_RANK[a.severity] ?? -1)
+    || (Number(b.risk_score ?? b.max_risk) || 0) - (Number(a.risk_score ?? a.max_risk) || 0)
+    || String(b.timestamp ?? b.last_seen ?? "").localeCompare(String(a.timestamp ?? a.last_seen ?? ""));
+}
+
+/* Summarise a set of sources without letting it overrun its column. */
+function sourceSummary(sources) {
+  const list = [...sources];
+  if (list.length === 1) return esc(list[0]);
+  return `${esc(list[0])} <span class="more">+${list.length - 1} more</span>`;
+}
+
 function renderKpis(stats, capture) {
+  // Triage metrics, not traffic volume. Packet counts say how busy the wire
+  // is; they never say what an operator should look at next, and they were
+  // occupying the most valuable strip of the screen to say it.
+  const alerts = state.alerts || [];
+  const open = alerts.filter((a) => !a.acknowledged);
+  const critical = open.filter((a) => a.severity === "CRITICAL");
+  const high = open.filter((a) => a.severity === "HIGH");
+  const sources = new Set(open.map((a) => a.source));
+  const techniques = new Set(open.map((a) => a.technique).filter(Boolean));
+  const health = state.status?.analysis?.model?.health || {};
+  const modelNote = health.drifted ? "drifted — retrain"
+    : health.stale ? "stale — retrain"
+    : health.score_inflated ? "calibration suspect"
+    : state.status?.analysis?.model?.available ? "model healthy" : "no model";
+
   const cards = [
-    { k: "Packets", v: num(stats.packets), s: capture?.running ? "capturing" : "capture stopped" },
-    { k: "TCP", v: num(stats.tcp), s: pct(stats.tcp, stats.packets) },
-    { k: "UDP", v: num(stats.udp), s: pct(stats.udp, stats.packets) },
-    { k: "DNS", v: num(stats.dns), s: pct(stats.dns, stats.packets) },
-    { k: "Findings", v: num(stats.threats), s: "all severities" },
-    { k: "Critical", v: num(stats.critical), s: "needs review", alarm: Number(stats.critical) > 0 },
+    { k: "Critical open", v: num(critical.length), s: critical.length ? "act now" : "nothing critical",
+      alarm: critical.length > 0 },
+    { k: "High open", v: num(high.length), s: high.length ? "review today" : "clear" },
+    { k: "Sources", v: num(sources.size), s: "distinct hosts with findings" },
+    { k: "Techniques", v: num(techniques.size), s: "distinct ATT&CK IDs" },
+    { k: "Capture", v: captureLabel(capture),
+      s: capture?.interface && capture.interface !== "default"
+        ? capture.interface : (capture?.state || "").replace(/_/g, " ") || "no interface",
+      alarm: Boolean(capture?.error) || capture?.state === "failed" },
+    { k: "Packets", v: num(stats.packets), s: modelNote },
   ];
   $("kpis").innerHTML = cards.map((c) => `
     <article class="kpi ${c.alarm ? "alarm" : ""}">
@@ -221,15 +314,24 @@ function feedRows(alerts, limit) {
     return emptyState("◌", "No detections yet",
       "The sensor is running and nothing has crossed a threshold. That is the expected state on a quiet network.");
   }
-  return `<div class="feed">${alerts.slice(0, limit).map((a) => `
-    <div class="feed-row row ${sevClass(a.severity)}" data-alert="${esc(a.id)}" tabindex="0" role="button">
-      <span class="feed-t">${esc(clock(a.timestamp))}</span>
+  // Grouped for the same reason the tables are: eight repetitions of one
+  // campaign is not a summary of what is happening on the network.
+  return `<div class="feed">${groupFindings(alerts).slice(0, limit).map((g) => {
+    const a = g.members[0];
+    const spread = g.members.length > 1
+      ? `<span class="count">${g.members.length} findings · ${g.sources.size} sources</span>`
+      : "";
+    return `
+    <div class="feed-row row ${sevClass(g.severity)}" data-alert="${esc(a.id)}" tabindex="0" role="button">
+      <span class="feed-t">${esc(clock(g.latest))}</span>
       <span class="feed-main">
-        <b>${esc(a.threat)}</b>
-        <span>${esc(a.source)} · ${esc(a.reason)}</span>
+        <b title="${esc(g.threat)}">${esc(threatLabel(g.threat))}</b>${spread}
+        <span>${g.members.length > 1
+          ? `${esc([...g.sources][0])} and ${g.sources.size - 1} other host(s)`
+          : esc(a.source)} · ${esc(a.reason)}</span>
       </span>
-      <span class="score">${esc(a.risk_score)}</span>
-    </div>`).join("")}</div>`;
+      <span class="score">${esc(g.risk_score)}</span>
+    </div>`; }).join("")}</div>`;
 }
 
 /* ── Rendering: tables ──────────────────────────────────────────────── */
@@ -246,16 +348,72 @@ function renderIncidents(incidents) {
     return;
   }
   empty.innerHTML = "";
-  body.innerHTML = incidents.map((i) => `
-    <tr class="row ${sevClass(i.severity)}" data-incident="${esc(i.incident_id)}">
-      <td class="mono">${esc(i.incident_id)}</td>
-      <td class="mono">${esc(i.sources)}</td>
-      <td class="wrap dim">${esc(i.threats)}</td>
+  // Incidents correlate per source, which is correct: one host's findings
+  // belong together. But forty hosts each beaconing to the same address
+  // produce forty single-alert incidents, and listed individually they bury
+  // the two that matter. Incidents sharing one threat signature are collapsed
+  // into a campaign row; anything multi-threat stays on its own line, because
+  // that is precisely the incident an operator must not miss.
+  const campaigns = new Map();
+  const singular = [];
+  for (const i of incidents) {
+    const threats = String(i.threats || "").split(",").filter(Boolean);
+    if (threats.length !== 1 || Number(i.alert_count) > 1) { singular.push(i); continue; }
+    const key = `${threats[0]}|${i.severity}|${i.max_risk}`;
+    const group = campaigns.get(key);
+    if (group) {
+      group.alert_count += Number(i.alert_count) || 0;
+      group.members.push(i);
+      if (String(i.last_seen) > String(group.last_seen)) group.last_seen = i.last_seen;
+    } else {
+      campaigns.set(key, { ...i, alert_count: Number(i.alert_count) || 0, members: [i] });
+    }
+  }
+  const rows = [...singular, ...campaigns.values()].sort(byTriage);
+  body.innerHTML = rows.map((i) => {
+    if (i.members && i.members.length > 1) {
+      const sources = i.members.map((m) => String(m.sources || "").split(",")[0]).filter(Boolean);
+      const threat = String(i.threats || "").split(",")[0] || "";
+      return `
+    <tr class="row campaign ${sevClass(i.severity)}" data-incident="${esc(i.incident_id)}">
+      <td class="mono nowrap">${esc(sources[0])} <span class="more">+${sources.length - 1} hosts</span></td>
+      <td class="cell-threat">
+        <span class="tag" title="${esc(threat)}">${esc(threatLabel(threat))}</span>
+        <span class="count">${i.members.length} hosts</span>
+      </td>
       <td class="num">${num(i.alert_count)}</td>
       <td class="num score">${esc(i.max_risk)}</td>
       <td><span class="sev">${esc(i.severity)}</span></td>
-      <td class="dim">${esc(ago(i.last_seen))}</td>
-    </tr>`).join("");
+      <td class="dim nowrap">${esc(ago(i.last_seen))}</td>
+    </tr>`;
+    }
+    return renderIncidentRow(i);
+  }).join("");
+}
+
+function renderIncidentRow(i) {
+  {
+    // A raw comma-joined list of SCREAMING_SNAKE labels was overrunning its
+    // column and painting over the risk and severity beside it -- and it did
+    // that worst on the multi-stage incidents, which are the ones that matter
+    // most. Show the leading techniques and count the rest.
+    const threats = String(i.threats || "").split(",").filter(Boolean);
+    const shown = threats.slice(0, 2).map((t) => `<span class="tag" title="${esc(t)}">${esc(threatLabel(t))}</span>`).join("");
+    const extra = threats.length > 2 ? `<span class="more">+${threats.length - 2} more</span>` : "";
+    const sources = String(i.sources || "").split(",").filter(Boolean);
+    return `
+    <tr class="row ${sevClass(i.severity)}${threats.length > 2 ? " multistage" : ""}"
+        data-incident="${esc(i.incident_id)}" title="Incident ${esc(i.incident_id)}">
+      <td class="mono nowrap">${sources.length > 1
+        ? `${esc(sources[0])} <span class="more">+${sources.length - 1}</span>`
+        : esc(sources[0] || "—")}</td>
+      <td class="cell-threat">${shown}${extra}</td>
+      <td class="num">${num(i.alert_count)}</td>
+      <td class="num score">${esc(i.max_risk)}</td>
+      <td><span class="sev">${esc(i.severity)}</span></td>
+      <td class="dim nowrap">${esc(ago(i.last_seen))}</td>
+    </tr>`;
+  }
 }
 
 function filteredDetections() {
@@ -269,12 +427,18 @@ function filteredDetections() {
 }
 
 function renderDetections() {
-  const rows = filteredDetections();
+  const matched = filteredDetections();
+  // Group first, then paginate the groups. Paginating raw findings and
+  // grouping only the visible page would still hand the operator a first
+  // page made entirely of one repeated campaign.
+  const rows = groupFindings(matched);
   const pages = Math.max(1, Math.ceil(rows.length / PAGE));
   state.detPage = Math.min(state.detPage, pages - 1);
   const page = rows.slice(state.detPage * PAGE, state.detPage * PAGE + PAGE);
 
-  $("det-count").textContent = `${rows.length} of ${state.alerts.length}`;
+  $("det-count").textContent = rows.length === matched.length
+    ? `${matched.length} of ${state.alerts.length}`
+    : `${rows.length} groups · ${matched.length} of ${state.alerts.length} findings`;
   $("nav-detections").textContent = state.alerts.length || "";
 
   const body = $("det-body");
@@ -294,16 +458,48 @@ function renderDetections() {
   $("det-prev").disabled = state.detPage === 0;
   $("det-next").disabled = state.detPage >= pages - 1;
 
-  body.innerHTML = page.map((a) => `
+  body.innerHTML = page.map((g) => {
+    if (g.members.length === 1) {
+      const a = g.members[0];
+      return `
     <tr class="row ${sevClass(a.severity)}" data-alert="${esc(a.id)}">
-      <td class="dim mono">${esc(clock(a.timestamp))}</td>
-      <td><b>${esc(a.threat)}</b><br><span class="dim">${esc(a.reason)}</span></td>
-      <td class="mono">${esc(a.source)}</td>
+      <td class="dim mono nowrap">${esc(clock(a.timestamp))}</td>
+      <td class="cell-threat"><b title="${esc(a.threat)}">${esc(threatLabel(a.threat))}</b><br><span class="dim">${esc(a.reason)}</span></td>
+      <td class="mono nowrap">${esc(a.source)}</td>
       <td class="num score">${esc(a.risk_score)}</td>
       <td class="num dim">${esc(a.confidence)}%</td>
-      <td class="mono dim">${esc(a.technique || "—")}</td>
+      <td class="mono dim nowrap">${esc(a.technique || "—")}</td>
       <td><span class="sev">${esc(a.severity)}</span></td>
+    </tr>`;
+    }
+    const expanded = state.expanded.has(g.key);
+    const head = `
+    <tr class="row grouped ${sevClass(g.severity)}" data-group="${esc(g.key)}" tabindex="0" role="button"
+        aria-expanded="${expanded}">
+      <td class="dim mono nowrap">${esc(clock(g.latest))}</td>
+      <td class="cell-threat">
+        <b title="${esc(g.threat)}">${esc(threatLabel(g.threat))}</b>
+        <span class="count">${g.members.length} findings · ${g.sources.size} sources</span>
+        <br><span class="dim">${esc(g.reason)}</span>
+      </td>
+      <td class="mono nowrap">${sourceSummary(g.sources)}</td>
+      <td class="num score">${esc(g.risk_score)}</td>
+      <td class="num dim">${esc(g.confidence)}%</td>
+      <td class="mono dim nowrap">${esc(g.technique || "—")}</td>
+      <td><span class="sev">${esc(g.severity)}</span><span class="caret" aria-hidden="true">${expanded ? "▾" : "▸"}</span></td>
+    </tr>`;
+    if (!expanded) return head;
+    return head + g.members.slice(0, 60).map((a) => `
+    <tr class="row child ${sevClass(a.severity)}" data-alert="${esc(a.id)}">
+      <td class="dim mono nowrap">${esc(clock(a.timestamp))}</td>
+      <td class="cell-threat dim">${esc(a.reason)}</td>
+      <td class="mono nowrap">${esc(a.source)}</td>
+      <td class="num score">${esc(a.risk_score)}</td>
+      <td class="num dim">${esc(a.confidence)}%</td>
+      <td class="mono dim nowrap">${esc(a.technique || "—")}</td>
+      <td></td>
     </tr>`).join("");
+  }).join("");
 }
 
 function renderHosts(hosts) {
@@ -593,13 +789,17 @@ function paint() {
   renderKpis(data.stats || {}, data.capture);
   renderPosture(state.alerts);
   $("ov-incidents").innerHTML = (data.incidents || []).length
-    ? `<div class="tablewrap"><table class="table"><tbody>${(data.incidents || []).slice(0, 6).map((i) => `
+    ? `<div class="tablewrap"><table class="table"><tbody>${[...(data.incidents || [])]
+        .sort(byTriage).slice(0, 6).map((i) => {
+          const threats = String(i.threats || "").split(",").filter(Boolean);
+          return `
         <tr class="row ${sevClass(i.severity)}" data-incident="${esc(i.incident_id)}">
-          <td class="mono">${esc(i.incident_id)}</td>
-          <td class="mono dim">${esc(i.sources)}</td>
+          <td class="mono nowrap">${esc(String(i.sources || "").split(",")[0] || "—")}</td>
+          <td class="cell-threat dim">${esc(threatLabel(threats[0] || ""))}${
+            threats.length > 1 ? ` <span class="more">+${threats.length - 1} more</span>` : ""}</td>
           <td class="num score">${esc(i.max_risk)}</td>
           <td><span class="sev">${esc(i.severity)}</span></td>
-        </tr>`).join("")}</tbody></table></div>`
+        </tr>`; }).join("")}</tbody></table></div>`
     : emptyState("◇", "No incidents", "Findings from a single source are grouped into an incident. None have formed.");
   $("ov-timeline").innerHTML = feedRows(state.alerts, 8);
 
@@ -621,7 +821,7 @@ async function refresh() {
   try {
     const [dash, alerts, catalog, status] = await Promise.all([
       api("/api/dashboard"),
-      api("/api/alerts?limit=500"),
+      api("/api/alerts?limit=500&sort=risk"),
       api("/api/techniques"),
       api("/api/status"),
     ]);
@@ -705,6 +905,17 @@ function init() {
 
   // Row activation -> drawer, or host -> filtered detections
   document.addEventListener("click", (e) => {
+    // Group headers expand in place. Checked before [data-alert] so a click
+    // on a collapsed campaign opens it rather than jumping into one member.
+    const groupRow = e.target.closest("[data-group]");
+    if (groupRow) {
+      const key = groupRow.dataset.group;
+      if (state.expanded.has(key)) state.expanded.delete(key);
+      else state.expanded.add(key);
+      renderDetections();
+      return;
+    }
+
     const alertRow = e.target.closest("[data-alert]");
     if (alertRow) { openDrawer(alertById(alertRow.dataset.alert)); return; }
 
@@ -725,7 +936,15 @@ function init() {
     }
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && e.target.dataset?.alert) openDrawer(alertById(e.target.dataset.alert));
+    if (e.key !== "Enter") return;
+    const key = e.target.dataset?.group;
+    if (key) {
+      if (state.expanded.has(key)) state.expanded.delete(key);
+      else state.expanded.add(key);
+      renderDetections();
+      return;
+    }
+    if (e.target.dataset?.alert) openDrawer(alertById(e.target.dataset.alert));
   });
 
   $("drawer-close").addEventListener("click", closeDrawer);

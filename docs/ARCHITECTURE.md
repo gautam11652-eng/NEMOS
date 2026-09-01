@@ -305,6 +305,24 @@ endpoints reject cross-site browser writes even when no token is configured.
 Production deployments should still place HTTPS and network controls in front of
 the application.
 
+## Presentation
+
+The console's job is triage, and the two failure modes are ordering and
+repetition. Both are solved on the side that can actually solve them.
+
+Ordering is done in SQL. Sorting the page a client already holds cannot
+change which rows are on it, so a chronological query plus pagination puts
+the worst finding on page three permanently. `/api/dashboard` is risk-ordered
+outright; `/api/alerts` and `/api/incidents` keep their documented arrival
+order for scripts and take `sort=risk`.
+
+Grouping is done in the browser, before pagination rather than after: forty
+hosts beaconing to one address is one campaign, and grouping only the visible
+page would still produce a first page made entirely of it. Nothing is
+discarded -- a group expands to every constituent finding, and an incident
+spanning several techniques is never folded into a campaign, because that is
+precisely the row an operator must not miss.
+
 ## Sensor watchdog
 
 `nemos/watchdog.py` polls `PacketCapture.status()` on its own thread. A dead

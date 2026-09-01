@@ -440,7 +440,8 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
                               GROUP_CONCAT(DISTINCT threat) threats,
                               GROUP_CONCAT(DISTINCT source) sources
                        FROM alerts WHERE incident_id <> ''
-                       GROUP BY incident_id ORDER BY last_id DESC LIMIT ?""",
+                       GROUP BY incident_id
+                       ORDER BY max_risk DESC, last_id DESC LIMIT ?""",
                     (min(limit, 50),),
                 )
             ]
@@ -564,6 +565,16 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
         # only interpolated characters are `?` placeholders. All user-supplied
         # values travel in `params` as bound parameters.
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        # Chronological by default, because that is this endpoint's documented
+        # contract and scripts depend on it. ``sort=risk`` gives triage order
+        # instead, which is what the dashboard asks for: a chronological feed
+        # buries the one CRITICAL finding under fifty routine ones, and
+        # pagination makes that permanent -- the worst thing on the network
+        # ends up on page three. The ordering has to happen in SQL for exactly
+        # that reason, since sorting the page a client already holds cannot
+        # change which rows are on it.
+        order = ("risk_score DESC, id DESC"
+                 if request.args.get("sort") == "risk" else "id DESC")
         params.append(limit)
         c = connect(settings.db_path)
         try:
@@ -571,7 +582,7 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
                 dict(row) for row in c.execute(
                     f"""SELECT id,timestamp,threat,category,source,severity,risk_score,
                                confidence,reason,technique,incident_id,acknowledged,evidence
-                        FROM alerts{where} ORDER BY id DESC LIMIT ?""",
+                        FROM alerts{where} ORDER BY {order} LIMIT ?""",
                     params,
                 )
             ]))
@@ -581,16 +592,23 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
     @app.get("/api/incidents")
     def incidents():
         limit = _bounded_limit(request.args.get("limit"), 50, 1, 200)
+        # See /api/alerts. ``sort=risk`` is triage order, which the dashboard
+        # requests: by recency a forty-host beaconing campaign pushes the one
+        # critical flood off the first page entirely.
+        incident_order = ("max_risk DESC, last_id DESC"
+                          if request.args.get("sort") == "risk"
+                          else "last_id DESC")
         c = connect(settings.db_path)
         try:
             rows = c.execute(
-                """SELECT incident_id, MAX(id) last_id, MIN(timestamp) first_seen,
+                f"""SELECT incident_id, MAX(id) last_id, MIN(timestamp) first_seen,
                           MAX(timestamp) last_seen, COUNT(*) alert_count,
                           MAX(risk_score) max_risk,
                           GROUP_CONCAT(DISTINCT threat) threats,
                           GROUP_CONCAT(DISTINCT source) sources
                    FROM alerts WHERE incident_id <> ''
-                   GROUP BY incident_id ORDER BY last_id DESC LIMIT ?""",
+                   GROUP BY incident_id
+                   ORDER BY {incident_order} LIMIT ?""",
                 (limit,),
             ).fetchall()
             if not rows:

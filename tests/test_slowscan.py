@@ -233,7 +233,7 @@ class ThroughTheDetector(unittest.TestCase):
             now += pace
             event = TrafficEvent(
                 "2026-01-01T00:00:00+00:00", "203.0.113.9", "192.168.1.10",
-                "TCP", 40000 + index, 1000 + index, 60, "S", "eth0", {},
+                "TCP", 40000 + index, 1000 + index, 60, "S", "eth0", metadata={},
             )
             alerts.extend(detector.process(event, "TCP", now=now))
         return alerts

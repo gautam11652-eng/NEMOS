@@ -132,8 +132,9 @@
 
         <section class="card" aria-labelledby="ov-time-h">
           <header class="card-head">
-            <div><h2 id="ov-time-h">Recent detections</h2>
-                 <p>Newest first. Select a row for the evidence behind it.</p></div>
+            <div><h2 id="ov-time-h">Priority detections</h2>
+                 <p>Highest risk first, repeated findings grouped. Select a row for the
+                    evidence behind it.</p></div>
             <a class="btn ghost sm" href="#detections">All detections</a>
           </header>
           <div id="ov-timeline"></div>
@@ -145,14 +146,17 @@
         <section class="card">
           <header class="card-head">
             <div><h2>Correlated incidents</h2>
-                 <p>Alerts sharing a source within the correlation window share an incident.</p></div>
+                 <p>Alerts sharing a source within the correlation window share an incident.
+                    Highest risk first — an incident spanning several techniques is marked
+                    as multi-stage.</p></div>
             <span class="chip" id="inc-count">0</span>
           </header>
           <div class="tablewrap">
-            <table class="table">
+            <table class="table table-incidents">
               <thead><tr>
-                <th>Incident</th><th>Sources</th><th>Threats</th>
-                <th class="num">Alerts</th><th class="num">Risk</th><th>Severity</th><th>Last seen</th>
+                <th>Source</th><th>Techniques observed</th>
+                <th class="num">Alerts</th><th class="num">Risk</th><th>Severity</th>
+                <th>Last seen</th>
               </tr></thead>
               <tbody id="inc-body"></tbody>
             </table>
