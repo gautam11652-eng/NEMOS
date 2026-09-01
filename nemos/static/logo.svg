@@ -12,14 +12,18 @@
     </linearGradient>
   </defs>
 
-  <!-- A hexagon reads as infrastructure without shouting, and unlike a shield
-       it is not the same mark every other security tool already uses. The mark
-       carries its own ground so it looks identical on a light page. -->
-  <path d="M20 2.2 L35 11 V29 L20 37.8 L5 29 V11 Z"
-        fill="url(#nemos-tile)" stroke="#3ec8f4" stroke-opacity="0.28" stroke-width="1.1"/>
+  <!-- The tile carries the mark's own ground, so it reads identically on a
+       light page as on a dark one. -->
+  <rect width="40" height="40" rx="10" fill="url(#nemos-tile)"/>
+  <rect x="0.6" y="0.6" width="38.8" height="38.8" rx="9.4"
+        fill="none" stroke="#3ec8f4" stroke-opacity="0.22"/>
 
-  <!-- The N is left plain on purpose: it is the only element here that still
-       resolves at 16px, which is where a mark spends most of its life. -->
-  <path d="M14 27 V13 L26 27 V13" fill="none" stroke="url(#nemos-stroke)"
-        stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- A shield says defensive monitoring before a word is read. The trace
+       crossing it is what keeps it from being a generic padlock badge: NEMOS
+       watches traffic, and the one spike breaking the line is the finding. -->
+  <path d="M20 8 L29 12 V20.5 C29 26 24.8 30 20 32 C15.2 30 11 26 11 20.5 V12 Z"
+        fill="none" stroke="url(#nemos-stroke)" stroke-width="2.2" stroke-linejoin="round"/>
+  <path d="M13.5 21 h3.2 l2.1 -5.4 l2.4 8.4 l1.9 -3 h3.4"
+        fill="none" stroke="#3ec8f4" stroke-width="1.9"
+        stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
