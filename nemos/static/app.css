@@ -564,3 +564,44 @@ pre.json {
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ── ML lifecycle ───────────────────────────────────────────────────── */
+
+.progress {
+  height: 5px; margin: 0 15px; border-radius: 3px;
+  background: var(--surface-2); overflow: hidden;
+}
+.progress i {
+  display: block; height: 100%; border-radius: 3px;
+  background: var(--accent); width: calc(var(--pct, 0) * 1%);
+}
+
+/* Which detection layers are carrying the sensor right now. "No model" must
+   not read as "no detection", so all three are always listed. */
+.layers { margin: 12px 0 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
+.layers li {
+  display: flex; align-items: baseline; gap: 9px;
+  padding: 8px 15px; border-bottom: 1px solid var(--line); font-size: 12.5px;
+}
+.layers li:last-child { border-bottom: 0; }
+.layers .tick { width: 12px; flex: none; color: var(--text-3); }
+.layers li.on .tick { color: var(--ok); }
+.layers li b { font-weight: 500; }
+.layers li span:last-child { margin-left: auto; color: var(--text-3); font-size: 11.5px; }
+.layers li.off b { color: var(--text-2); }
+
+/* Explanatory copy under a panel: the console has to say what a state means,
+   not only name it. */
+.card-note {
+  margin: 0; padding: 12px 15px 14px;
+  font-size: 11.5px; line-height: 1.65; color: var(--text-3);
+}
+
+.notice.warn { border-style: solid; border-color: color-mix(in srgb, var(--med) 40%, var(--line)); }
+.notice.warn b { color: var(--med); }
+.notice.bad  { border-style: solid; border-color: color-mix(in srgb, var(--crit) 45%, var(--line)); }
+.notice.bad b { color: var(--crit); }
+
+.chip.ok   { color: var(--ok);   border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.chip.warn { color: var(--med);  border-color: color-mix(in srgb, var(--med) 40%, var(--line)); }
+.chip.bad  { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, var(--line)); }

@@ -119,6 +119,29 @@ const threatLabel = (v) => String(v ?? "").split("_").filter(Boolean).map((word,
   return i === 0 ? lower.charAt(0).toUpperCase() + lower.slice(1) : lower;
 }).join(" ");
 
+/* ML lifecycle states, as nemos/bootstrap.py reports them. The console shows
+ * the word, never the token, and never claims more than the state means:
+ * ACTIVE is only ever set after a real Isolation Forest was fitted, validated
+ * and loaded. */
+const ML_LABEL = {
+  NO_MODEL: "Unavailable", WARMING_UP: "Warming up", TRAINING: "Training",
+  VALIDATING: "Validating", ACTIVE: "Active", RETRAINING: "Retraining",
+  FAILED: "Failed",
+};
+const ML_TONE = {
+  ACTIVE: "ok", RETRAINING: "ok", FAILED: "bad", NO_MODEL: "warn",
+};
+
+/* mm:ss for an observation period. Hours appear once there are any. */
+function duration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
 function emptyState(mark, title, body) {
   return `<div class="empty"><span class="empty-mark" aria-hidden="true">${mark}</span>
           <b>${esc(title)}</b><p>${body}</p></div>`;
@@ -567,6 +590,109 @@ function renderAttack(alerts, catalog) {
 
 const facts = (pairs) => pairs.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("");
 
+/* The three detection layers, and which of them is carrying the sensor right
+ * now. NEMOS is deliberately not ML-dependent: rules and the statistical
+ * baseline run whether or not a model exists, and saying so is the point of
+ * this block -- "no model" must not read as "no detection". */
+function layerList(analysis) {
+  const state = analysis.bootstrap?.state || "NO_MODEL";
+  const mlOn = Boolean(analysis.model?.available);
+  const rows = [
+    ["on", "Deterministic detection", "active"],
+    ["on", "Behavioural baseline", analysis.enabled === false ? "inactive" : "active"],
+    [mlOn ? "on" : "off", "ML anomaly detection",
+     mlOn ? "active" : (ML_LABEL[state] || state).toLowerCase()],
+  ];
+  return `<ul class="layers">${rows.map(([cls, name, note]) => `
+    <li class="${cls}"><span class="tick" aria-hidden="true">${cls === "on" ? "\u2713" : "\u25cb"}</span>
+      <b>${esc(name)}</b><span>${esc(note)}</span></li>`).join("")}</ul>`;
+}
+
+function renderModel(analysis) {
+  const model = $("sensor-model");
+  const boot = analysis.bootstrap || {};
+  const state = boot.state || "NO_MODEL";
+  const meta = analysis.model?.metadata || {};
+  $("ml-state").textContent = ML_LABEL[state] || state;
+  $("ml-state").className = `chip ${ML_TONE[state] || ""}`;
+
+  if (analysis.enabled === false) {
+    model.innerHTML = `<div class="notice"><b>Windowed analysis is disabled</b>
+      <p>${esc(sentence(analysis.reason) || "Not enabled.")} Set <code>NEMOS_ANALYSIS=true</code>
+         to enable flow aggregation, feature extraction and model scoring.
+         Deterministic rules are unaffected.</p></div>${layerList(analysis)}`;
+    return;
+  }
+
+  if (analysis.model?.available) {
+    // Only ever reached when a real forest was fitted, validated and loaded.
+    model.innerHTML = `<dl class="facts">${facts([
+      ["Status", ML_LABEL[state] || state],
+      ["Algorithm", boot.algorithm || "Isolation Forest"],
+      ["Model file", "anomaly_model.joblib"],
+      ["Trained", meta.trained_at ? ago(meta.trained_at) : "—"],
+      ["Training samples", num(meta.samples)],
+      ["Window", `${analysis.window_seconds ?? "—"} seconds`],
+      ["Schema version", analysis.model.schema_version ?? "—"],
+      ["Windows scored", num(analysis.model.scored_windows)],
+      ["Source", boot.auto_trained ? "trained automatically by this sensor" : "trained out of band"],
+      ["scikit-learn", meta.sklearn_version || "—"],
+    ])}</dl>${layerList(analysis)}`;
+    return;
+  }
+
+  if (state === "NO_MODEL") {
+    model.innerHTML = `<div class="notice warn"><b>Automatic training unavailable</b>
+      <p>${esc(sentence(boot.reason) || sentence(analysis.model?.reason) || "No model is loaded.")}
+         You can still train one by hand with
+         <code>python tools/train_model.py --source database</code>.
+         NEMOS ships no pretrained model on purpose: a model fitted on another
+         network describes another network's normal.</p></div>${layerList(analysis)}`;
+    return;
+  }
+
+  if (state === "FAILED") {
+    model.innerHTML = `<div class="notice bad"><b>Training failed</b>
+      <p>${esc(sentence(boot.last_error) || "The last training run did not complete.")}
+         Collection continues and NEMOS will try again. Detection is unaffected.</p>
+      </div>${layerList(analysis)}`;
+    return;
+  }
+
+  // Warming up, training or validating: show the real progress, and nothing
+  // the sensor has not actually measured.
+  const need = Number(boot.samples_required) || 0;
+  const have = Number(boot.samples) || 0;
+  const needSeconds = Number(boot.observed_seconds_required) || 0;
+  const seen = Number(boot.observed_seconds) || 0;
+  model.innerHTML = `
+    <dl class="facts">${facts([
+      ["Status", ML_LABEL[state] || state],
+      ["Training samples", `${num(have)} / ${num(need)}`],
+      ["Observation period", needSeconds
+        ? `${duration(seen)} / ${duration(needSeconds)}` : "not required"],
+      ["Window", `${analysis.window_seconds ?? "—"} seconds`],
+      ["Samples excluded", num(boot.samples_rejected)],
+      ["Model", "not active"],
+    ])}</dl>
+    <div class="progress"><i></i></div>
+    <p class="card-note">NEMOS is learning what this network's ordinary traffic
+       looks like. Only windows that every detection layer judged unremarkable
+       are kept, so traffic it flagged never becomes training data. It fits an
+       Isolation Forest once both thresholds are met; an anomaly score is a
+       measure of how unlike that traffic a window is, and is not a probability
+       of compromise.</p>
+    ${layerList(analysis)}`;
+  // Width via a custom property: an inline style attribute would be refused
+  // by the page's own Content-Security-Policy.
+  const bar = model.querySelector(".progress i");
+  if (bar) {
+    const time = needSeconds ? Math.min(1, seen / needSeconds) : 1;
+    const rows = need ? Math.min(1, have / need) : 1;
+    bar.style.setProperty("--pct", Math.min(time, rows) * 100);
+  }
+}
+
 function renderSensor(data, status) {
   const capture = status.capture || data.capture || {};
   $("sensor-capture").innerHTML = facts([
@@ -589,33 +715,7 @@ function renderSensor(data, status) {
     ["Write errors", num(w.write_errors)],
   ]);
 
-  // ML model. Each branch is a real state the sensor can be in, and says what
-  // to do about it rather than rendering a row of dashes.
-  const analysis = status.analysis || {};
-  const model = $("sensor-model");
-  if (analysis.enabled === false) {
-    model.innerHTML = `<div class="notice"><b>Windowed analysis is disabled</b>
-      <p>${esc(sentence(analysis.reason) || "Not enabled.")} Set <code>NEMOS_ANALYSIS=true</code>
-         to enable flow aggregation, feature extraction and model scoring.
-         Deterministic rules and the statistical baseline are unaffected.</p></div>`;
-  } else if (!analysis.model?.available) {
-    model.innerHTML = `<div class="notice"><b>No trained model</b>
-      <p>${esc(sentence(analysis.model?.reason) || "No model is loaded.")}
-         Train one with <code>python tools/train_model.py --source database</code>.
-         NEMOS ships no pretrained model on purpose: a model fitted on another
-         network describes another network's normal.</p></div>`;
-  } else {
-    const meta = analysis.model.metadata || {};
-    model.innerHTML = `<dl class="facts">${facts([
-      ["State", "loaded"],
-      ["Schema version", analysis.model.schema_version ?? "—"],
-      ["Trained", meta.trained_at ? ago(meta.trained_at) : "—"],
-      ["Training samples", num(meta.samples)],
-      ["Window", `${analysis.window_seconds ?? "—"}s`],
-      ["Windows scored", num(analysis.model.scored_windows)],
-      ["scikit-learn", meta.sklearn_version || "—"],
-    ])}</dl>`;
-  }
+  renderModel(status.analysis || {});
 
   // Delivery.
   const n = status.notifications || {};

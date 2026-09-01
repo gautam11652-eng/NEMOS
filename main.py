@@ -86,6 +86,15 @@ def main() -> int:
             max_flows=settings.max_flows,
             on_alert=record,
             on_flows=persist_flows,
+            # Automatic ML bootstrap. The corpus of vetted-normal windows lives
+            # in the sensor's own database, so a restart resumes collection
+            # rather than beginning the observation period again.
+            db_path=settings.db_path,
+            autotrain=settings.ml_autotrain,
+            bootstrap_min_seconds=settings.ml_bootstrap_min_seconds,
+            bootstrap_min_samples=settings.ml_bootstrap_min_samples,
+            retrain_seconds=settings.ml_retrain_seconds,
+            max_training_samples=settings.ml_max_samples,
         )
         analysis.start()
     else:
