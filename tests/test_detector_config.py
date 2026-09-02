@@ -63,6 +63,10 @@ TUNABLE_FIELDS = [
     ("NEMOS_DETECT_BASELINE_MULTIPLIER", "baseline_multiplier", "5.0", 5.0),
     ("NEMOS_DETECT_BASELINE_MIN_EVENTS", "baseline_min_events", "40", 40),
     ("NEMOS_DETECT_MIN_CONFIDENCE", "min_confidence", "70", 70),
+    ("NEMOS_DETECT_TLS_HORIZON", "tls_horizon", "1800", 1800.0),
+    ("NEMOS_DETECT_TLS_MAX_FINGERPRINTS", "tls_max_fingerprints", "9", 9),
+    ("NEMOS_DETECT_TLS_ODD_PORT_HANDSHAKES", "tls_odd_port_handshakes", "5", 5),
+    ("NEMOS_DETECT_TLS_MAX_TRACKED", "tls_max_tracked", "32", 32),
     # Pre-existing env vars, kept under their original names for compatibility.
     ("NEMOS_MAX_EVENTS", "max_events", "2000", 2000),
     ("NEMOS_BEHAVIOR_ALPHA", "baseline_alpha", "0.5", 0.5),

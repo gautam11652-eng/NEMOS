@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 697 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 722 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -439,7 +439,8 @@ justify to a reviewer. Both remain reasonable alternatives; the engine is a
 single class behind a small interface if you want to substitute one.
 
 **Features** — 24 per source per window, all derivable from observed metadata,
-none from payload:
+none from payload (TLS handshake fingerprints are recorded as evidence but are
+deliberately not model features; see [Encrypted traffic](#encrypted-traffic)):
 
 | Group | Features |
 | --- | --- |
@@ -538,6 +539,68 @@ it. Scanning maps to `T1046`; DNS tunnelling patterns to `T1071.004`; floods to
 `T1498`/`T1498.001`; ARP manipulation to `T1557.002`. A generic behavioural
 anomaly is reported as an unmapped signal with a stated reason, rather than
 being assigned a technique it does not evidence.
+
+## Encrypted traffic
+
+Most traffic worth watching is now inside TLS, which is the blind spot every
+metadata-only sensor has: NEMOS can see that a host opened a session and how
+much crossed it, but not what was said.
+
+The handshake is the exception. Before a session key exists, client and server
+negotiate in cleartext — which versions, ciphers, extensions and curves they
+support. That negotiation is a property of the *software*, not of the user, and
+it is distinctive: Chrome, curl, python-requests, Go's `crypto/tls` and a
+Cobalt Strike beacon all present recognisably different handshakes. **JA3** is
+the standard hash of that negotiation, and NEMOS computes it for every
+handshake it sees, in both directions (JA3S for the server).
+
+**What is read, precisely.** The ClientHello and ServerHello, and nothing else.
+Application data — everything after the handshake — is ciphertext and is never
+parsed. NEMOS does not decrypt, does not proxy, and does not need a private
+key. The one field that identifies a destination rather than software is the
+SNI (the hostname the client asks for), which is recorded because it is the
+field that makes a finding actionable.
+
+**GREASE is stripped.** RFC 8701 has clients inject reserved values into their
+cipher and extension lists specifically so middleboxes cannot assume the lists
+are fixed, and Chrome picks different ones on every connection. Hashing the
+lists as they arrive gives a browser a brand-new fingerprint per connection,
+which makes JA3 worse than useless. NEMOS removes them before hashing, so a
+fingerprint is stable across connections from the same software.
+
+### What this detects, and what it does not
+
+| Finding | Technique | What it means |
+| --- | --- | --- |
+| `TLS_ON_UNEXPECTED_PORT` | T1571 | Confirmed TLS handshakes to an external host on a port that is not a TLS port. Because the handshake is unmistakable, this knows the traffic really is TLS rather than guessing from the port number. |
+
+Fingerprints are also attached as **evidence** to every command-and-control
+finding, which is the larger practical win: a beaconing alert that carries a
+JA3 can be pivoted on — across this network, across other tooling, across
+public corpora — where "talked to 203.0.113.9" leads nowhere.
+
+**NEMOS ships no list of known-malicious JA3 hashes, on purpose.** Such lists
+go stale quickly, collide with common libraries (a great deal of malware uses
+stock Go or Python TLS, and so does a great deal of legitimate software), and
+shipping one would claim a detection quality that cannot be validated here.
+The fingerprint is recorded so *you* can pivot on it; it is never treated as a
+verdict.
+
+**Fingerprint diversity is evidence, never its own alert.** A workstation
+speaks TLS with a small, stable set of client software, so a host presenting
+many distinct handshakes is worth an analyst's attention. But behind NAT one
+address aggregates every host behind it and reaches any threshold honestly, so
+this could not earn a standalone confidence. It appears in evidence, with that
+caveat stated inline, and strengthens a finding rather than making one.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NEMOS_DETECT_TLS_HORIZON` | `900` | How long a fingerprint stays associated with a source, in seconds |
+| `NEMOS_DETECT_TLS_MAX_FINGERPRINTS` | `6` | Distinct fingerprints from one address before diversity is noted in evidence |
+| `NEMOS_DETECT_TLS_ODD_PORT_HANDSHAKES` | `3` | Handshakes on a non-TLS port before it is reported |
+| `NEMOS_DETECT_TLS_MAX_TRACKED` | `16` | Bound on fingerprints, names and ports retained per source |
 
 ## Training the model
 
@@ -909,7 +972,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 697 tests
+python -m pytest -q                              # 722 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
@@ -1022,7 +1085,11 @@ Stated plainly, because an evaluator will find them anyway:
   update can all be genuinely anomalous and entirely benign.
 - The model is trained per deployment. There is no pretrained model shipped,
   because a generic notion of "normal traffic" would not describe your network.
-- Encrypted payloads are not inspected. Detection is metadata-only.
+- Encrypted payloads are not inspected. NEMOS reads the TLS *handshake*, which
+  is sent in cleartext before a session key exists, to fingerprint the client
+  software (JA3) and record the server name. Everything after the handshake is
+  ciphertext and is never touched, so nothing encrypted is read and no session
+  is decrypted. See [Encrypted traffic](#encrypted-traffic).
 - IPv6 is captured and every rule applies to it, but the volumetric thresholds
   were tuned against IPv4 traffic. A v6 segment with very different host
   density may want them adjusted — see
