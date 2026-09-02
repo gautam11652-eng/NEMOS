@@ -16,6 +16,9 @@ class MainLifecycleTests(unittest.TestCase):
             analysis_enabled=True, analysis_window=10.0, max_flows=100,
             persist_flows=True, model_dir=Path("/tmp/nemos-test-model"),
             heartbeat_seconds=0.0, watchdog_poll_seconds=15.0,
+            ml_autotrain=True, ml_bootstrap_min_seconds=600.0,
+            ml_bootstrap_min_samples=1000, ml_retrain_seconds=86_400.0,
+            ml_max_samples=20_000,
         )
 
         class Writer:

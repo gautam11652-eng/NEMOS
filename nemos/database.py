@@ -72,6 +72,20 @@ CREATE INDEX IF NOT EXISTS idx_flows_last_timestamp ON flows(last_timestamp);
 CREATE INDEX IF NOT EXISTS idx_flows_source ON flows(source);
 CREATE INDEX IF NOT EXISTS idx_flows_destination ON flows(destination);
 CREATE INDEX IF NOT EXISTS idx_flows_protocol ON flows(protocol);
+-- Vetted-normal feature windows for automatic model training. Only windows
+-- that every detection layer judged unremarkable are written here; see
+-- nemos/bootstrap.py. Kept in the sensor's own database so a restart resumes
+-- from what has already been collected rather than starting over.
+CREATE TABLE IF NOT EXISTS ml_training_samples (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ created_at TEXT NOT NULL,
+ source TEXT NOT NULL,
+ window_seconds REAL NOT NULL,
+ schema_version INTEGER NOT NULL,
+ features TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ml_samples_contract
+ ON ml_training_samples(window_seconds, schema_version, id);
 
 
 """
@@ -185,6 +199,16 @@ def _migrate(c: sqlite3.Connection):
     c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_incident_id_id ON alerts(incident_id, id DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_incident_source ON alerts(incident_id, source)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ack ON alerts(acknowledged)")
+
+    # Automatic ML training corpus. Additive, like every other migration here:
+    # an upgrade never requires deleting telemetry.
+    c.execute("""CREATE TABLE IF NOT EXISTS ml_training_samples (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   created_at TEXT NOT NULL, source TEXT NOT NULL,
+                   window_seconds REAL NOT NULL, schema_version INTEGER NOT NULL,
+                   features TEXT NOT NULL)""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ml_samples_contract "
+              "ON ml_training_samples(window_seconds, schema_version, id)")
 
 
 def _rebuild_host_stats(c: sqlite3.Connection):

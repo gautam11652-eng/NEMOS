@@ -60,7 +60,8 @@ extraction and model inference can never add latency to packet capture.
 | `nemos/detector.py` | Deterministic rules over bounded sliding windows; owns incident correlation |
 | `nemos/flows.py` | Unidirectional flow aggregation, bounded with O(1) LRU eviction |
 | `nemos/features.py` | 24 numeric features per source per window; no ML dependency |
-| `nemos/ml.py` | Isolation Forest: training, persistence, calibration, scoring |
+| `nemos/ml.py` | Isolation Forest: training, persistence, calibration, validation, scoring |
+| `nemos/bootstrap.py` | Automatic model lifecycle: vetted-normal corpus, background training, validation, promotion |
 | `nemos/fusion.py` | Transparent combination of rules, baseline and ML into one risk |
 | `nemos/analysis.py` | The background windowed-analysis thread tying those together |
 | `nemos/analyst.py` | Optional LLM explanation layer; performs no detection |
@@ -237,9 +238,52 @@ defensible rather than merely impressive:
   file or a mismatched schema all leave the engine unavailable with a stated
   reason while rules and the baseline continue unaffected.
 
-Training is out-of-band by design (`tools/train_model.py`). A sensor that
-retrained itself on live traffic would learn to accept whatever it is currently
-seeing, including an intrusion in progress.
+### Automatic bootstrap
+
+`bootstrap.py` lets the sensor fit its own model, because the alternative in
+practice was no model at all: training required an operator to run
+`tools/train_model.py` by hand, and on most deployments nobody did. The ML slot
+sat permanently unavailable while the sensor ran.
+
+The obvious hazard is a sensor that retrains on live traffic and learns to
+accept whatever it is currently seeing, including an intrusion in progress. Two
+things keep that from happening, and a third keeps a bad fit from costing
+anything:
+
+- **The corpus is vetted by the layers that already exist.** A window is offered
+  to training only when `fusion.assess` returned `NO_FINDING` for that source —
+  no rule fired, the baseline is not deviating, any loaded model scored it
+  NORMAL. `bootstrap.is_clean` *reads* that verdict; there is no second
+  detection implementation. Sources are additionally quarantined for a few
+  windows after any rule finding, because a rule firing late in a window is
+  fused into the following one.
+- **Two independent thresholds gate the first fit.** A sample count alone is
+  satisfied by one quiet minute repeated, which fits a degenerate cloud that
+  genuinely unusual traffic can then land inside. A wall-clock observation
+  period is required alongside it, on top of the distinct-row floor `train`
+  enforces regardless.
+- **Validation precedes promotion.** Training runs against a staging directory
+  on a background thread — the analysis loop, and behind it the capture path,
+  are never blocked. `AnomalyEngine.check` is deliberately side-effect free: it
+  validates schema, feature names and the aggregation window and returns the
+  objects, so a rejected candidate cannot disturb the model already scoring.
+  Only after it passes are the files moved into place with atomic replacements
+  and `install` swaps the estimator and its calibration under one lock.
+
+The corpus is persisted in the sensor's own database (`ml_training_samples`),
+scoped to the current window and feature-schema pair, so a restart resumes
+rather than restarting the observation period, and changing
+`NEMOS_ANALYSIS_WINDOW` invalidates the corpus instead of mixing incompatible
+feature scales.
+
+`tools/train_model.py` is unchanged and calls the same `AnomalyEngine.train`.
+There is one training implementation, one feature extractor and one
+serialisation format.
+
+What this is not: it computes no accuracy, precision or recall, and claims
+none — nothing labelled exists to compute them against. It also cannot exclude
+what NEMOS never detected in the first place; vetting filters what the sensor
+*flagged*.
 
 ## Fusion
 

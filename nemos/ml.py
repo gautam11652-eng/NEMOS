@@ -155,8 +155,13 @@ class InsufficientTrainingData(RuntimeError):
 class AnomalyEngine:
     """Loads, trains and applies the Isolation Forest.
 
-    Inference and training are separate operations: the runtime only ever loads
-    and scores. Training happens out of band via ``tools/train_model.py``.
+    Inference and training are separate operations here, and this class does
+    not decide when to do either. ``tools/train_model.py`` calls
+    :meth:`train` for an explicit operator-run fit;
+    :class:`nemos.bootstrap.ModelBootstrap` calls the same method on a
+    background thread once the sensor has accumulated enough vetted-normal
+    windows. Both paths go through :meth:`check` before a model reaches
+    :meth:`install`, so nothing is ever scored against an unvalidated model.
     """
 
     def __init__(self, model_dir: Path | str, *, random_state: int = 42,
@@ -334,18 +339,7 @@ class AnomalyEngine:
         }
 
         self._persist(model, metadata)
-        with self._lock:
-            self._model = model
-            self._quantiles = quantiles
-            self._feature_mean = feature_mean
-            self._feature_std = feature_std
-            self._metadata = {k: v for k, v in metadata.items()
-                              if k not in ("quantiles", "feature_mean", "feature_std")}
-            self._unavailable_reason = ""
-        # Live statistics describe the previous model's view of the network.
-        # Carrying them forward would have a freshly trained model report
-        # drift against its own training data.
-        self.drift.reset()
+        self.install(model, metadata)
 
         return TrainingReport(
             samples=len(vectors),
@@ -388,64 +382,68 @@ class AnomalyEngine:
     # -------------------------------------------------------------- loading
 
     def load(self) -> bool:
-        """Load a persisted model. Returns False and stays usable on failure.
+        """Load the persisted model. Returns False and stays usable on failure.
 
         Every failure mode -- scikit-learn missing, no model on disk, corrupt
         file, schema mismatch -- results in an unavailable engine rather than an
         exception, because none of them should stop a sensor from capturing.
         """
+        reason, model, metadata = self.check(self.model_path, self.metadata_path)
+        if reason:
+            self._set_unavailable(reason)
+            return False
+        self.install(model, metadata)
+        log.info(
+            "anomaly model loaded: version=%s samples=%s trained_at=%s",
+            metadata.get("model_version"), metadata.get("samples"), metadata.get("trained_at"),
+        )
+        return True
+
+    def check(self, model_path: Path, metadata_path: Path) -> tuple[str, Any, dict[str, Any]]:
+        """Validate a model pair against this build and this sensor's window.
+
+        Returns ``("", model, metadata)`` when the pair is usable, or
+        ``(reason, None, {})`` when it is not. Deliberately free of side
+        effects: automatic retraining validates a candidate *before* promoting
+        it, and a rejected candidate must not cost the sensor the model it is
+        already scoring with.
+        """
         if not sklearn_available():
-            self._set_unavailable("scikit-learn is not installed")
-            return False
-        if not self.model_path.is_file():
-            self._set_unavailable(
-                "no trained model found; run: python tools/train_model.py --help"
-            )
-            return False
+            return "scikit-learn is not installed", None, {}
+        if not Path(model_path).is_file():
+            return ("no trained model found; NEMOS trains one automatically once it has "
+                    "observed enough clean traffic, or run: python tools/train_model.py --help"), None, {}
         try:
             # SECURITY: joblib.load deserialises, which can execute code if the
             # file is attacker-controlled. The model is treated as trusted
-            # operator input: it is written by tools/train_model.py into a
-            # 0700 directory with 0600 permissions, and is never fetched from a
-            # network or accepted through the API. Do not point NEMOS_MODEL_DIR
-            # at a directory other users can write to.
+            # operator input: it is written by NEMOS itself or by
+            # tools/train_model.py into a 0700 directory with 0600 permissions,
+            # and is never fetched from a network or accepted through the API.
+            # Do not point NEMOS_MODEL_DIR at a directory other users can write to.
             import joblib
 
-            metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
         except FileNotFoundError:
-            self._set_unavailable("model metadata is missing; retrain the model")
-            return False
+            return "model metadata is missing; retrain the model", None, {}
         except (ValueError, OSError) as exc:
-            self._set_unavailable(f"model metadata is unreadable: {exc}")
-            return False
+            return f"model metadata is unreadable: {exc}", None, {}
+
+        if not isinstance(metadata, dict):
+            return "model metadata is not an object; retrain the model", None, {}
 
         schema = metadata.get("feature_schema_version")
         if schema != FEATURE_SCHEMA_VERSION:
             # Refusing here is the point: scoring a vector whose columns mean
             # something different from what the model was fitted on would
             # produce confident, wrong answers.
-            self._set_unavailable(
-                f"model was trained on feature schema {schema}, this build uses "
-                f"{FEATURE_SCHEMA_VERSION}; retrain the model"
-            )
-            return False
+            return (f"model was trained on feature schema {schema}, this build uses "
+                    f"{FEATURE_SCHEMA_VERSION}; retrain the model"), None, {}
         if metadata.get("feature_names") != list(FEATURE_NAMES):
-            self._set_unavailable("model feature names do not match this build; retrain the model")
-            return False
-
-        try:
-            model = joblib.load(self.model_path)
-        except Exception as exc:
-            self._set_unavailable(f"model file could not be loaded: {exc}")
-            return False
-        if not hasattr(model, "decision_function"):
-            self._set_unavailable("model file does not contain a usable estimator")
-            return False
+            return "model feature names do not match this build; retrain the model", None, {}
 
         quantiles = metadata.get("quantiles") or []
         if len(quantiles) != 101:
-            self._set_unavailable("model calibration data is missing or malformed; retrain")
-            return False
+            return "model calibration data is missing or malformed; retrain", None, {}
 
         trained_window = metadata.get("window_seconds")
         if self.window_seconds is not None and trained_window is not None:
@@ -454,29 +452,43 @@ class AnomalyEngine:
                 # every count and rate feature is on a different scale, so the
                 # model reports confident numbers about a distribution it was
                 # never fitted on.
-                self._set_unavailable(
+                return (
                     f"model was trained on {trained_window}s windows but this sensor "
                     f"aggregates {self.window_seconds}s windows. Counts and rates scale "
                     f"with the window, so the scores would be meaningless. Either set "
                     f"NEMOS_ANALYSIS_WINDOW={trained_window} or retrain with "
                     f"--window {self.window_seconds}."
-                )
-                return False
+                ), None, {}
 
+        try:
+            model = joblib.load(model_path)
+        except Exception as exc:
+            return f"model file could not be loaded: {exc}", None, {}
+        if not hasattr(model, "decision_function"):
+            return "model file does not contain a usable estimator", None, {}
+
+        return "", model, metadata
+
+    def install(self, model: Any, metadata: dict[str, Any]) -> None:
+        """Swap a validated model into the scoring path under one lock.
+
+        Called by :meth:`load` and by automatic retraining after
+        :meth:`check` has accepted the pair. Scoring either sees the whole old
+        model or the whole new one, never a mixture of one's estimator and the
+        other's calibration.
+        """
         with self._lock:
             self._model = model
-            self._quantiles = [float(q) for q in quantiles]
+            self._quantiles = [float(q) for q in metadata.get("quantiles", [])]
             self._feature_mean = [float(v) for v in metadata.get("feature_mean", [])]
             self._feature_std = [float(v) for v in metadata.get("feature_std", [])]
             self._metadata = {k: v for k, v in metadata.items()
                               if k not in ("quantiles", "feature_mean", "feature_std")}
             self._unavailable_reason = ""
+        # Live statistics describe the previous model's view of the network.
+        # Carrying them forward would have a freshly installed model report
+        # drift against traffic its predecessor scored.
         self.drift.reset()
-        log.info(
-            "anomaly model loaded: version=%s samples=%s trained_at=%s",
-            metadata.get("model_version"), metadata.get("samples"), metadata.get("trained_at"),
-        )
-        return True
 
     def _set_unavailable(self, reason: str) -> None:
         with self._lock:

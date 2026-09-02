@@ -36,6 +36,7 @@ from typing import Any
 from collections.abc import Callable, Sequence
 
 from .behavioral import STATE_NO_BASELINE, AdaptiveBehaviorProfiler, BehaviorObservation, BehaviorResult
+from .bootstrap import ModelBootstrap
 from .features import FeatureVector, extract_all
 from .flows import Flow, FlowTable, group_by_source
 from .fusion import Assessment, assess
@@ -89,7 +90,12 @@ class AnalysisEngine:
                  on_alert: Callable[[Alert], None] | None = None,
                  on_flows: Callable[[Sequence[Flow]], None] | None = None,
                  max_flows: int = 20_000,
-                 anomaly_cooldown: float = DEFAULT_ANOMALY_COOLDOWN):
+                 anomaly_cooldown: float = DEFAULT_ANOMALY_COOLDOWN,
+                 db_path=None, autotrain: bool = False,
+                 bootstrap_min_seconds: float = 600.0,
+                 bootstrap_min_samples: int = 1000,
+                 retrain_seconds: float = 86_400.0,
+                 max_training_samples: int = 20_000):
         self.window_seconds = max(1.0, float(window_seconds))
         self.on_alert = on_alert
         self.on_flows = on_flows
@@ -108,6 +114,20 @@ class AnalysisEngine:
         self.model = AnomalyEngine(model_dir, window_seconds=self.window_seconds)
         self.profiler = profiler or AdaptiveBehaviorProfiler(sample_interval=0.0)
 
+        # Automatic model bootstrap. Needs somewhere to persist its vetted
+        # corpus, so it is only active when the caller supplies the sensor's
+        # database; without one the engine behaves exactly as it did before.
+        self.bootstrap = ModelBootstrap(
+            engine=self.model,
+            db_path=db_path,
+            window_seconds=self.window_seconds,
+            enabled=bool(autotrain and db_path is not None),
+            min_seconds=bootstrap_min_seconds,
+            min_samples=bootstrap_min_samples,
+            retrain_seconds=retrain_seconds,
+            max_samples=max_training_samples,
+        ) if db_path is not None else None
+
         self._state_lock = threading.Lock()
         self._pending_rules: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
         self._baselines: OrderedDict[str, BehaviorResult] = OrderedDict()
@@ -125,6 +145,10 @@ class AnalysisEngine:
 
     def start(self) -> None:
         self.model.load()  # never raises; unavailable is a valid state
+        if self.bootstrap is not None:
+            # After load(), so an existing model is reported ACTIVE rather than
+            # the sensor announcing a bootstrap it does not need.
+            self.bootstrap.start()
         with self._state_lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -146,6 +170,10 @@ class AnalysisEngine:
             thread.join(max(0.0, float(timeout)))
         with self._state_lock:
             self._thread = None
+        if self.bootstrap is not None:
+            # Flushes whatever clean samples this run collected, so a restart
+            # resumes from them instead of discarding the observation period.
+            self.bootstrap.stop(timeout=timeout)
 
     def _run(self) -> None:
         # Wake more often than the window so expiry is timely, but only do work
@@ -168,6 +196,11 @@ class AnalysisEngine:
         """Remember deterministic findings so the next cycle can fuse them."""
         if not alerts:
             return
+        if self.bootstrap is not None:
+            # A rule that fires late in a window is fused into the *next* one,
+            # so the window it actually fired during would otherwise look clean
+            # to the training filter. Hold the source out for a few windows.
+            self.bootstrap.note_rule_finding(source, time.monotonic())
         with self._state_lock:
             bucket = self._pending_rules.setdefault(source, [])
             bucket.extend(a.as_dict() for a in alerts)
@@ -212,6 +245,17 @@ class AnalysisEngine:
             assessments.append(result)
             if result.actionable:
                 self._emit(result, vector, now)
+            elif self.bootstrap is not None:
+                # Only windows every layer found unremarkable are offered to
+                # the training corpus; the filter itself lives in bootstrap.py
+                # and reads this assessment rather than re-deciding it.
+                self.bootstrap.observe(vector, result, now)
+
+        if self.bootstrap is not None:
+            self.bootstrap.flush()
+            # Cheap when the conditions are not met; when they are, the fit
+            # runs on its own thread and this returns immediately.
+            self.bootstrap.maybe_train()
 
         window = WindowResult(
             started_at=utc_now(),
@@ -356,6 +400,9 @@ class AnalysisEngine:
             "window_seconds": self.window_seconds,
             "flows": flow_metrics,
             "model": self.model.status(),
+            "bootstrap": (self.bootstrap.status() if self.bootstrap is not None
+                          else {"state": "NO_MODEL", "enabled": False,
+                                "reason": "automatic training needs a database path"}),
             **state,
         }
 

@@ -17,7 +17,8 @@ HTML = ROOT / "nemos" / "templates" / "index.html"
 JS = ROOT / "nemos" / "static" / "app.js"
 CSS = ROOT / "nemos" / "static" / "app.css"
 
-VIEWS = ("overview", "incidents", "detections", "hosts", "attack", "sensor")
+VIEWS = ("overview", "incidents", "detections", "hosts", "network",
+         "attack", "analytics", "sensor", "settings")
 
 
 def test_every_scripted_id_exists_in_the_markup():
@@ -62,7 +63,7 @@ def test_every_view_has_a_route_a_section_and_a_title():
 def test_hidden_attribute_is_honoured():
     """Every toggled element sets its own display, so [hidden] must outrank them.
 
-    Without this rule all six views, the drawer and the palette paint at once --
+    Without this rule all nine views, the drawer and the palette paint at once --
     which is exactly what happened before it was added.
     """
     assert re.search(r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important", CSS.read_text())

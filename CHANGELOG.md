@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The ML anomaly model bootstraps itself.** A sensor with no model starts
+  normally, reports `WARMING_UP`, and trains its own Isolation Forest once it
+  has observed enough traffic. `python tools/train_model.py` is no longer
+  required to get ML scoring, and still works unchanged. Before this, the ML
+  layer was inert on every deployment where nobody ran it by hand.
+- Training data is vetted, not collected blindly. A window enters the corpus
+  only when `fusion.assess` returned `NO_FINDING` for that source — no rule
+  fired, the baseline is not deviating, any loaded model scored it NORMAL — and
+  a source is held out for several windows after any deterministic finding,
+  because a rule firing late in a window is fused into the next one. The filter
+  reads the existing detection layers rather than reimplementing them.
+- Two independent thresholds gate the first fit (`NEMOS_ML_BOOTSTRAP_MIN_SAMPLES`
+  and `NEMOS_ML_BOOTSTRAP_MIN_SECONDS`). A sample count alone is satisfied by one
+  quiet minute repeated, which fits a cloud that genuinely unusual traffic can
+  land inside.
+- Bounded periodic retraining (`NEMOS_ML_RETRAIN_SECONDS`, daily by default, `0`
+  to disable). The active model keeps scoring throughout and a replacement is
+  promoted only after it validates; a failed refit leaves the working model
+  untouched.
+- New settings: `NEMOS_ML_AUTOTRAIN`, `NEMOS_ML_BOOTSTRAP_MIN_SECONDS`,
+  `NEMOS_ML_BOOTSTRAP_MIN_SAMPLES`, `NEMOS_ML_RETRAIN_SECONDS`,
+  `NEMOS_ML_MAX_SAMPLES`.
+- The Sensor page shows the model lifecycle with measured progress — sample
+  count, observation period, windows excluded — and lists all three detection
+  layers, so "no model" cannot be misread as "no detection".
+
+### Changed
+
+- `AnomalyEngine.load` is split into `check` (pure validation: schema, feature
+  names, aggregation window) and `install` (a single locked swap of estimator
+  and calibration). Retraining validates a candidate before promoting it, so a
+  rejected model cannot cost the sensor the one it is already scoring with.
+- New `ml_training_samples` table in the existing database, scoped to the
+  current window and feature schema. A restart resumes the observation period
+  rather than discarding it; changing `NEMOS_ANALYSIS_WINDOW` invalidates the
+  corpus rather than mixing incompatible feature scales.
+
+### Fixed
+
+- The bootstrap's cached sample count was not invalidated on write, so under a
+  fast window cadence the training trigger could read a total that never grew —
+  a bootstrap that silently never fires. Found by running it, not by reading it.
+
 ## 4.1.0
 
 Detection coverage, a rebuilt interface, and two defects found by testing the

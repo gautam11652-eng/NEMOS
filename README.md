@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 666 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 697 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -225,6 +225,11 @@ cannot catch. See [Deployment](#deployment).
 | `NEMOS_MAX_EVENTS` | `1000` | Events retained per source for the rules. Detection cost per packet is linear in this — see [Performance](#performance) |
 | `NEMOS_PERSIST_FLOWS` | `true` | Store aggregated flows in SQLite |
 | `NEMOS_MODEL_DIR` | `data/model` | Where the trained model is loaded from |
+| `NEMOS_ML_AUTOTRAIN` | `true` | Let the sensor train its own model from vetted-normal traffic |
+| `NEMOS_ML_BOOTSTRAP_MIN_SAMPLES` | `1000` | Clean windows required before the first fit (floor: 50) |
+| `NEMOS_ML_BOOTSTRAP_MIN_SECONDS` | `600` | Observation period required before the first fit |
+| `NEMOS_ML_RETRAIN_SECONDS` | `86400` | Refit cadence once a model is active; `0` disables retraining |
+| `NEMOS_ML_MAX_SAMPLES` | `20000` | Bound on the stored training corpus |
 
 ### Optional LLM analyst
 
@@ -536,9 +541,68 @@ being assigned a technique it does not evidence.
 
 ## Training the model
 
-Training is a deliberate, out-of-band operator action. A sensor that retrained
-itself on live traffic would learn to accept whatever it is currently seeing —
-including an attack in progress.
+You do not have to. Start NEMOS, point it at authorized traffic, and it trains
+its own model. The manual command below still works and is still the right tool
+for training from a specific captured period.
+
+### Automatic bootstrap (default)
+
+A sensor with no model starts normally and reports `WARMING_UP`. Deterministic
+rules and the statistical baseline run exactly as they always did — the model
+is the third layer, not the load-bearing one.
+
+While it warms up, NEMOS collects feature windows for its training corpus, and
+this is the part that matters:
+
+**It only keeps windows every detection layer judged unremarkable.** A window
+enters the corpus when the fused assessment for that source came back
+`NO_FINDING`: no deterministic rule fired, the statistical baseline is not
+deviating, and any model already loaded scored it in the NORMAL band. There is
+no second detection implementation involved — the filter reads the existing
+one. A source is additionally held out for a few windows after any rule
+finding, because a detection raised late in a window is fused into the next
+one. So a sensor bootstrapping through a port scan does not learn that port
+scanning is normal; it learns from the windows around it and excludes the scan.
+
+**It will not train on volume alone.** A sample count is satisfied by one quiet
+minute repeated, which teaches an Isolation Forest nothing and lets genuinely
+unusual traffic land inside its notion of normal. Both
+`NEMOS_ML_BOOTSTRAP_MIN_SAMPLES` and `NEMOS_ML_BOOTSTRAP_MIN_SECONDS` must be
+satisfied, on top of the distinct-row floor training enforces anyway.
+
+When both hold, NEMOS fits a model **on a background thread** — packet capture
+and the analysis loop are never blocked — validates it against the live feature
+contract (schema version, feature names, and the aggregation window), promotes
+it with an atomic file replacement and activates it. The Sensor page shows the
+state throughout.
+
+The corpus lives in the sensor's own SQLite database, so restarting resumes
+from the samples already collected rather than beginning the observation period
+again.
+
+Once a model is active, NEMOS refits it every `NEMOS_ML_RETRAIN_SECONDS` from
+newly collected clean traffic. This is a *bounded* refit on a vetted corpus, not
+continuous online learning: **the active model keeps scoring the whole time, and
+a replacement is only promoted after it validates.** If a refit fails for any
+reason, the working model is untouched and the sensor says so.
+
+Set `NEMOS_ML_AUTOTRAIN=false` to keep training a manual operation.
+
+### The honest limits of this
+
+Automatic training narrows a real gap — before it, most deployments simply never
+had a model — but it is not a free upgrade:
+
+- A network that is already compromised when NEMOS is first deployed can have
+  that compromise represented in its idea of normal, if the traffic is steady
+  enough that no rule and no baseline ever flags it. Vetting excludes what NEMOS
+  *detects*; it cannot exclude what NEMOS never noticed.
+- Retraining follows a network as it changes, which is the point, and also means
+  a slow enough change is followed rather than flagged. The daily default is a
+  deliberate trade; `NEMOS_ML_RETRAIN_SECONDS=0` opts out.
+- It is bootstrapping, not self-supervision. Nothing here evaluates whether the
+  resulting model is *good* — no accuracy, precision or recall is computed or
+  claimed, because nothing labelled exists to compute them against.
 
 ### From your own captured traffic (recommended)
 
@@ -845,7 +909,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 666 tests
+python -m pytest -q                              # 697 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit

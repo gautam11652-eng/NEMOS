@@ -45,6 +45,14 @@ class Settings:
     max_flows: int = 20_000
     persist_flows: bool = True
     model_dir: Path | None = None
+    # Automatic ML bootstrap. The sensor trains its own model from traffic it
+    # has already judged unremarkable, so an operator never has to run the
+    # training CLI by hand. See nemos/bootstrap.py for the vetting rules.
+    ml_autotrain: bool = True
+    ml_bootstrap_min_seconds: float = 600.0
+    ml_bootstrap_min_samples: int = 1000
+    ml_retrain_seconds: float = 86_400.0
+    ml_max_samples: int = 20_000
     # Sensor watchdog: 0 disables the silence check (see nemos/watchdog.py
     # for why that one is opt-in rather than on by default).
     heartbeat_seconds: float = 0.0
@@ -89,6 +97,20 @@ def load_settings(base: Path | None = None) -> Settings:
         _int("NEMOS_MAX_FLOWS", 20_000, 100, 1_000_000),
         _bool("NEMOS_PERSIST_FLOWS", True),
         Path(os.getenv("NEMOS_MODEL_DIR", str(data/"model"))).expanduser(),
+        _bool("NEMOS_ML_AUTOTRAIN", True),
+        # Both conditions must hold before the first fit. The sample count
+        # alone is satisfied by one quiet minute repeated; the wall-clock
+        # period is what makes the corpus span real variation.
+        _float("NEMOS_ML_BOOTSTRAP_MIN_SECONDS", 600.0, 0.0, 2_592_000.0),
+        # Floor is ml.MIN_TRAINING_SAMPLES: below it training is refused
+        # outright, so a lower setting would only schedule a guaranteed failure.
+        _int("NEMOS_ML_BOOTSTRAP_MIN_SAMPLES", 1000, 50, 1_000_000),
+        # 0 disables retraining; the first model then stays until replaced by
+        # hand. Daily by default -- often enough to follow a network that
+        # changes, rare enough that a slow drift into accepting an intrusion
+        # would have to persist for days to take hold.
+        _float("NEMOS_ML_RETRAIN_SECONDS", 86_400.0, 0.0, 31_536_000.0),
+        _int("NEMOS_ML_MAX_SAMPLES", 20_000, 100, 2_000_000),
         _float("NEMOS_HEARTBEAT_SECONDS", 0.0, 0.0, 86_400.0),
         _float("NEMOS_WATCHDOG_POLL_SECONDS", 15.0, 5.0, 300.0),
     )
