@@ -60,6 +60,7 @@ extraction and model inference can never add latency to packet capture.
 | `nemos/detector.py` | Deterministic rules over bounded sliding windows; owns incident correlation |
 | `nemos/flows.py` | Unidirectional flow aggregation, bounded with O(1) LRU eviction |
 | `nemos/features.py` | 24 numeric features per source per window; no ML dependency |
+| `nemos/tls.py` | TLS handshake parsing and JA3/JA3S fingerprinting; no scapy dependency |
 | `nemos/ml.py` | Isolation Forest: training, persistence, calibration, validation, scoring |
 | `nemos/bootstrap.py` | Automatic model lifecycle: vetted-normal corpus, background training, validation, promotion |
 | `nemos/fusion.py` | Transparent combination of rules, baseline and ML into one risk |
@@ -284,6 +285,41 @@ What this is not: it computes no accuracy, precision or recall, and claims
 none — nothing labelled exists to compute them against. It also cannot exclude
 what NEMOS never detected in the first place; vetting filters what the sensor
 *flagged*.
+
+## Encrypted traffic
+
+`tls.py` reads the one part of a TLS session that is not encrypted. Before a
+session key exists the peers negotiate in cleartext, and that negotiation —
+versions, ciphers, extensions, curves — is a property of the client software
+rather than of the user. JA3 hashes it into something comparable.
+
+Three decisions are worth recording:
+
+- **GREASE is stripped before hashing.** RFC 8701 has clients inject reserved
+  values into these lists on purpose, and Chrome picks different ones every
+  connection. Hashing them as they arrive gives the same browser a new
+  fingerprint per connection, so fingerprints would never match and the feature
+  would be actively misleading rather than merely useless. A test pins this,
+  because nothing else would catch its loss: the parser would still return a
+  hash, and it would still look like a hash.
+- **The record header decides what gets parsed, not the port.** A handshake is
+  recognised by its own bytes, so TLS speaking somewhere it has no business
+  speaking is fingerprinted like any other — which is exactly the traffic worth
+  fingerprinting.
+- **Every length is attacker-controlled and the parser runs on the capture
+  thread.** Reads are bounds-checked against the bytes actually present, list
+  lengths are capped, and only a bounded prefix is examined. Malformed input
+  returns None; it never raises, because an exception per packet on that thread
+  is dropped traffic.
+
+Application data is never parsed. NEMOS does not decrypt, proxy, or hold a key,
+so the claim that it does not inspect encrypted payloads remains exactly true —
+what it now also reads is the unencrypted negotiation in front of them.
+
+Fingerprints reach findings as evidence rather than as verdicts. No list of
+known-malicious hashes is shipped: such lists go stale, collide with the stock
+TLS stacks that legitimate software also uses, and would assert a detection
+quality that cannot be validated here.
 
 ## Fusion
 

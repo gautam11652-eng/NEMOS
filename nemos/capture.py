@@ -4,6 +4,7 @@ import logging
 import threading
 
 from .models import TrafficEvent, utc_now
+from .tls import MAX_HANDSHAKE_BYTES, parse_hello
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +63,41 @@ def ndp_binding(ip_layer, icmp6):
             return None, None
         claimed = source
     return (str(claimed) if claimed else None), mac
+
+
+def tcp_payload(layer) -> bytes:
+    """The bytes a TCP segment carries, or b"" if it carries none.
+
+    Bounded at the handshake cap: NEMOS reads the front of a segment to
+    recognise a TLS handshake and never more, so a large transfer costs the
+    same as a small one here.
+    """
+    payload = getattr(layer, "payload", None)
+    if payload is None or not payload:
+        return b""
+    try:
+        return bytes(payload)[:MAX_HANDSHAKE_BYTES]
+    except Exception:
+        # A layer scapy could not serialise is not worth an exception on the
+        # capture thread.
+        return b""
+
+
+def tls_metadata(layer) -> dict:
+    """Fingerprint a TLS handshake carried by this segment, if it is one.
+
+    Deliberately keyed on the TLS record header rather than on port 443. TLS
+    speaking on a port it has no business speaking on is exactly the traffic
+    worth fingerprinting, and a port test would miss all of it.
+
+    Only the ClientHello/ServerHello is read. Everything after the handshake
+    is ciphertext and is never touched.
+    """
+    payload = tcp_payload(layer)
+    if not payload:
+        return {}
+    hello = parse_hello(payload)
+    return hello.as_dict() if hello is not None else {}
 
 
 def icmpv6_layer(packet):
@@ -263,11 +299,13 @@ class PacketCapture:
         ndp_claim = ndp_mac = None
         # TCP and UDP are the same scapy layers over either family, so every
         # port-based rule applies to v6 without change.
+        tls: dict = {}
         if packet.haslayer(TCP):
             layer = packet[TCP]
             proto = ptype = "TCP"
             sp, dp = int(layer.sport), int(layer.dport)
             flags = str(layer.flags)
+            tls = tls_metadata(layer)
         elif packet.haslayer(UDP):
             layer = packet[UDP]
             proto = ptype = "DNS" if packet.haslayer(DNS) else "UDP"
@@ -286,6 +324,7 @@ class PacketCapture:
         if ndp_claim and ndp_mac:
             metadata["claimed"] = ndp_claim
             metadata["mac"] = ndp_mac
+        metadata.update(tls)
         return TrafficEvent(
             utc_now(), str(ip.src), str(ip.dst), proto, sp, dp, len(packet),
             flags, interface, metadata=metadata,

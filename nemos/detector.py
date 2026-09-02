@@ -63,6 +63,13 @@ class DetectionConfig:
     slow_eval_interval: float = 30.0
     slow_max_sources: int = 1024
     slow_max_tracked: int = 256
+    # TLS handshake fingerprinting. The handshake is the only unencrypted part
+    # of a TLS session, and what it discloses is a property of the client
+    # software rather than of the user -- see nemos/tls.py.
+    tls_horizon: float = 900.0
+    tls_max_fingerprints: int = 6
+    tls_odd_port_handshakes: int = 3
+    tls_max_tracked: int = 16
     cooldown: int = 30
     correlation_window: int = 60
     max_sources: int = 4096
@@ -139,6 +146,14 @@ class DetectionConfig:
                 "NEMOS_DETECT_NONSTANDARD_PACKETS", defaults.nonstandard_packets, 5, 1_000_000),
             nonstandard_min_port=integer(
                 "NEMOS_DETECT_NONSTANDARD_MIN_PORT", defaults.nonstandard_min_port, 1024, 65_535),
+            tls_horizon=real(
+                "NEMOS_DETECT_TLS_HORIZON", defaults.tls_horizon, 60.0, 86_400.0),
+            tls_max_fingerprints=integer(
+                "NEMOS_DETECT_TLS_MAX_FINGERPRINTS", defaults.tls_max_fingerprints, 2, 512),
+            tls_odd_port_handshakes=integer(
+                "NEMOS_DETECT_TLS_ODD_PORT_HANDSHAKES", defaults.tls_odd_port_handshakes, 1, 10_000),
+            tls_max_tracked=integer(
+                "NEMOS_DETECT_TLS_MAX_TRACKED", defaults.tls_max_tracked, 2, 1_024),
             beacon_min_intervals=integer(
                 "NEMOS_DETECT_BEACON_MIN_INTERVALS", defaults.beacon_min_intervals, 3, 1000),
             beacon_max_jitter=real(
@@ -200,6 +215,16 @@ def _flag_class(flags: str) -> str | None:
     if {"F", "P", "U"} <= marks and "S" not in marks and "A" not in marks:
         return "xmas"
     return None
+
+
+#: Ports where finding TLS is unremarkable -- HTTPS, submission, IMAPS, POP3S,
+#: LDAPS, DoT, SIP-TLS and the common alternate HTTPS ports. Deliberately
+#: generous: the rule below exists to catch TLS somewhere it has no business
+#: being, not to flag every service that is not on 443.
+TLS_EXPECTED_PORTS = frozenset({
+    443, 465, 563, 587, 636, 853, 989, 990, 993, 995, 1443, 2376,
+    4433, 5061, 5223, 5986, 6697, 8443, 9443, 10443,
+})
 
 
 class ThreatDetector:
@@ -302,10 +327,101 @@ class ThreatDetector:
             max_sources=self.cfg.slow_max_sources,
             max_tracked=self.cfg.slow_max_tracked,
         )
+        # TLS handshakes seen per source: which client software it presented,
+        # and where it spoke TLS on a port that is not a TLS port. Keyed by
+        # source address, so bounded and evicted least-recently-used like every
+        # other attacker-keyed map in this class.
+        self.tls: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._private_cache: OrderedDict[str, bool] = OrderedDict()
         self.internal_networks = self._parse_networks(
             os.getenv("NEMOS_INTERNAL_NETWORKS", "")
         ) or [ipaddress.ip_network(n) for n in self.DEFAULT_INTERNAL_NETWORKS]
+
+    def _observe_tls(self, e: TrafficEvent, now: float) -> None:
+        """Record which client software a source presented, and where.
+
+        Cheap by construction: the fingerprint was computed once in the capture
+        parse path, and this only files it. Every map is bounded because the
+        source address, the fingerprint and the port are all attacker-chosen.
+        """
+        profile = self.tls.get(e.source)
+        if profile is None:
+            # `reported` is None rather than 0.0 until this source has actually
+            # been reported. Seeding it with 0.0 made the cooldown below read
+            # "now - 0.0 >= horizon", which is false until the monotonic clock
+            # passes the horizon -- so the rule silently never fired under
+            # replay, and in production only fired by accident of uptime.
+            profile = {"fingerprints": OrderedDict(), "names": OrderedDict(),
+                       "odd_ports": OrderedDict(), "reported": None}
+            self.tls[e.source] = profile
+        self.tls.move_to_end(e.source)
+        while len(self.tls) > self.cfg.max_sources:
+            self.tls.popitem(last=False)
+
+        ja3 = str(e.metadata.get("ja3", ""))[:32]
+        if ja3:
+            profile["fingerprints"][ja3] = now
+            profile["fingerprints"].move_to_end(ja3)
+            while len(profile["fingerprints"]) > self.cfg.tls_max_tracked:
+                profile["fingerprints"].popitem(last=False)
+
+        sni = str(e.metadata.get("sni", ""))[:253]
+        if sni:
+            profile["names"][sni] = now
+            profile["names"].move_to_end(sni)
+            while len(profile["names"]) > self.cfg.tls_max_tracked:
+                profile["names"].popitem(last=False)
+
+        port = e.destination_port
+        if port is not None and int(port) not in TLS_EXPECTED_PORTS:
+            key = (e.destination, int(port))
+            entry = profile["odd_ports"].get(key)
+            profile["odd_ports"][key] = (
+                (entry[0] + 1, now) if entry else (1, now)
+            )
+            profile["odd_ports"].move_to_end(key)
+            while len(profile["odd_ports"]) > self.cfg.tls_max_tracked:
+                profile["odd_ports"].popitem(last=False)
+
+    def _fresh_fingerprints(self, source: str, now: float) -> list[str]:
+        """Fingerprints this source presented inside the TLS horizon."""
+        profile = self.tls.get(source)
+        if not profile:
+            return []
+        cutoff = now - self.cfg.tls_horizon
+        return [f for f, seen in profile["fingerprints"].items() if seen >= cutoff]
+
+    def tls_evidence(self, source: str, now: float | None = None) -> dict[str, Any]:
+        """The TLS software a source was last seen using.
+
+        Attached to findings about that source so an encrypted-channel
+        detection carries something huntable: a JA3 can be pivoted on across
+        other tooling and public corpora, where "talked to 1.2.3.4" cannot.
+        """
+        now = time.monotonic() if now is None else now
+        fingerprints = self._fresh_fingerprints(source, now)
+        if not fingerprints:
+            return {}
+        profile = self.tls[source]
+        evidence: dict[str, Any] = {
+            "ja3": fingerprints[-6:],
+            "distinct_fingerprints": len(fingerprints),
+        }
+        if profile["names"]:
+            evidence["sni"] = list(profile["names"])[-6:]
+        if len(fingerprints) >= self.cfg.tls_max_fingerprints:
+            # Reported as context, never as its own finding. A workstation
+            # speaks TLS with a small stable set of client software, so a long
+            # list is worth an analyst's attention -- but behind NAT one
+            # address aggregates every host behind it and reaches this
+            # legitimately, which is not a confidence this rule could earn on
+            # its own. It strengthens a finding; it does not make one.
+            evidence["fingerprint_diversity"] = (
+                f"{len(fingerprints)} distinct TLS client fingerprints from this "
+                f"address in {int(self.cfg.tls_horizon)}s; unusual for a single "
+                f"host, ordinary for a NAT gateway"
+            )
+        return evidence
 
     @staticmethod
     def _parse_networks(raw: str) -> list[Any]:
@@ -359,6 +475,11 @@ class ThreatDetector:
         # 160us/packet, against 5us before the rules were added. Detection runs
         # inline on the capture thread, so that is dropped traffic, not just a
         # slow dashboard.
+        # TLS handshakes arrive as metadata from the capture path; recording
+        # them is a dict update, not parsing -- nemos/tls.py already did that.
+        if e.metadata and "ja3" in e.metadata:
+            self._observe_tls(e, now)
+
         agg = self._aggregate(bucket, e.source)
         ports = agg["ports"]
         scan_ports = agg["scan_ports"]
@@ -794,6 +915,41 @@ class ThreatDetector:
                         },
                     )
 
+        # --- TLS speaking where TLS does not belong ----------------------------
+        # A handshake is unmistakable, so unlike the port-volume rule below
+        # this one knows the traffic is really TLS. Tunnelling a C2 channel
+        # over TLS on an unexpected port is the point of T1571, and the
+        # fingerprint makes the finding huntable rather than merely alarming.
+        profile = self.tls.get(e.source)
+        if profile:
+            cutoff = now - self.cfg.tls_horizon
+            for (dst, port), (count, seen) in list(profile["odd_ports"].items()):
+                if seen < cutoff or count < self.cfg.tls_odd_port_handshakes:
+                    continue
+                if self._private(dst):
+                    # Internal services on odd ports are ordinary; this rule is
+                    # about a channel leaving the network.
+                    continue
+                fingerprints = self._fresh_fingerprints(e.source, now)
+                add(
+                    "TLS_ON_UNEXPECTED_PORT", "COMMAND_AND_CONTROL",
+                    68, f"{count} TLS handshakes to {dst} on port {port}, "
+                        f"which is not a TLS port",
+                    "T1571", confidence=60,
+                    packets=count, destinations=1, ports=1,
+                    evidence={
+                        "destination": dst,
+                        "port": port,
+                        "handshakes": count,
+                        "ja3": fingerprints[-4:],
+                        "sni": list(profile["names"])[-4:],
+                        "note": "the handshake is unencrypted, so this is "
+                                "confirmed TLS rather than inferred from the "
+                                "port; the session contents are not read",
+                    },
+                )
+                profile["odd_ports"].pop((dst, port), None)
+
         # --- Non-standard port communication -----------------------------------
         # Sustained traffic to one external host on a high, unregistered port.
         # Weak alone, which is why its confidence is low and it names the port.
@@ -1169,6 +1325,23 @@ class ThreatDetector:
         if confidence < self.cfg.min_confidence:
             return None
         incident_id = self._incident_for(source, now)
+
+        # Attach the TLS client software this source was last seen using, to
+        # findings where it changes what an analyst can do next. A
+        # command-and-control finding that carries a JA3 can be pivoted on --
+        # across this network, across other tooling, across public corpora --
+        # where "talked to 203.0.113.9" leads nowhere. Added here rather than
+        # in each rule so every C2 finding gets it, and only where the source
+        # actually presented a handshake.
+        if category == "COMMAND_AND_CONTROL":
+            tls = self.tls_evidence(source, now)
+            if tls:
+                evidence = dict(kw.get("evidence") or {})
+                # Never overwrite what the rule itself established.
+                for field, value in tls.items():
+                    evidence.setdefault(f"client_{field}" if field in evidence else field, value)
+                kw["evidence"] = evidence
+
         return Alert(
             utc_now(), threat, category, source, severity, score, confidence, reason,
             window_seconds=self.cfg.window, technique=technique,

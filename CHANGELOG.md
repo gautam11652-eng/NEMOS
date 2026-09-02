@@ -4,6 +4,40 @@
 
 ### Added
 
+- **TLS handshake fingerprinting (JA3/JA3S)**, closing the blind spot every
+  metadata-only sensor has. The handshake is sent in cleartext before a session
+  key exists, and what it discloses — versions, ciphers, extensions, curves —
+  identifies the client *software*. Application data is never parsed and
+  nothing is decrypted, so the existing claim that encrypted payloads are not
+  inspected remains exactly true; the README now states the distinction rather
+  than leaving "metadata-only" to imply more than it should.
+- GREASE (RFC 8701) is stripped before hashing. Without it Chrome produces a
+  different fingerprint on every connection, which makes JA3 actively
+  misleading rather than merely useless. A test pins the property because
+  nothing else would catch its loss.
+- Handshakes are recognised by the TLS record header rather than by port, so
+  TLS on a port it has no business using is fingerprinted like any other.
+- New finding `TLS_ON_UNEXPECTED_PORT` (T1571): confirmed handshakes to an
+  external host on a non-TLS port. Unlike the port-volume rule beside it, this
+  knows the traffic really is TLS.
+- Fingerprints and SNI are attached as evidence to every command-and-control
+  finding — a beaconing alert carrying a JA3 can be pivoted on, where a
+  destination address cannot.
+- New settings: `NEMOS_DETECT_TLS_HORIZON`, `NEMOS_DETECT_TLS_MAX_FINGERPRINTS`,
+  `NEMOS_DETECT_TLS_ODD_PORT_HANDSHAKES`, `NEMOS_DETECT_TLS_MAX_TRACKED`.
+
+### Deliberately not added
+
+- **No list of known-malicious JA3 hashes.** They go stale, they collide with
+  the stock Go and Python TLS stacks that legitimate software also uses, and
+  shipping one would assert a detection quality that could not be validated
+  here. The fingerprint is recorded so an analyst can pivot on it.
+- **No standalone fingerprint-churn alert.** A host presenting many distinct
+  TLS stacks is worth attention, but behind NAT one address aggregates every
+  host behind it and reaches any threshold honestly. It could not earn a
+  confidence above the detector's floor without inflating the number, so it is
+  evidence on other findings instead of a finding of its own.
+
 - **The ML anomaly model bootstraps itself.** A sensor with no model starts
   normally, reports `WARMING_UP`, and trains its own Isolation Forest once it
   has observed enough traffic. `python tools/train_model.py` is no longer
