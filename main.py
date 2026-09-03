@@ -10,7 +10,12 @@ from nemos.analysis import AnalysisEngine
 from nemos.analyst import Analyst, AnalystConfig
 from nemos.api import create_app
 from nemos.bot import DailyBrief, TelegramBot
-from nemos.capture import PacketCapture
+from nemos.capture import (
+    STATE_BLOCKED as CAPTURE_BLOCKED,
+    STATE_ERROR as CAPTURE_ERROR,
+    STATE_NO_INTERFACE as CAPTURE_NO_INTERFACE,
+    PacketCapture,
+)
 from nemos.config import load_settings
 from nemos.database import initialize
 from nemos.detector import DetectionConfig, ThreatDetector
@@ -201,10 +206,20 @@ def main() -> int:
     try:
         if capture is not None:
             capture.start()
-            log.info(
-                "capture enabled%s",
-                f" on {settings.interface}" if settings.interface else "",
-            )
+            state = capture.status()
+            if state["display_state"] in (CAPTURE_BLOCKED, CAPTURE_NO_INTERFACE,
+                                          CAPTURE_ERROR):
+                # start() has already logged the reason and the fix. Repeat the
+                # headline so an operator scrolling a busy startup log cannot
+                # miss that nothing is being captured.
+                log.error("capture is %s -- NEMOS will record no packets",
+                          state["display_state"])
+            else:
+                log.info(
+                    "capture started on %s (interfaces found: %s)",
+                    settings.interface or "all interfaces",
+                    ", ".join(state.get("interfaces") or []) or "unknown",
+                )
         else:
             log.info("capture disabled")
         watchdog.start()

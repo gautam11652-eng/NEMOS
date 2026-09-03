@@ -81,6 +81,24 @@ extraction and model inference can never add latency to packet capture.
 | `nemos/watchdog.py` | Detects a dead capture thread and pings systemd's own watchdog |
 | `nemos/api.py` | The Flask application: JSON API, auth, security headers |
 
+### Capture states
+
+The internal lifecycle and what an operator is shown are deliberately separate
+questions. The lifecycle answers "which branch of `_run` are we in"; the
+operator needs "is traffic reaching the detector, and if not, whose problem is
+it". `PacketCapture.display_state` maps one onto the other, and the mapping has
+one rule worth stating: `ONLINE` requires a packet, never a successful bind. A
+sensor pointed at the wrong interface opens its socket perfectly and sees
+nothing forever, and calling that online is how a deployment sits blind.
+
+`preflight()` runs before the thread starts, so a hopeless configuration is
+reported as itself rather than as a thread that dies a moment later for reasons
+nobody can see. It checks the backend, then the interface, then privileges --
+in that order, because a missing Scapy makes the other two unanswerable. The
+privilege check opens a real `AF_PACKET` socket and closes it: a capability bit
+is a claim, a socket is proof, and seccomp, AppArmor or a container's network
+mode can each refuse a process that holds `CAP_NET_RAW` on paper.
+
 ## Detection
 
 Detection has three independent layers, kept distinguishable in the data model,

@@ -68,6 +68,10 @@ class MainLifecycleTests(unittest.TestCase):
         fake_api.create_app = lambda *a, **k: object()
         fake_capture = types.ModuleType("nemos.capture")
         fake_capture.PacketCapture = object
+        fake_capture.STATE_BLOCKED = "BLOCKED"
+        fake_capture.STATE_ERROR = "ERROR"
+        fake_capture.STATE_NO_INTERFACE = "NO INTERFACE"
+        fake_capture.STATE_OFF = "OFF"
         fake_config = types.ModuleType("nemos.config")
         fake_config.load_settings = lambda base=None: fake_settings
         fake_database = types.ModuleType("nemos.database")

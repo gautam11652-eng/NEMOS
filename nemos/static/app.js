@@ -82,10 +82,28 @@ const SEV_CLASS = { CRITICAL: "sev-crit", HIGH: "sev-high", MEDIUM: "sev-med", L
 const SEV_RANK = { CRITICAL: 3, HIGH: 2, MEDIUM: 1, LOW: 0 };
 
 /* Capture states arrive as machine tokens; a card needs a word, not a token. */
+/* The sensor reports its own operator-facing state (nemos/capture.py), which is
+ * the one the dashboard shows. This map covers the internal lifecycle names for
+ * an older sensor, or a state the backend has not classified.
+ *
+ * "Live" is never inferred here. The backend only says ONLINE once a packet has
+ * actually arrived, because a sensor bound to the wrong interface opens its
+ * socket perfectly and then sees nothing. */
 const CAPTURE_LABEL = {
   running: "Live", starting: "Starting", stopped: "Stopped", failed: "Failed",
   permission_denied: "Blocked", unavailable: "Unavailable",
   not_configured: "Off", error: "Failed",
+};
+
+/* Operator-facing capture states, as words rather than shouted constants. */
+const CAPTURE_STATE_LABEL = {
+  ONLINE: "Live", "NO TRAFFIC": "No traffic", BLOCKED: "Blocked",
+  "NO INTERFACE": "No interface", ERROR: "Failed", STARTING: "Starting",
+  OFF: "Off",
+};
+const CAPTURE_TONE = {
+  ONLINE: "ok", "NO TRAFFIC": "warn", BLOCKED: "bad", "NO INTERFACE": "bad",
+  ERROR: "bad", STARTING: "warn", OFF: "warn",
 };
 
 /* ML lifecycle states as nemos/bootstrap.py reports them. ACTIVE is only ever
@@ -181,8 +199,12 @@ const threatLabel = (v) => String(v ?? "").split("_").filter(Boolean).map((word,
   return i === 0 ? lower.charAt(0).toUpperCase() + lower.slice(1) : lower;
 }).join(" ");
 
-const captureLabel = (c) => (c?.running ? "Live"
-  : CAPTURE_LABEL[String(c?.state || "").toLowerCase()] || "Off");
+const captureLabel = (c) => (
+  CAPTURE_STATE_LABEL[String(c?.display_state || "")]
+  ?? (c?.running ? "Live" : CAPTURE_LABEL[String(c?.state || "").toLowerCase()] || "Off"));
+
+const captureTone = (c) => CAPTURE_TONE[String(c?.display_state || "")]
+  ?? (c?.running ? "ok" : c?.error ? "bad" : "warn");
 
 function evidenceOf(alert) {
   let evidence = alert?.evidence;
@@ -1163,16 +1185,26 @@ function renderSensor(data, status) {
   const analysis = status.analysis || {};
   const flows = analysis.flows || {};
 
+  // A failure state that does not say what to do about it just relocates the
+  // problem to a search engine. The backend supplies one sentence per state.
+  const captureNotice = (capture.error || capture.remedy)
+    ? `<div class="notice ${captureTone(capture) === "bad" ? "bad" : "warn"}">
+         <b>${esc(captureLabel(capture))}</b>
+         <p>${esc(capture.error || "")}${capture.remedy
+           ? ` <br>${esc(capture.remedy)}` : ""}</p></div>`
+    : "";
+
   $("sensor-grid").innerHTML = `<div class="panels">
     <section>
       <h3>Capture</h3>
+      ${captureNotice}
       <dl class="facts">${facts([
         ["State", captureLabel(capture)],
         ["Running", capture.running ? "yes" : "no"],
-        ["Interface", capture.interface || "auto-selected"],
+        ["Interface", capture.interface || "all interfaces"],
+        ["Interfaces found", (capture.interfaces || []).join(", ") || "—"],
         ["Packets seen", num(capture.packets_seen)],
         ["Last packet", capture.last_packet ? ago(capture.last_packet) : "—"],
-        ["Error", capture.error || "none"],
       ])}</dl>
     </section>
     <section>
@@ -1511,15 +1543,17 @@ function paint() {
 
   // Rail footer: sensor status, capture interface, system health, last update.
   const dot = $("conn-dot");
-  dot.className = `dot ${capture.running ? "ok" : capture.error ? "bad" : "warn"}`;
-  $("conn-text").textContent = capture.running ? "Capturing"
+  dot.className = `dot ${captureTone(capture)}`;
+  $("conn-text").textContent = captureLabel(capture) === "Live" ? "Capturing"
     : captureLabel(capture) === "Off" ? "Not capturing" : captureLabel(capture);
-  $("conn-sub").textContent = capture.interface || "no interface";
-  $("foot-iface").textContent = capture.interface || "—";
+  $("conn-sub").textContent = capture.interface || "all interfaces";
+  $("foot-iface").textContent = capture.interface || "all";
 
   const writer = status.writer || {};
   const unhealthy = [
     Boolean(capture.error),
+    ["BLOCKED", "NO INTERFACE", "ERROR", "NO TRAFFIC"].includes(
+      String(capture.display_state || "")),
     writer.thread_alive === false,
     Number(writer.write_errors) > 0,
     Number(writer.dropped_alerts) > 0,

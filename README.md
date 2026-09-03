@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 930 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 967 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -134,7 +134,9 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for module-level detail.
 ## Requirements
 
 - Python 3.10 or newer
-- Linux for packet capture (`CAP_NET_RAW`); the dashboard and API run anywhere
+- For packet capture: Linux with `CAP_NET_RAW`, or Windows with
+  [Npcap](https://npcap.com) in WinPcap API-compatible mode. The dashboard, the
+  API and the replay demo run anywhere.
 
 ## Quick start
 
@@ -150,16 +152,54 @@ python main.py
 
 Open <http://127.0.0.1:5000>.
 
-To capture on a specific interface:
+Leave `NEMOS_INTERFACE` unset and NEMOS captures on every interface. To pin one,
+name it — and name one that exists, which NEMOS will tell you if you do not:
 
 ```bash
 NEMOS_INTERFACE=eth0 python main.py
 ```
 
-If capture fails with a permission error, grant only the capture capability
-rather than running the web application as root — see
-[Deployment](#deployment). The dashboard reports capture state explicitly, so a
-permission failure appears as `CAPTURE BLOCKED` rather than as silent zeroes.
+Interfaces are enumerated, never assumed. `eth0` is wrong on a laptop, `wlan0`
+is wrong on a server, and both are wrong inside a container, so NEMOS asks the
+system rather than guessing — and a name that does not exist is reported as
+exactly that, with the list of ones that do.
+
+### What the capture state means
+
+| State | Meaning |
+| --- | --- |
+| `ONLINE` | The socket is bound **and packets have arrived** |
+| `NO TRAFFIC` | The socket is bound; nothing has arrived yet |
+| `BLOCKED` | The OS refused the capture socket — a privilege problem |
+| `NO INTERFACE` | The configured interface does not exist, or none is usable |
+| `ERROR` | Anything else, including a missing capture backend |
+
+`ONLINE` is the one that matters. It is never set on a successful bind alone: a
+sensor pointed at the wrong interface opens its socket perfectly and then sees
+nothing, and reporting that as online is exactly how a deployment sits blind for
+a week. A packet has to arrive first.
+
+Every failure state carries one actionable sentence for the platform you are on,
+in the log and on the Sensor page — not a bare "failed" that sends you to a
+search engine.
+
+### Capture privileges
+
+Do not run the whole sensor as root to read packets: that grants it every other
+privilege too. On Linux, grant the one capability capture actually uses:
+
+```bash
+sudo setcap cap_net_raw+eip "$(readlink -f "$(which python3)")"
+```
+
+`CAP_NET_RAW` alone is sufficient — measured, not assumed: capture reaches
+`ONLINE` as an unprivileged user holding only that capability, which is why
+`packaging/systemd/nemos.service` grants only that and nothing more. Most advice
+adds `CAP_NET_ADMIN`; NEMOS does not need it.
+
+On Windows, install [Npcap](https://npcap.com) with WinPcap API-compatible mode
+enabled. If it is missing, NEMOS says so in one sentence instead of surfacing a
+Scapy traceback.
 
 ### Try it without capture
 
@@ -184,7 +224,7 @@ never overridden by a stale file. Copy `.env.example` to `.env` to begin.
 | --- | --- | --- |
 | `NEMOS_HOST` | `127.0.0.1` | Bind address |
 | `NEMOS_PORT` | `5000` | Bind port |
-| `NEMOS_INTERFACE` | *(auto)* | Capture interface |
+| `NEMOS_INTERFACE` | *(all)* | Capture interface; unset captures on all of them |
 | `NEMOS_CAPTURE` | `true` | Enable packet capture |
 | `NEMOS_DB` | `data/nemos.db` | SQLite path |
 | `NEMOS_API_TOKEN` | *(none)* | Required for any non-loopback bind |
@@ -1093,7 +1133,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 930 tests
+python -m pytest -q                              # 967 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit

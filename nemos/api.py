@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, render_template, request
 
+from .capture import STATE_OFF as CAPTURE_OFF
 from .config import Settings
 from .database import connect
 from .models import TrafficEvent
@@ -106,6 +107,7 @@ def _dashboard_etag(c, limit: int, capture_state: dict[str, Any] | None = None) 
         "limit": limit,
         "capture": {
             "state": (capture_state or {}).get("state"),
+            "display_state": (capture_state or {}).get("display_state"),
             "running": bool((capture_state or {}).get("running")),
             "packets_seen": int((capture_state or {}).get("packets_seen") or 0),
             "error": (capture_state or {}).get("error"),
@@ -389,6 +391,7 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
         c = connect(settings.db_path)
         try:
             capture_state = capture.status() if capture is not None else {
+                "display_state": CAPTURE_OFF,
                 "state": "not_configured",
                 "running": False,
                 "interface": settings.interface or "default",
@@ -482,7 +485,11 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
 
     @app.get("/api/status")
     def status():
-        capture_state = capture.status() if capture is not None else {"state": "not_configured", "running": False, "interface": settings.interface or "default", "packets_seen": 0, "last_packet": None, "error": None}
+        capture_state = capture.status() if capture is not None else {
+            "state": "not_configured", "display_state": CAPTURE_OFF, "running": False,
+            "interface": settings.interface or "default", "interfaces": [],
+            "packets_seen": 0, "last_packet": None, "error": None, "remedy": "",
+        }
         return jsonify(
             ok=True, version=VERSION, capture=capture_state,
             writer=writer.metrics(), notifications=_notification_state(),

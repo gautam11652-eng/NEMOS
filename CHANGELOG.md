@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Packet capture reported the wrong problem.** On Kali the sensor showed
+  `Capture: Blocked` / `CAP_NET_RAW is required` / `Packets recorded: 0` for
+  what could equally have been a misspelled interface name or an uninstalled
+  backend -- three problems with three unrelated fixes, all reaching the
+  operator as one message that named only the least likely of them. Capture now
+  runs a preflight before starting a thread and distinguishes:
+  - `BLOCKED` -- the OS refused a packet socket, checked by *opening* one rather
+    than by reading a capability bit, since seccomp, AppArmor, a container's
+    network mode and an unprivileged userns can each refuse a process that
+    appears to hold `CAP_NET_RAW`. When the capability is held and the socket is
+    still refused, the message says so, because `setcap` is then the wrong fix.
+  - `NO INTERFACE` -- the configured interface does not exist, reported with the
+    list of ones that do.
+  - `ERROR` -- a missing backend, including a Windows host with no Npcap.
+  - `NO TRAFFIC` -- bound, but nothing has arrived.
+  - `ONLINE` -- bound **and packets have actually arrived**.
+- **`ONLINE` now requires a packet.** It was previously set on a successful
+  bind. A sensor pointed at the wrong interface binds perfectly and sees
+  nothing, so that reported a blind deployment as a healthy one.
+- Every failure state carries one actionable sentence for the current platform,
+  in the log and on the Sensor page. On Linux that is `setcap cap_net_raw+eip`
+  and not "run as root": `CAP_NET_RAW` alone was measured sufficient -- capture
+  reaches `ONLINE` as an unprivileged user holding only that capability -- so
+  the advice no longer asks for `CAP_NET_ADMIN` as most does.
+- Interfaces are enumerated (scapy's list, then `/sys/class/net`, then
+  `socket.if_nameindex`) instead of assumed. No interface name is hardcoded
+  anywhere in the module, and a test asserts it.
+
 ### Added
 
 - **Telegram QR pairing.** An operator no longer pastes a bot token anywhere.
