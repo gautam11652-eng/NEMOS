@@ -193,11 +193,22 @@ class MetricsAreTriageNotVolume(unittest.TestCase):
     def test_the_first_metric_is_what_needs_attention(self):
         self.assertIn('k: "Critical open"', JS)
 
+    def test_the_console_names_only_the_one_setting_a_deployment_needs(self):
+        """Deriving the username made TELEGRAM_BOT_USERNAME optional, but the
+        console kept telling operators an administrator has to set it."""
+        assert "TELEGRAM_BOT_TOKEN" in JS
+        assert "TELEGRAM_BOT_USERNAME" not in JS
+
+    def test_the_pairing_action_is_named_connect_telegram(self):
+        assert "Connect Telegram" in HTML
+        # The body copy quotes the button, so the two must not drift apart.
+        assert "Generate code" not in HTML
+        assert "Generate code" not in JS
+
     def test_the_console_never_asks_for_a_telegram_chat_id(self):
         """QR pairing replaced it. A panel still naming TELEGRAM_CHAT_ID sends
         the operator down the path the pairing card below it says to avoid."""
         assert "TELEGRAM_CHAT_ID" not in JS
-        assert "TELEGRAM_BOT_USERNAME" in JS
 
     def test_a_backend_reason_is_punctuated_before_the_next_sentence(self):
         """The reason is a clause carrying no trailing stop, so it ran straight

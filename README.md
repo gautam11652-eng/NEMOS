@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 988 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 990 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -836,7 +836,7 @@ token *is* the bot's identity. What NEMOS removes is everyone else having to
 handle one: it is set once by whoever deploys the sensor, stays server-side, and
 no operator is ever asked for a credential or a chat id.
 
-Then, on the **Sensor** page, press **Generate code**. NEMOS mints a single-use
+Then, on the **Sensor** page, press **Connect Telegram**. NEMOS mints a single-use
 pairing code, renders `https://t.me/<bot>?start=<code>` as a QR code, and counts
 down its five-minute life. Scan it, press **Start**, and that chat is linked.
 Alerts begin arriving immediately — no restart, no chat id to look up.
@@ -964,7 +964,7 @@ environment or `.env`, never from arguments, and never printed.
 TELEGRAM_BOT_TOKEN=your_bot_token
 ```
 
-4. Open the **Sensor** page and press **Generate code**, then scan the QR code.
+4. Open the **Sensor** page and press **Connect Telegram**, then scan the QR code.
 
 `TELEGRAM_CHAT_ID` remains supported for a single fixed recipient, but is no
 longer required: paired chats are the delivery audience.
@@ -1175,7 +1175,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 988 tests
+python -m pytest -q                              # 990 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit

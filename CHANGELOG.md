@@ -22,6 +22,10 @@
 
 ### Changed
 
+- The pairing action is named **Connect Telegram**, matching what it does
+  rather than how it does it, and the console no longer names
+  `TELEGRAM_BOT_USERNAME` as something an administrator must set -- deriving it
+  made that copy wrong the moment it landed.
 - **`TELEGRAM_BOT_USERNAME` is no longer required.** The token already
   determines the username, so NEMOS asks Telegram once (`getMe`) and caches the
   answer instead of making an operator look it up and retype it. That was not

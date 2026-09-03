@@ -1247,9 +1247,8 @@ function renderSensor(data, status) {
         : "No outbound channel is configured."}
          Findings are still recorded and shown here — only the outbound copy is
          affected. For Telegram, see the card below: the deployment sets
-         <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_BOT_USERNAME</code>,
-         then you pair a chat by scanning a QR code. For a webhook instead, set
-         <code>NEMOS_WEBHOOK_URL</code>.</p></div>`;
+         <code>TELEGRAM_BOT_TOKEN</code>, then you connect a chat by scanning a
+         QR code. For a webhook instead, set <code>NEMOS_WEBHOOK_URL</code>.</p></div>`;
     return;
   }
   host.innerHTML = `<dl class="facts">${facts([
@@ -1286,9 +1285,8 @@ function renderTelegram(pairing) {
     const why = esc(p.error || "This deployment has not set up a Telegram bot");
     parts.push(`<div class="notice"><b>Telegram pairing is not configured</b>
       <p>${why.replace(/\.?$/, ".")}
-         An administrator sets <code>TELEGRAM_BOT_TOKEN</code> and
-         <code>TELEGRAM_BOT_USERNAME</code> once, on the server. You are never
-         asked for either.</p></div>`);
+         Whoever deploys NEMOS sets <code>TELEGRAM_BOT_TOKEN</code> once, on the
+         server. You are never asked for it, or for a chat id.</p></div>`);
   }
 
   const linked = p.linked || [];
@@ -1299,8 +1297,8 @@ function renderTelegram(pairing) {
            esc(l.label ? `${l.label} (${l.chat_id})` : l.chat_id)).join(", ")}.</p></div>`);
   } else if (p.available) {
     parts.push(`<div class="notice"><b>No chat is linked yet</b>
-      <p>Press “Generate code”, then scan the QR code with the Telegram app and
-         press Start. Nothing is sent to Telegram until a chat is linked.</p></div>`);
+      <p>Press “Connect Telegram”, then scan the QR code with the Telegram app
+         and press Start. Nothing is sent to Telegram until a chat is linked.</p></div>`);
   }
 
   if (state.pairCode) {
@@ -1315,7 +1313,7 @@ function renderTelegram(pairing) {
   } else if (p.pending) {
     parts.push(`<div class="notice"><b>A pairing code is outstanding</b>
       <p>It was generated in another session, so it cannot be shown again.
-         Press “Generate code” to replace it with one you can scan.</p></div>`);
+         Press “Connect Telegram” to replace it with one you can scan.</p></div>`);
   }
 
   host.innerHTML = parts.join("");
