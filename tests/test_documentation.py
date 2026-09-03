@@ -43,11 +43,18 @@ class CountTests(unittest.TestCase):
         if not collected:
             self.skipTest("could not determine the collected test count")
         actual = int(collected.group(1))
-        for claim in re.findall(r"(\d{3,4}) automated tests", README):
-            self.assertEqual(int(claim), actual,
+        # The count passed 1,000 and prose writes it with a separator, which the
+        # original pattern silently matched the wrong half of: "1,015" gave
+        # "015". A claim this check cannot read is worse than no check.
+        def claimed(pattern: str) -> list[int]:
+            return [int(match.replace(",", ""))
+                    for match in re.findall(pattern, README)]
+
+        for claim in claimed(r"([\d,]{3,6}) automated tests"):
+            self.assertEqual(claim, actual,
                              f"README claims {claim} tests; {actual} are collected")
-        for claim in re.findall(r"# (\d{3,4}) tests", README):
-            self.assertEqual(int(claim), actual,
+        for claim in claimed(r"# ([\d,]{3,6}) tests"):
+            self.assertEqual(claim, actual,
                              f"README claims {claim} tests; {actual} are collected")
 
     def test_documented_technique_count_is_real(self):

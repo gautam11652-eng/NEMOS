@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 990 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 1,015 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -808,6 +808,81 @@ abnormal scenario is detected:
 | rate_deviation | 1239 | 2 | 84 | 100 | POSSIBLE_RECONNAISSANCE |
 | icmp_sweep | 119 | 3 | 100 | 100 | POSSIBLE_RECONNAISSANCE |
 
+## Detection benchmark
+
+Throughput is not detection quality. `tools/benchmark.py` answers "how many
+packets per second"; this answers the question that decides whether a detector
+is worth deploying:
+
+```bash
+python tools/benchmark_detection.py
+python tools/benchmark_detection.py --repeats 20 --json results.json
+```
+
+Every scenario in `tools/scenarios.py` carries machine-readable ground truth
+(`Scenario.expected`) decided from the **traffic shape**, independently of what
+NEMOS emits. That independence is the point — labelling scenarios with whatever
+the detector already finds would make recall 1.0 by construction.
+
+### Results
+
+20 replays per scenario, each with a different seed, on the committed defaults
+(10s window, confidence floor 55). Reproduce with the command above.
+
+| Detection | Precision | Recall | F1 | FP on benign |
+| --- | ---: | ---: | ---: | ---: |
+| PORT_SCAN | 100% | 100% | 100% | 0 |
+| TCP_SYN_SCAN | 100% | 100% | 100% | 0 |
+| UDP_PORT_SCAN | 100% | 100% | 100% | 0 |
+| ICMP_SWEEP | 100% | 100% | 100% | 0 |
+| ICMP_FLOOD_PATTERN | 100% | 100% | 100% | 0 |
+| DNS_BURST | 100% | 100% | 100% | 0 |
+| SYN_FLOOD_PATTERN | 100% | 100% | 100% | 0 |
+| SERVICE_CONNECTION_BURST | 100% | 100% | 100% | 0 |
+| BEHAVIORAL_TRAFFIC_ANOMALY | 100% | 100% | 100% | 0 |
+| SERVICE_DENIAL_OF_SERVICE | 66.7% | 100% | 80% | 20 |
+| NETWORK_FANOUT | 33.3% | 100% | 50% | 40 |
+
+**Overall: recall 100%, precision 58.2%, F1 73.6%** — 160 true positives, 0
+false negatives, 115 false positives across 80 benign replays (1.44 per
+replay). Median detection latency **1.20s** of scenario time.
+
+### The false positives are real, and not tuned away
+
+Recall is 100% because the attack scenarios are unambiguous. Precision is 58%
+because the benign corpus is deliberately hard: three of the four benign
+scenarios are *legitimate traffic shaped like an attack*, which is where real
+false positives come from.
+
+| Benign scenario | What NEMOS says | Why |
+| --- | --- | --- |
+| `nat_gateway` | NETWORK_FANOUT, PASSWORD_SPRAYING | One address speaking for a whole office contacts many destinations on many ports. Indistinguishable from a scan without knowing it is a gateway |
+| `monitoring_host` | NETWORK_FANOUT | A metrics poller contacting 39 hosts on a schedule is shaped exactly like discovery |
+| `backup_window` | C2_BEACONING, CREDENTIAL_BRUTE_FORCE, SERVICE_DENIAL_OF_SERVICE | A nightly bulk transfer to an SMB server looks like exfiltration, brute force and a flood at once |
+
+These are **not** bugs to be fixed by raising thresholds. Each is a case where
+packet metadata genuinely does not carry the distinguishing information — the
+difference is authorisation and role, which no amount of header inspection
+reveals. The honest fix is context (an asset inventory that knows which address
+is the gateway, the poller and the backup target), not a threshold that makes
+the number look better while blinding the detector to the real version of the
+same shape.
+
+An earlier version of this benchmark measured only against `normal_traffic`,
+which is *paced below the detector's thresholds by construction*, and reported
+100% precision with zero false positives. That figure was close to circular and
+has been removed rather than quoted.
+
+### What it does not measure
+
+- **The ML model.** These figures are the deterministic rules only. Nothing
+  here evaluates the Isolation Forest; see the note under Training.
+- **Real network traffic.** The corpus is synthetic. It exercises the shapes the
+  rules target, not the messiness of a production network.
+- **Evasion.** Nothing here is paced to slip under a window deliberately; see
+  `nemos/slowscan.py` for the tier that addresses that, which this does not
+  score.
+
 ## Alert delivery
 
 NEMOS records findings locally by default. It can also push them to Telegram or
@@ -1175,7 +1250,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 990 tests
+python -m pytest -q                              # 1,015 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
