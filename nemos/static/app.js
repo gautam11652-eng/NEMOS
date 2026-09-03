@@ -1246,8 +1246,10 @@ function renderSensor(data, status) {
         ? `${esc(configured.join(" and "))} ${configured.length > 1 ? "are" : "is"} configured, but delivery is not running.`
         : "No outbound channel is configured."}
          Findings are still recorded and shown here — only the outbound copy is
-         affected. Set <code>TELEGRAM_BOT_TOKEN</code> and
-         <code>TELEGRAM_CHAT_ID</code>, or <code>NEMOS_WEBHOOK_URL</code>.</p></div>`;
+         affected. For Telegram, see the card below: the deployment sets
+         <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_BOT_USERNAME</code>,
+         then you pair a chat by scanning a QR code. For a webhook instead, set
+         <code>NEMOS_WEBHOOK_URL</code>.</p></div>`;
     return;
   }
   host.innerHTML = `<dl class="facts">${facts([
@@ -1279,8 +1281,11 @@ function renderTelegram(pairing) {
   const parts = [];
 
   if (!p.available) {
+    // The backend's reason is a clause, not a sentence: it carries no trailing
+    // stop, so one is added here rather than running into the next sentence.
+    const why = esc(p.error || "This deployment has not set up a Telegram bot");
     parts.push(`<div class="notice"><b>Telegram pairing is not configured</b>
-      <p>${esc(p.error || "This deployment has not set up a Telegram bot.")}
+      <p>${why.replace(/\.?$/, ".")}
          An administrator sets <code>TELEGRAM_BOT_TOKEN</code> and
          <code>TELEGRAM_BOT_USERNAME</code> once, on the server. You are never
          asked for either.</p></div>`);
