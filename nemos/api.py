@@ -16,9 +16,13 @@ from flask import Flask, jsonify, render_template, request
 from .config import Settings
 from .database import connect
 from .models import TrafficEvent
-from .intelligence import summarize_incident
+from .intelligence import summarize_incident, valid_incident_id
 from .analyst import collect_evidence
 from .attack import catalog as attack_catalog, enrich_alert
+from .notify import NotifierConfig, TELEGRAM_API_BASE, telegram_api
+from .pairing import PairingStore
+from .qr import QRError, svg as qr_svg
+from .telegram import TEST_NOTIFICATION
 
 from .version import VERSION
 _ALLOWED_PROTOCOLS = {"TCP", "UDP", "DNS", "ICMP", "ARP", "NDP", "IP", "OTHER"}
@@ -82,13 +86,10 @@ def _host(value: str) -> bool:
     return isinstance(value, str) and len(value) <= 64 and _valid_ip(value)
 
 
-_INCIDENT_ID_CHARS = set(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-)
-
-
 def _valid_incident_id(value: str) -> bool:
-    return bool(value) and len(value) <= 64 and all(ch in _INCIDENT_ID_CHARS for ch in value)
+    # One definition, in nemos/intelligence.py, so the API and the Telegram bot
+    # cannot drift into disagreeing about what an incident id is.
+    return valid_incident_id(value)
 
 
 def _dashboard_etag(c, limit: int, capture_state: dict[str, Any] | None = None) -> str:
@@ -198,7 +199,8 @@ class RateLimiter:
 
 
 def create_app(settings: Settings, writer, capture=None, notifier=None, analysis=None,
-               analyst=None) -> Flask:
+               analyst=None, pairing: PairingStore | None = None,
+               bot=None) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
     # Flask 3.x trusted-host protection. Keep local aliases usable for the
@@ -964,7 +966,11 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
         """
         state = _notification_state()
         telegram = state["channels"].get("telegram", {})
+        pairing_state = _pairing_state()
         return jsonify(
+            pairing=pairing_state,
+            connected=pairing_state["connected"],
+            bot=(bot.metrics() if bot is not None else {"active": False, "running": False}),
             configured=bool(state["telegram_configured"]),
             chat_id=state["chat_id"],
             delivery=state,
@@ -972,6 +978,128 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
             failed=telegram.get("failed", 0),
             last_error=telegram.get("last_error", ""),
         )
+
+    # ---- Telegram pairing ----------------------------------------------
+    # The bot token is a deployment-level secret. It is read here only to decide
+    # whether pairing is possible and to send a test message; it is never put in
+    # a response body, a log line, or the page. What the browser receives is the
+    # public t.me link and a QR rendering of it.
+
+    def _telegram_settings() -> tuple[str, str]:
+        """(token, bot_username) from the environment, read fresh each call."""
+        config = NotifierConfig.from_env()
+        return config.telegram_token, config.telegram_bot_username
+
+    def _pairing_state() -> dict[str, Any]:
+        token, username = _telegram_settings()
+        state: dict[str, Any] = {
+            "available": bool(token and username and pairing is not None),
+            "bot_username": username,
+            "token_configured": bool(token),
+            "linked": [],
+            "pending": None,
+        }
+        if not token:
+            state["error"] = "TELEGRAM_BOT_TOKEN is not set on this deployment"
+        elif not username:
+            state["error"] = "TELEGRAM_BOT_USERNAME is not set on this deployment"
+        elif pairing is None:
+            state["error"] = "pairing storage is unavailable"
+        if pairing is not None:
+            # Chat ids are masked in the same way as the legacy chat-id field:
+            # enough to recognise the chat, not enough to be useful elsewhere.
+            state["linked"] = [
+                {
+                    "chat_id": ("••••" + item["chat_id"][-4:])
+                    if len(item["chat_id"]) > 4 else item["chat_id"],
+                    "label": item["label"],
+                    "linked_at": item["linked_at"],
+                }
+                for item in pairing.links()
+            ]
+            state["pending"] = pairing.pending()
+        state["connected"] = bool(state["linked"])
+        return state
+
+    @app.get("/api/telegram/pair")
+    def pairing_status():
+        """Report pairing state. Never returns an outstanding code."""
+        return jsonify(_pairing_state())
+
+    @app.post("/api/telegram/pair")
+    def pairing_create():
+        """Mint a single-use pairing code and return its link and QR code.
+
+        The plaintext code exists in exactly one response, to the authenticated
+        operator who asked for it. NEMOS keeps only its hash.
+        """
+        token, username = _telegram_settings()
+        if pairing is None or not token or not username:
+            state = _pairing_state()
+            return jsonify(ok=False, error=state.get("error") or "pairing unavailable"), 503
+        code, expires_at = pairing.issue()
+        link = f"https://t.me/{username}?start={code}"
+        try:
+            image = qr_svg(link, level="M", title="NEMOS Telegram pairing")
+        except QRError as exc:
+            return jsonify(ok=False, error=str(exc)), 500
+        return jsonify(
+            ok=True, link=link, qr_svg=image, expires_at=expires_at,
+            expires_in=max(0.0, expires_at - time.time()), bot_username=username,
+        )
+
+    @app.delete("/api/telegram/pair")
+    def pairing_revoke():
+        if pairing is None:
+            return jsonify(ok=False, error="pairing unavailable"), 503
+        return jsonify(ok=True, revoked=pairing.revoke())
+
+    @app.delete("/api/telegram/links/<chat_id>")
+    def pairing_unlink(chat_id: str):
+        if pairing is None:
+            return jsonify(ok=False, error="pairing unavailable"), 503
+        removed = pairing.unlink(chat_id)
+        pairing.record("dashboard", "unlink", chat_id, "ok" if removed else "not_found")
+        if not removed:
+            return jsonify(ok=False, error="not linked"), 404
+        return jsonify(ok=True)
+
+    @app.get("/api/telegram/audit")
+    def pairing_audit():
+        """The audit trail for chat-initiated and pairing actions."""
+        if pairing is None:
+            return jsonify([])
+        return jsonify(pairing.audit(_bounded_limit(request.args.get("limit"), 50, 1, 200)))
+
+    @app.post("/api/telegram/test")
+    def telegram_test():
+        """Send the confirmation message to every paired chat."""
+        token, _ = _telegram_settings()
+        chat_ids = list(pairing.chat_ids()) if pairing is not None else []
+        legacy = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        if legacy and legacy not in chat_ids:
+            chat_ids.append(legacy)
+        if not token:
+            return jsonify(ok=False, error="TELEGRAM_BOT_TOKEN is not set"), 503
+        if not chat_ids:
+            return jsonify(ok=False, error="no Telegram chat is paired"), 409
+        sent, failures = 0, []
+        for chat_id in chat_ids:
+            try:
+                telegram_api(token, "sendMessage",
+                             {"chat_id": chat_id, "text": TEST_NOTIFICATION,
+                              "disable_web_page_preview": "true"},
+                             timeout=10.0, api_base=TELEGRAM_API_BASE)
+                sent += 1
+            except Exception as exc:
+                # telegram_api already redacts the token from its message.
+                failures.append(str(exc)[:160])
+        if pairing is not None:
+            pairing.record("dashboard", "test_notification", f"{len(chat_ids)} chat(s)",
+                           "ok" if sent else "failed", failures[0] if failures else "")
+        if not sent:
+            return jsonify(ok=False, error=failures[0] if failures else "delivery failed"), 502
+        return jsonify(ok=True, sent=sent, failed=len(failures))
 
     @app.get("/api/techniques")
     def techniques():

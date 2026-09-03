@@ -6,6 +6,40 @@ from collections.abc import Iterable, Mapping
 import json
 
 
+# Incident ids are minted by the detector as ``NEMOS-<12 uppercase hex>``. Two
+# checks are needed, because two different questions get asked about one:
+#
+# - ``valid_incident_id`` is the shape check applied to anything arriving from
+#   outside -- a URL path segment, a chat argument. It bounds length and
+#   character set so the value is safe to bind into a query and to echo back.
+# - ``minted_incident_id`` additionally asserts NEMOS itself produced it. That
+#   is the stronger claim, and it is what an argument handed to an operator's
+#   containment hook has to satisfy.
+INCIDENT_ID_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
+
+def valid_incident_id(value: Any) -> bool:
+    """True when ``value`` is shaped like an incident id NEMOS could serve."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= 64
+        and all(ch in INCIDENT_ID_CHARS for ch in value)
+    )
+
+
+def minted_incident_id(value: Any) -> bool:
+    """True only for the ``NEMOS-<hex>`` form the detector actually mints."""
+    if not valid_incident_id(value) or not isinstance(value, str):
+        return False
+    prefix, _, suffix = value.partition("-")
+    return prefix == "NEMOS" and len(suffix) == 12 and all(
+        ch in "0123456789ABCDEF" for ch in suffix
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class IncidentSummary:
     incident_id: str

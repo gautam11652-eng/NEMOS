@@ -888,3 +888,24 @@ tr.sev-med  .score { color: var(--med); }
   .rail, .topbar-tools, .filters, .pager { display: none; }
   .app { grid-template-columns: 1fr; }
 }
+
+/* ── Telegram pairing ─────────────────────────────────────────────
+   The QR panel. Deliberately plain: the code has to be square, high
+   contrast and big enough for a phone camera, and nothing else here
+   earns any space. */
+.qr-pair {
+  display: flex; gap: 18px; flex-wrap: wrap; align-items: center;
+  padding: 16px;
+}
+.qr-image {
+  flex: none; width: 180px; height: 180px;
+  background: #ffffff; border-radius: 6px; padding: 6px;
+}
+.qr-image svg { display: block; width: 100%; height: 100%; }
+.qr-detail { flex: 1; min-width: 220px; }
+.qr-detail p { font-size: 12px; line-height: 1.7; color: var(--text-2); }
+.qr-detail p.mono {
+  font-family: var(--mono); font-size: 11px; color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+.qr-detail p.lead { color: var(--text); font-weight: 600; }

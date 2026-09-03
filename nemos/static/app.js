@@ -40,6 +40,10 @@ const state = {
   hostPage: 0,
   paletteIndex: 0,
   expanded: new Set(),  // campaign groups the operator has opened
+  pairing: null,        // /api/telegram/pair
+  // The plaintext pairing code exists only here, in this tab, until it expires.
+  // It is never written to storage: a code on disk outlives its own expiry.
+  pairCode: null,
 };
 
 const PAGE = 25;
@@ -257,6 +261,20 @@ async function api(path) {
   if (response.status === 503) return { unavailable: true };
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
+}
+
+/* State-changing calls. Separate from api() because these carry a method and
+ * must surface the server's own error text: "no Telegram chat is paired" is
+ * something the operator can act on, and "HTTP 409" is not. */
+async function apiSend(path, method) {
+  const headers = {};
+  const token = getToken();
+  if (token) headers["X-NEMOS-Token"] = token;
+  const response = await fetch(path, { method, headers, cache: "no-store" });
+  let body = {};
+  try { body = await response.json(); } catch { body = {}; }
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  return body;
 }
 
 /* ══ Grouping ══════════════════════════════════════════════════════
@@ -1215,6 +1233,82 @@ function renderSensor(data, status) {
 
 /* ══ Settings ══════════════════════════════════════════════════════ */
 
+/* ══ Telegram pairing ══════════════════════════════════════════════
+ * The whole point of this panel is that the operator never handles a
+ * credential. It shows the public t.me link as a QR code, a countdown to when
+ * that code dies, and which chats are linked. The bot token is not in any
+ * response this page reads.
+ */
+function renderTelegram(pairing) {
+  const host = $("sensor-telegram");
+  if (!host) return;
+  state.pairing = pairing || null;
+  const p = pairing || {};
+  const parts = [];
+
+  if (!p.available) {
+    parts.push(`<div class="notice"><b>Telegram pairing is not configured</b>
+      <p>${esc(p.error || "This deployment has not set up a Telegram bot.")}
+         An administrator sets <code>TELEGRAM_BOT_TOKEN</code> and
+         <code>TELEGRAM_BOT_USERNAME</code> once, on the server. You are never
+         asked for either.</p></div>`);
+  }
+
+  const linked = p.linked || [];
+  if (linked.length) {
+    parts.push(`<div class="notice good"><b>Connected</b>
+      <p>${linked.length} chat${linked.length === 1 ? "" : "s"} will receive
+         security notifications: ${linked.map((l) =>
+           esc(l.label ? `${l.label} (${l.chat_id})` : l.chat_id)).join(", ")}.</p></div>`);
+  } else if (p.available) {
+    parts.push(`<div class="notice"><b>No chat is linked yet</b>
+      <p>Press “Generate code”, then scan the QR code with the Telegram app and
+         press Start. Nothing is sent to Telegram until a chat is linked.</p></div>`);
+  }
+
+  if (state.pairCode) {
+    parts.push(`<div class="qr-pair">
+      <div class="qr-image">${state.pairCode.qr_svg}</div>
+      <div class="qr-detail">
+        <p class="lead">Scan with Telegram to connect NEMOS</p>
+        <p class="mono">${esc(state.pairCode.link)}</p>
+        <p>Expires in <span id="tg-countdown">—</span>. The code works once.</p>
+      </div>
+    </div>`);
+  } else if (p.pending) {
+    parts.push(`<div class="notice"><b>A pairing code is outstanding</b>
+      <p>It was generated in another session, so it cannot be shown again.
+         Press “Generate code” to replace it with one you can scan.</p></div>`);
+  }
+
+  host.innerHTML = parts.join("");
+  updatePairCountdown();
+}
+
+function updatePairCountdown() {
+  const el = $("tg-countdown");
+  if (!el) return;
+  if (!state.pairCode) { el.textContent = "—"; return; }
+  const left = Math.max(0, Math.round(state.pairCode.expires_at * 1000 - Date.now()) / 1000);
+  if (left <= 0) {
+    // A dead code must stop looking scannable: the server will reject it.
+    state.pairCode = null;
+    renderTelegram(state.pairing);
+    return;
+  }
+  const m = Math.floor(left / 60);
+  const sec = Math.floor(left % 60);
+  el.textContent = `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+async function loadTelegram() {
+  try {
+    renderTelegram(await api("/api/telegram/pair"));
+  } catch {
+    renderTelegram({ available: false, error: "Could not read pairing state." });
+  }
+}
+
 function renderSettings(status) {
   const analysis = status.analysis || {};
   const rate = status.rate_limit || {};
@@ -1413,6 +1507,7 @@ function paint() {
 
   renderSensor(data, status);
   renderSettings(status);
+  loadTelegram();
 
   // Rail footer: sensor status, capture interface, system health, last update.
   const dot = $("conn-dot");
@@ -1529,6 +1624,38 @@ function init() {
     if (state.live) refresh();
   });
   $("refresh-now").addEventListener("click", refresh);
+
+  $("tg-pair").addEventListener("click", async () => {
+    const button = $("tg-pair");
+    button.disabled = true;
+    try {
+      const result = await apiSend("/api/telegram/pair", "POST");
+      state.pairCode = result;
+      renderTelegram(state.pairing);
+      toast("Scan the code with Telegram");
+    } catch (err) {
+      toast(err.message || "Could not generate a pairing code");
+      await loadTelegram();
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $("tg-test").addEventListener("click", async () => {
+    const button = $("tg-test");
+    button.disabled = true;
+    try {
+      const result = await apiSend("/api/telegram/test", "POST");
+      toast(`Test notification sent to ${result.sent} chat(s)`);
+    } catch (err) {
+      toast(err.message || "Could not send a test notification");
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  // The countdown is the only thing on this page that has to tick on its own.
+  setInterval(updatePairCountdown, 1000);
 
   $("token-save").addEventListener("click", () => {
     setToken($("token-input").value.trim());

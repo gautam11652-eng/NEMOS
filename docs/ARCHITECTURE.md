@@ -71,7 +71,11 @@ extraction and model inference can never add latency to packet capture.
 | `nemos/attack.py` | MITRE ATT&CK catalog and presentation-only alert enrichment |
 | `nemos/storage.py` | The single SQLite writer thread: batching, retention, backpressure |
 | `nemos/database.py` | Schema, indexes, pragmas and additive migrations |
-| `nemos/notify.py` | Outbound alert delivery to Telegram and webhooks |
+| `nemos/notify.py` | Outbound alert delivery to Telegram, webhooks and syslog |
+| `nemos/telegram.py` | Message rendering: pure functions, no I/O, no delivery state |
+| `nemos/bot.py` | Inbound Telegram: commands, inline actions, the daily brief |
+| `nemos/pairing.py` | Single-use pairing codes, linked chats, the chat audit log |
+| `nemos/qr.py` | Dependency-free QR encoder for the pairing link |
 | `nemos/slowscan.py` | Long-horizon reconnaissance tier for scans paced below the detection window |
 | `nemos/drift.py` | Compares live traffic against the model's training distribution |
 | `nemos/watchdog.py` | Detects a dead capture thread and pings systemd's own watchdog |
@@ -361,6 +365,34 @@ and each suppression is counted.
 Webhook URLs must be HTTPS unless loopback, and redirects are refused rather
 than followed. The Telegram bot token travels in the request URL, so it is
 redacted from every log line, error string and API response.
+
+### Telegram, in three pieces
+
+The split exists so that the part most likely to contain a bug is the part that
+cannot break anything:
+
+- `telegram.py` renders. It is pure -- data in, a string out -- so the exact
+  text an operator receives is unit-testable, and a rendering mistake cannot
+  take down a worker thread. Detail scales with severity; a field the finding
+  does not carry produces no line at all.
+- `pairing.py` owns the durable state: hashed single-use codes, linked chats,
+  and the audit log for chat-initiated actions. Redemption happens inside one
+  `BEGIN IMMEDIATE` transaction, which is what makes the replay guard hold under
+  a race rather than only in sequence.
+- `bot.py` is the only piece that talks to Telegram inbound. It long-polls on
+  its own daemon thread inside a loop that catches everything, with an
+  exponential backoff, so an outage or an invalid token degrades to a log line
+  while capture and detection keep running.
+
+The direction of trust runs one way. The token is a deployment secret and never
+appears in a response, a page or a log. A chat id is only ever read out of
+Telegram's own update payload -- no API path accepts one. Authorisation is
+re-checked at the moment an inline button is pressed rather than inherited from
+the message it was attached to.
+
+Delivery reads its audience from the pairing store on every send, not at
+construction, so a chat paired while the sensor is running receives the next
+alert without a restart.
 
 ## Web layer
 

@@ -69,3 +69,9 @@ ignore = [
 "tools/benchmark.py" = ["S311"]
 "nemos/config.py" = ["S104"]
 "nemos/api.py" = ["S104", "S608"]
+# S608: same rule as nemos/api.py -- the only interpolated text is a run of
+# `?` placeholders and a literal clause fragment defined in this module.
+# S404/S603: the containment hook is an operator-supplied executable run in
+# argv form with no shell, on an incident id validated against the format
+# NEMOS itself mints. See TelegramBot._handle_contain.
+"nemos/bot.py" = ["S608", "S404", "S603"]

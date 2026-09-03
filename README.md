@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 722 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 930 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -774,26 +774,119 @@ NEMOS records findings locally by default. It can also push them to Telegram or
 a webhook. Delivery is off until you configure a channel, and it never blocks
 packet capture.
 
-### Connecting a chat
+### Connecting a chat: scan a QR code
 
-A bot token is unavoidable — it is what identifies your bot to Telegram — but
-the chat id is not. Rather than opening a `getUpdates` URL and digging a number
-out of raw JSON:
+A bot token is a *deployment* secret. One NEMOS install needs exactly one, set
+once by whoever deploys it, and no operator should ever be asked to paste one
+into a web form. So they are not: they scan a QR code.
 
 ```bash
-# .env, beside main.py
+# .env, beside main.py -- set once, by the deployment
 TELEGRAM_BOT_TOKEN=the_token_from_@BotFather
-
-python tools/connect_telegram.py
+TELEGRAM_BOT_USERNAME=your_bot_username
 ```
 
-It validates the token, prints a `t.me` link carrying a one-time code, and
-waits. Open the link, press **Start**, and NEMOS binds that chat, writes
-`TELEGRAM_CHAT_ID` into `.env` at mode 0600, and sends a confirmation message.
+Then, on the **Sensor** page, press **Generate code**. NEMOS mints a single-use
+pairing code, renders `https://t.me/<bot>?start=<code>` as a QR code, and counts
+down its five-minute life. Scan it, press **Start**, and that chat is linked.
+Alerts begin arriving immediately — no restart, no chat id to look up.
 
-The one-time code is not decoration: without it the tool would bind whichever
-chat messaged the bot first, which on a shared bot means someone else receives
-your security alerts. Codes are single-use — if the link expires, run it again.
+What the pairing code has to survive, and how:
+
+| Attack | Defence |
+| --- | --- |
+| Guessing a code | 128 bits from `secrets.token_urlsafe` |
+| Replaying a used code | Redemption flips `used` inside one `BEGIN IMMEDIATE` transaction, so concurrent `/start`s cannot both win |
+| Waiting out and then using an expired code | Expiry is compared against the server clock at redemption; nothing the client sends is consulted |
+| Linking someone else's chat | A code binds whichever chat redeems it and is then dead |
+| Injecting a chat id | The chat id comes only from Telegram's own update payload, and must still parse as one |
+| Reading codes out of a stolen database | Only SHA-256 hashes are stored, and a hash cannot be replayed as a start parameter |
+
+Issuing a new code retires the previous one, so a link screenshotted an hour ago
+is not still live alongside the one on screen.
+
+The QR encoder is `nemos/qr.py` — about 400 lines, no new dependency. Its output
+is pinned in the test suite against an independent reference implementation, and
+the rendered SVG has been decoded back to the exact pairing link.
+
+`python tools/connect_telegram.py` still works and still writes
+`TELEGRAM_CHAT_ID`; QR pairing is the path that does not require shell access to
+the sensor.
+
+### What an alert looks like
+
+Detail scales with severity, because a channel that sends the same wall of text
+for everything trains its reader to ignore it. LOW is two lines. CRITICAL is the
+full structured report:
+
+```
+🚨 NEMOS SECURITY INCIDENT
+━━━━━━━━━━━━━━━━━━
+
+Severity: HIGH
+
+Detection:
+PORT_SCAN
+
+Confidence: 99%
+Risk score: 89/100
+
+Source:
+192.0.2.10
+
+Why this fired:
+8 unique destination ports in 10s
+
+Observed:
+• 8 packets
+• 1 unique destination
+• 8 unique ports
+
+Evidence:
+• scan type: vertical
+• ports: 8 — 20, 21, 22, 23, 24, 25, ...
+• syn ratio: 1.0
+
+ATT&CK:
+T1595 — Active Scanning
+Tactic: Reconnaissance
+
+Incident: NEMOS-B956BF9FC040
+Observed at: 2026-09-03T04:11:06+00:00
+
+[ Investigate ] [ Acknowledge ] [ Open Dashboard ]
+```
+
+Every value there came out of the finding. A field NEMOS does not have produces
+no line — not a blank, not a zero. Evidence lists are summarised rather than
+dumped: a port scan legitimately carries a hundred port numbers, and sending all
+of them helps nobody.
+
+Messages are plain text with **no parse mode**. Alert fields carry
+attacker-influenced content, and asking a chat client to parse that as Markdown
+invites both delivery failures and formatting injection. Newlines are stripped
+from every field so nothing can forge a second section.
+
+### Commands
+
+A linked chat can ask:
+
+| Command | Answers with |
+| --- | --- |
+| `/status` | Capture, detection, ML, database and delivery state, plus live counters |
+| `/incidents` | The most recent incidents, highest risk first |
+| `/critical` | Only incidents carrying a critical finding |
+| `/hosts` | Observed hosts ranked by risk |
+| `/incident <id>` | One incident with its evidence timeline and ATT&CK mapping |
+| `/brief` | The security summary on demand |
+
+An unlinked chat gets pairing instructions and nothing else — not a count, not a
+host, not an incident id. Authorisation is re-checked when an inline button is
+pressed, so a chat unlinked after an alert was sent cannot still act on it.
+Every state-changing action is recorded in an audit log with its actor, target,
+result and timestamp, readable at `/api/telegram/audit`.
+
+Set `NEMOS_TELEGRAM_BRIEF_HOUR` to send a daily summary at that UTC hour.
 
 ### Verifying delivery
 
@@ -814,14 +907,18 @@ environment or `.env`, never from arguments, and never printed.
 ### Telegram
 
 1. Open Telegram and start a chat with **@BotFather**.
-2. Create a bot with `/newbot` and copy the token.
-3. Send a message to your bot, then obtain your chat ID.
-4. Add both to `.env`:
+2. Create a bot with `/newbot`; copy the token and note the username it gives you.
+3. Add both to `.env` — this is the only Telegram configuration a deployment needs:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
+TELEGRAM_BOT_USERNAME=your_bot_username
 ```
+
+4. Open the **Sensor** page and press **Generate code**, then scan the QR code.
+
+`TELEGRAM_CHAT_ID` remains supported for a single fixed recipient, but is no
+longer required: paired chats are the delivery audience.
 
 ### Webhook
 
@@ -876,6 +973,12 @@ asserts a forged `CEF:0|Evil|...|All clear` inside a finding stays inside the
 | `NEMOS_NOTIFY_RATE` | `12` | Maximum messages per minute |
 | `NEMOS_NOTIFY_TIMEOUT` | `5.0` | Per-request timeout |
 | `NEMOS_NOTIFY_QUEUE` | `256` | Pending-delivery queue size |
+| `TELEGRAM_BOT_TOKEN` | — | Deployment bot credential; never leaves the server |
+| `TELEGRAM_BOT_USERNAME` | — | The public half, needed to build the pairing link |
+| `TELEGRAM_CHAT_ID` | — | Legacy fixed recipient; QR pairing replaces it |
+| `NEMOS_DASHBOARD_URL` | — | Base URL alerts link back to; `https://` for a button |
+| `NEMOS_TELEGRAM_BRIEF_HOUR` | — | UTC hour for the daily brief; unset is off |
+| `NEMOS_TELEGRAM_CONTAIN_HOOK` | — | Lab-only containment executable (see below) |
 
 The cooldown and rate limit exist so a port scan cannot turn the sensor into a
 message flood. **Suppressed alerts are still recorded and still appear on the
@@ -883,7 +986,19 @@ dashboard** — only the outbound copy is dropped, and every suppression is
 counted in `/api/notifications`.
 
 The bot token is never returned by any endpoint and is redacted from logs and
-error messages.
+error messages. A test asserts this against every Telegram route, against
+`/api/status`, and against the rendered page.
+
+### Containment
+
+NEMOS is a passive sensor. It has no enforcement point, so it does not pretend
+to have one: there is no built-in "block this host". Where a controlled lab has
+a real containment action, point `NEMOS_TELEGRAM_CONTAIN_HOOK` at an executable
+and a **Contain** button appears on alerts. Pressing it runs that executable
+with the incident id as its only argument — argv form, no shell, a 20-second
+timeout, and the id validated against the `NEMOS-<12 hex>` format NEMOS itself
+mints, so nothing typed in a chat can become a command. Every attempt is
+audited, and the button is absent unless the hook is configured.
 
 ## API
 
@@ -896,6 +1011,12 @@ error messages.
 | `GET /api/alerts/<id>` | Single alert with evidence |
 | `GET /api/incidents` | Correlated incidents |
 | `GET /api/incidents/<incident_id>` | Incident detail and triage summary |
+| `GET /api/telegram/pair` | Pairing state and linked chats (never the code) |
+| `POST /api/telegram/pair` | Mint a single-use pairing code and its QR code |
+| `DELETE /api/telegram/pair` | Revoke the outstanding pairing code |
+| `DELETE /api/telegram/links/<chat_id>` | Unlink a paired chat |
+| `POST /api/telegram/test` | Send the confirmation message to paired chats |
+| `GET /api/telegram/audit` | Audit trail for chat-initiated actions |
 | `GET /api/hosts` | Host risk index |
 | `GET /api/hosts/<ip>` | Per-host investigation view |
 | `GET /api/techniques` | ATT&CK catalog with observed counts |
@@ -972,7 +1093,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 722 tests
+python -m pytest -q                              # 930 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
