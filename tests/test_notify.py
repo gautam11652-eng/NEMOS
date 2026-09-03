@@ -12,6 +12,7 @@ from nemos.notify import (
     DeliveryError,
     NotifierConfig,
     TelegramChannel,
+    WebhookChannel,
     forget_bot_username,
     format_alert_text,
     resolve_bot_username,
@@ -53,10 +54,16 @@ class Recorder:
         self._lock = threading.Lock()
 
     def __call__(self, method, url, headers, data, timeout):
+        text = data.decode("utf-8")
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            # A text-format webhook body is not JSON by design.
+            parsed = None
         with self._lock:
             self.calls.append({
                 "method": method, "url": url, "headers": dict(headers),
-                "body": json.loads(data.decode("utf-8")), "timeout": timeout,
+                "body": parsed, "text": text, "timeout": timeout,
             })
         self.event.set()
         return self.status, self.body
@@ -259,6 +266,78 @@ class PairedAudienceTests(unittest.TestCase):
     def test_a_notifier_with_no_token_builds_no_telegram_channel(self):
         notifier = AlertNotifier(NotifierConfig(), chat_ids=lambda: ["111"])
         self.assertEqual(notifier.channels, [])
+
+
+class WebhookTextFormatTests(unittest.TestCase):
+    """The one delivery path that reaches a phone with no credential at all."""
+
+    def channel(self, **kw):
+        return WebhookChannel("https://ntfy.example/nemos-topic", **kw)
+
+    def test_the_default_body_is_still_json(self):
+        recorder = Recorder()
+        self.channel().send(alert(), recorder, 1.0)
+        call = recorder.calls[0]
+        self.assertEqual(call["headers"]["Content-Type"], "application/json")
+        self.assertEqual(call["body"]["source"], "NEMOS")
+
+    def test_text_format_posts_the_rendered_report(self):
+        recorder = Recorder()
+        self.channel(body_format="text").send(alert(), recorder, 1.0)
+        call = recorder.calls[0]
+        self.assertTrue(call["headers"]["Content-Type"].startswith("text/plain"))
+        self.assertIn("NEMOS SECURITY INCIDENT", call["text"])
+        self.assertIn("192.0.2.10", call["text"])
+
+    def test_no_credential_is_required_or_sent(self):
+        recorder = Recorder()
+        self.channel(body_format="text").send(alert(), recorder, 1.0)
+        self.assertNotIn("Authorization", recorder.calls[0]["headers"])
+
+    def test_push_headers_carry_severity(self):
+        recorder = Recorder()
+        self.channel(body_format="text").send(alert(severity="CRITICAL"), recorder, 1.0)
+        headers = recorder.calls[0]["headers"]
+        self.assertEqual(headers["X-Priority"], "5")
+        self.assertEqual(headers["X-Tags"], "rotating_light")
+        self.assertIn("CRITICAL", headers["X-Title"])
+
+    def test_a_lower_severity_gets_a_lower_priority(self):
+        recorder = Recorder()
+        self.channel(body_format="text").send(alert(severity="LOW"), recorder, 1.0)
+        self.assertEqual(recorder.calls[0]["headers"]["X-Priority"], "2")
+
+    def test_a_newline_in_a_finding_cannot_inject_a_header(self):
+        """Threat names come from observed traffic; the title is a boundary."""
+        recorder = Recorder()
+        self.channel(body_format="text").send(
+            alert(threat="X\r\nX-Injected: yes"), recorder, 1.0)
+        title = recorder.calls[0]["headers"]["X-Title"]
+        self.assertNotIn("\n", title)
+        self.assertNotIn("\r", title)
+        self.assertNotIn("X-Injected", recorder.calls[0]["headers"])
+
+    def test_a_non_latin1_finding_still_produces_a_sendable_header(self):
+        recorder = Recorder()
+        self.channel(body_format="text").send(alert(threat="scan \u2014 \u4f60\u597d"),
+                                              recorder, 1.0)
+        title = recorder.calls[0]["headers"]["X-Title"]
+        title.encode("latin-1")  # must not raise; that would fail the request
+
+    def test_the_format_comes_from_the_environment(self):
+        with patch.dict(os.environ, {"NEMOS_WEBHOOK_FORMAT": "text"}):
+            self.assertEqual(NotifierConfig.from_env().webhook_format, "text")
+        with patch.dict(os.environ, {"NEMOS_WEBHOOK_FORMAT": "anything-else"}):
+            self.assertEqual(NotifierConfig.from_env().webhook_format, "json")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NEMOS_WEBHOOK_FORMAT", None)
+            self.assertEqual(NotifierConfig.from_env().webhook_format, "json")
+
+    def test_the_notifier_builds_the_channel_with_the_configured_format(self):
+        config = NotifierConfig(webhook_url="https://ntfy.example/t",
+                                webhook_format="text")
+        notifier = AlertNotifier(config)
+        self.assertEqual(notifier.channels[0].body_format, "text")
 
 
 class ResolveUsernameTests(unittest.TestCase):

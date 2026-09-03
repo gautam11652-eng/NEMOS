@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 979 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 988 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -969,11 +969,43 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 `TELEGRAM_CHAT_ID` remains supported for a single fixed recipient, but is no
 longer required: paired chats are the delivery audience.
 
+### Phone alerts with no credentials at all
+
+A Telegram bot token cannot be avoided — a token *is* the bot's identity, and
+Telegram has no unauthenticated send path. If you want alerts on a phone and are
+not willing to hold any credential, use a push service instead:
+
+```env
+NEMOS_WEBHOOK_URL=https://ntfy.sh/pick-something-long-and-unguessable
+NEMOS_WEBHOOK_FORMAT=text
+```
+
+That is the entire configuration. No token, no chat id, no account, no signup.
+Install the ntfy app, subscribe to that topic, and findings arrive as push
+notifications carrying the same rendered report Telegram gets — severity,
+evidence, ATT&CK technique, incident id — with the severity also set as the
+notification's priority and tag.
+
+What you give up, stated plainly:
+
+| | Telegram | `text` webhook |
+| --- | --- | --- |
+| Credential to hold | one bot token, set once | **none** |
+| Report format | full structured report | the same report |
+| Inline actions (Investigate / Acknowledge) | yes | no |
+| Commands (`/status`, `/incidents`, …) | yes | no |
+| Who can read your alerts | only paired chats | **anyone who guesses the URL** |
+
+That last row is the real cost. The topic name is the only thing protecting the
+feed, so treat it as a password: long, random, never committed. A short or
+guessable topic publishes your network's security findings to whoever tries it.
+
 ### Webhook
 
 ```env
 NEMOS_WEBHOOK_URL=https://your-collector.example/hook
 NEMOS_WEBHOOK_TOKEN=optional_bearer_token
+NEMOS_WEBHOOK_FORMAT=json
 ```
 
 The URL must be HTTPS unless it points at loopback: alert bodies describe your
@@ -1022,6 +1054,7 @@ asserts a forged `CEF:0|Evil|...|All clear` inside a finding stays inside the
 | `NEMOS_NOTIFY_RATE` | `12` | Maximum messages per minute |
 | `NEMOS_NOTIFY_TIMEOUT` | `5.0` | Per-request timeout |
 | `NEMOS_NOTIFY_QUEUE` | `256` | Pending-delivery queue size |
+| `NEMOS_WEBHOOK_FORMAT` | `json` | `text` posts the rendered report for push services |
 | `TELEGRAM_BOT_TOKEN` | — | Deployment bot credential; never leaves the server |
 | `TELEGRAM_BOT_USERNAME` | *(derived)* | Optional; resolved from the token via getMe when unset |
 | `TELEGRAM_CHAT_ID` | — | Legacy fixed recipient; QR pairing replaces it |
@@ -1142,7 +1175,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 979 tests
+python -m pytest -q                              # 988 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit

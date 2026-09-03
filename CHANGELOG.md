@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- **A delivery path that needs no credential at all.**
+  `NEMOS_WEBHOOK_FORMAT=text` posts the same rendered report Telegram receives
+  as `text/plain`, which push services such as ntfy turn straight into a phone
+  notification — severity also becomes the notification's priority and tag.
+  Two settings, no token, no chat id, no account.
+
+  This exists because a Telegram bot token genuinely cannot be removed: a token
+  *is* the bot's identity, and the API has no unauthenticated send path. Rather
+  than pretend otherwise, NEMOS now offers a route that reaches a phone with
+  nothing to hold. The cost is stated rather than glossed: the URL is the only
+  thing protecting the feed, and there are no inline actions or commands.
+
+  Header values derived from findings are flattened and latin-1 coerced, since a
+  threat name comes from observed traffic and a newline in one would otherwise
+  inject a header.
+
 ### Changed
 
 - **`TELEGRAM_BOT_USERNAME` is no longer required.** The token already

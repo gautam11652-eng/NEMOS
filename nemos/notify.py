@@ -126,6 +126,7 @@ class NotifierConfig:
     # link) and the dashboard URL is what an alert links back to.
     telegram_bot_username: str = ""
     dashboard_url: str = ""
+    webhook_format: str = "json"
 
     @property
     def telegram_token_configured(self) -> bool:
@@ -190,7 +191,22 @@ class NotifierConfig:
             syslog_facility=_int_env("NEMOS_SYSLOG_FACILITY", 13, 0, 23),
             telegram_bot_username=_bot_username(os.getenv("TELEGRAM_BOT_USERNAME", "")),
             dashboard_url=_dashboard_url(os.getenv("NEMOS_DASHBOARD_URL", "")),
+            webhook_format=(
+                "text" if os.getenv("NEMOS_WEBHOOK_FORMAT", "json").strip().lower() == "text"
+                else "json"
+            ),
         )
+
+
+def _header_safe(value: str) -> str:
+    """Flatten a value so it is legal in an HTTP header.
+
+    Threat names are derived from observed traffic, so this is a boundary, not
+    cosmetics: a newline here would let a finding inject a header of its own,
+    and a non-latin-1 byte makes the request unsendable rather than merely ugly.
+    """
+    text = " ".join(str(value).replace("\r", " ").replace("\n", " ").split())
+    return text.encode("latin-1", "replace").decode("latin-1")[:120]
 
 
 def _bot_username(value: str) -> str:
@@ -517,20 +533,68 @@ class TelegramChannel(_Channel):
                         delivered, len(targets), errors[0][:160])
 
 
+# Push services that turn a plain POST body into a phone notification -- ntfy
+# being the common one -- read these headers if they are present and ignore
+# them otherwise, so sending them costs nothing on a collector that does not.
+# Priority is ntfy's 1-5 scale.
+PUSH_PRIORITY = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2}
+PUSH_TAGS = {
+    "CRITICAL": "rotating_light",
+    "HIGH": "warning",
+    "MEDIUM": "yellow_circle",
+    "LOW": "blue_circle",
+}
+
+
 class WebhookChannel(_Channel):
+    """Deliver a finding to an arbitrary HTTP collector.
+
+    Two body formats, because two very different things are on the other end.
+
+    ``json`` (the default) posts a machine-readable envelope, for a SIEM, a
+    Lambda, or anything that parses.
+
+    ``text`` posts the same rendered report Telegram receives, as ``text/plain``.
+    That exists for the push services that treat the body as the notification --
+    and it is the one path in NEMOS that reaches a phone with **no credential of
+    any kind**: no bot token, no chat id, no account. The URL is the whole
+    configuration, which is also its weakness, so the topic in it has to be long
+    and unguessable.
+    """
+
     name = "webhook"
 
-    def __init__(self, url: str, token: str = ""):
+    def __init__(self, url: str, token: str = "", body_format: str = "json",
+                 dashboard_url: str = ""):
         self.url = url
         self.token = token
+        self.body_format = "text" if str(body_format).lower() == "text" else "json"
+        self.dashboard_url = dashboard_url
 
-    def send(self, alert: Mapping[str, Any], transport: Transport, timeout: float) -> None:
-        headers = {"Content-Type": "application/json", "User-Agent": "NEMOS"}
+    def _payload(self, alert: Mapping[str, Any]) -> tuple[dict[str, str], bytes]:
+        headers = {"User-Agent": "NEMOS"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        if self.body_format == "text":
+            severity = str(alert.get("severity") or "LOW").upper()
+            headers["Content-Type"] = "text/plain; charset=utf-8"
+            # X- prefixed so a collector that does not know them treats them as
+            # ordinary unknown headers rather than as its own metadata.
+            headers["X-Title"] = _header_safe(
+                f"NEMOS {severity}: {alert.get('threat') or 'DETECTION'}")
+            headers["X-Priority"] = str(PUSH_PRIORITY.get(severity, 3))
+            headers["X-Tags"] = PUSH_TAGS.get(severity, "blue_circle")
+            body = format_alert_text(
+                alert, dashboard_url=self.dashboard_url).encode("utf-8")
+            return headers, body
+        headers["Content-Type"] = "application/json"
         body = json.dumps(
             {"source": "NEMOS", "alert": dict(alert)}, separators=(",", ":"), default=str
         ).encode("utf-8")
+        return headers, body
+
+    def send(self, alert: Mapping[str, Any], transport: Transport, timeout: float) -> None:
+        headers, body = self._payload(alert)
         status, detail = transport("POST", self.url, headers, body, timeout)
         if not 200 <= status < 300:
             raise DeliveryError(
@@ -723,7 +787,11 @@ class AlertNotifier:
                 )
             if self.config.webhook_configured:
                 channels.append(
-                    WebhookChannel(self.config.webhook_url, self.config.webhook_token)
+                    WebhookChannel(
+                        self.config.webhook_url, self.config.webhook_token,
+                        body_format=self.config.webhook_format,
+                        dashboard_url=self.config.dashboard_url,
+                    )
                 )
             if self.config.syslog_configured:
                 channels.append(
