@@ -22,10 +22,17 @@ VIEWS = ("overview", "incidents", "detections", "hosts", "network",
 
 
 def test_every_scripted_id_exists_in_the_markup():
-    """$("x") with no matching id is a silent null dereference at runtime."""
-    html = HTML.read_text()
-    ids = set(re.findall(r'id="([^"]+)"', html))
-    refs = set(re.findall(r'\$\("([^"]+)"\)', JS.read_text()))
+    """$("x") with no matching id is a silent null dereference at runtime.
+
+    An element the script renders itself counts: the pairing countdown only
+    exists while a code is on screen, and its lookup is null-guarded. What must
+    never happen is a lookup for an id that appears in neither place, which is
+    always a typo.
+    """
+    js = JS.read_text()
+    ids = set(re.findall(r'id="([^"]+)"', HTML.read_text()))
+    ids |= set(re.findall(r'id="([^"${]+)"', js))
+    refs = set(re.findall(r'\$\("([^"]+)"\)', js))
     missing = refs - ids
     assert not missing, f"script references ids absent from the template: {sorted(missing)}"
 
@@ -111,7 +118,12 @@ def test_only_real_api_endpoints_are_called():
     silently rendered empty.
     """
     js = JS.read_text()
-    called = set(re.findall(r'api\("(/api/[^"?]+)', js))
-    routes = set(re.findall(r'@app\.(?:get|post|route)\("(/api/[^"<]*)', (ROOT / "nemos" / "api.py").read_text()))
+    # Both helpers: api() reads, apiSend() writes. A POST to a route that does
+    # not exist fails just as silently as a GET did.
+    called = set(re.findall(r'\bapi(?:Send)?\("(/api/[^"?]+)', js))
+    routes = set(re.findall(
+        r'@app\.(?:get|post|put|patch|delete|route)\("(/api/[^"<]*)',
+        (ROOT / "nemos" / "api.py").read_text(),
+    ))
     unknown = {c for c in called if c not in routes}
     assert not unknown, f"dashboard calls endpoints that do not exist: {sorted(unknown)}"

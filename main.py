@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 from pathlib import Path
@@ -8,13 +9,20 @@ from pathlib import Path
 from nemos.analysis import AnalysisEngine
 from nemos.analyst import Analyst, AnalystConfig
 from nemos.api import create_app
-from nemos.capture import PacketCapture
+from nemos.bot import DailyBrief, TelegramBot
+from nemos.capture import (
+    STATE_BLOCKED as CAPTURE_BLOCKED,
+    STATE_ERROR as CAPTURE_ERROR,
+    STATE_NO_INTERFACE as CAPTURE_NO_INTERFACE,
+    PacketCapture,
+)
 from nemos.config import load_settings
 from nemos.database import initialize
 from nemos.detector import DetectionConfig, ThreatDetector
 from nemos.env import load_dotenv
 from nemos.models import TrafficEvent
 from nemos.notify import AlertNotifier, NotifierConfig
+from nemos.pairing import PairingStore
 from nemos.storage import BatchWriter
 from nemos.watchdog import SensorWatchdog
 
@@ -59,7 +67,17 @@ def main() -> int:
     writer.start()
 
     detector = ThreatDetector(DetectionConfig.from_env())
-    notifier = AlertNotifier(NotifierConfig.from_env())
+
+    # Telegram: one deployment bot, many paired chats. The token stays in the
+    # environment; operators link a chat by scanning a QR code the dashboard
+    # renders, and the pairing store is the delivery audience from then on.
+    notify_config = NotifierConfig.from_env()
+    pairing = PairingStore(settings.db_path)
+    notifier = AlertNotifier(
+        notify_config,
+        chat_ids=pairing.chat_ids,
+        allow_contain=bool(os.getenv("NEMOS_TELEGRAM_CONTAIN_HOOK", "").strip()),
+    )
     notifier.start()
 
     def record(alert) -> None:
@@ -183,18 +201,48 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
 
+    bot = None
+    brief = None
     try:
         if capture is not None:
             capture.start()
-            log.info(
-                "capture enabled%s",
-                f" on {settings.interface}" if settings.interface else "",
-            )
+            state = capture.status()
+            if state["display_state"] in (CAPTURE_BLOCKED, CAPTURE_NO_INTERFACE,
+                                          CAPTURE_ERROR):
+                # start() has already logged the reason and the fix. Repeat the
+                # headline so an operator scrolling a busy startup log cannot
+                # miss that nothing is being captured.
+                log.error("capture is %s -- NEMOS will record no packets",
+                          state["display_state"])
+            else:
+                log.info(
+                    "capture started on %s (interfaces found: %s)",
+                    settings.interface or "all interfaces",
+                    ", ".join(state.get("interfaces") or []) or "unknown",
+                )
         else:
             log.info("capture disabled")
         watchdog.start()
 
-        app = create_app(settings, writer, capture, notifier, analysis, analyst)
+        # The command bot is started only once the pieces it reports on exist,
+        # so /status can never answer about a half-built sensor.
+        bot = TelegramBot(
+            notify_config.telegram_token, pairing, settings.db_path,
+            capture=capture, notifier=notifier, analysis=analysis,
+            dashboard_url=notify_config.dashboard_url,
+            bot_username=notify_config.telegram_bot_username,
+            contain_hook=os.getenv("NEMOS_TELEGRAM_CONTAIN_HOOK", "").strip(),
+        )
+        bot.start()
+        brief_hour = os.getenv("NEMOS_TELEGRAM_BRIEF_HOUR", "").strip()
+        if brief_hour.isdigit() and bot.active:
+            brief = DailyBrief(bot, int(brief_hour))
+            brief.start()
+        else:
+            brief = None
+
+        app = create_app(settings, writer, capture, notifier, analysis, analyst,
+                         pairing=pairing, bot=bot)
 
         try:
             from waitress import create_server
@@ -246,6 +294,14 @@ def main() -> int:
                 analysis.stop(timeout=5)
             except Exception:
                 log.exception("failed to stop flow analysis")
+        for component, label in ((brief, "the daily Telegram brief"),
+                                 (bot, "the Telegram command bot")):
+            if component is None:
+                continue
+            try:
+                component.stop(timeout=5)
+            except Exception:
+                log.exception("failed to stop %s", label)
         try:
             notifier.shutdown(timeout=5)
         except Exception:

@@ -2,8 +2,78 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Packet capture reported the wrong problem.** On Kali the sensor showed
+  `Capture: Blocked` / `CAP_NET_RAW is required` / `Packets recorded: 0` for
+  what could equally have been a misspelled interface name or an uninstalled
+  backend -- three problems with three unrelated fixes, all reaching the
+  operator as one message that named only the least likely of them. Capture now
+  runs a preflight before starting a thread and distinguishes:
+  - `BLOCKED` -- the OS refused a packet socket, checked by *opening* one rather
+    than by reading a capability bit, since seccomp, AppArmor, a container's
+    network mode and an unprivileged userns can each refuse a process that
+    appears to hold `CAP_NET_RAW`. When the capability is held and the socket is
+    still refused, the message says so, because `setcap` is then the wrong fix.
+  - `NO INTERFACE` -- the configured interface does not exist, reported with the
+    list of ones that do.
+  - `ERROR` -- a missing backend, including a Windows host with no Npcap.
+  - `NO TRAFFIC` -- bound, but nothing has arrived.
+  - `ONLINE` -- bound **and packets have actually arrived**.
+- **`ONLINE` now requires a packet.** It was previously set on a successful
+  bind. A sensor pointed at the wrong interface binds perfectly and sees
+  nothing, so that reported a blind deployment as a healthy one.
+- Every failure state carries one actionable sentence for the current platform,
+  in the log and on the Sensor page. On Linux that is `setcap cap_net_raw+eip`
+  and not "run as root": `CAP_NET_RAW` alone was measured sufficient -- capture
+  reaches `ONLINE` as an unprivileged user holding only that capability -- so
+  the advice no longer asks for `CAP_NET_ADMIN` as most does.
+- Interfaces are enumerated (scapy's list, then `/sys/class/net`, then
+  `socket.if_nameindex`) instead of assumed. No interface name is hardcoded
+  anywhere in the module, and a test asserts it.
+
 ### Added
 
+- **Telegram QR pairing.** An operator no longer pastes a bot token anywhere.
+  The token is a deployment secret (`TELEGRAM_BOT_TOKEN` plus the public
+  `TELEGRAM_BOT_USERNAME`), set once by whoever deploys NEMOS; operators link
+  their own chat by scanning a QR code on the Sensor page. Codes are 128 bits
+  from `secrets.token_urlsafe`, stored only as SHA-256 hashes, single-use,
+  five-minute-lived, and redeemed inside one `BEGIN IMMEDIATE` transaction so
+  two concurrent `/start` messages cannot both win. Chat ids come only from
+  Telegram's own update payload. Issuing a code retires the previous one.
+- **`nemos/qr.py`**, a dependency-free QR encoder (byte mode, versions 1-10,
+  all four error-correction levels). Its output is pinned against an
+  independent reference implementation, and the SVG the dashboard renders has
+  been decoded back to the exact pairing link with a third-party decoder.
+  Written rather than pulled in because NEMOS needs exactly one QR code and the
+  project rule is to avoid a dependency for a single screen.
+- **Structured, severity-aware alerts.** LOW is two lines; CRITICAL is a full
+  incident report with detection, confidence, risk, endpoints, reasoning,
+  observed counters, summarised evidence, ATT&CK technique and tactic, incident
+  id and a link back to the dashboard. A field NEMOS does not have produces no
+  line — not a blank, not a zero. Evidence lists are summarised rather than
+  dumped, so a port scan's hundred port numbers become a count and a preview.
+- **Inline actions**: Investigate, Acknowledge, Open Dashboard. Authorisation is
+  re-checked when the button is pressed rather than inherited from the message
+  it was attached to, so a chat unlinked after an alert was sent cannot act on
+  it. Every state-changing action is written to an audit log with actor, target,
+  result and timestamp, readable at `GET /api/telegram/audit`.
+- **Commands**: `/status`, `/incidents`, `/critical`, `/hosts`,
+  `/incident <id>`, `/brief`, `/help`, all answered from live NEMOS state. An
+  unlinked chat gets pairing instructions and nothing else — not a count, not a
+  host, not an incident id. Per-chat token buckets bound a flood to its own
+  sender.
+- **Daily security brief**, off unless `NEMOS_TELEGRAM_BRIEF_HOUR` names a UTC
+  hour. Only metrics with a query behind them are printed; a section with
+  nothing behind it is omitted rather than shown as zero.
+- **Delivery to every paired chat.** `TELEGRAM_CHAT_ID` still works and is
+  merged with the paired audience, which is read fresh on every send so a chat
+  paired a minute ago does not need a restart to be alerted. One chat failing
+  no longer cancels the others; only a delivery that reached nobody is a
+  failure.
+- `NEMOS_DASHBOARD_URL` for alert deep links, and an optional lab-only
+  `NEMOS_TELEGRAM_CONTAIN_HOOK`.
 - **TLS handshake fingerprinting (JA3/JA3S)**, closing the blind spot every
   metadata-only sensor has. The handshake is sent in cleartext before a session
   key exists, and what it discloses — versions, ciphers, extensions, curves —
@@ -26,8 +96,25 @@
 - New settings: `NEMOS_DETECT_TLS_HORIZON`, `NEMOS_DETECT_TLS_MAX_FINGERPRINTS`,
   `NEMOS_DETECT_TLS_ODD_PORT_HANDSHAKES`, `NEMOS_DETECT_TLS_MAX_TRACKED`.
 
+### Fixed
+
+- The Telegram poller backed off nothing on repeated failures. An invalid token
+  fails identically forever, so it logged the same warning every five seconds
+  and told the operator nothing new. The wait now doubles to a five-minute
+  ceiling and only the first failures are logged at warning level.
+
 ### Deliberately not added
 
+- **No built-in containment.** NEMOS is a passive sensor with no enforcement
+  point, and a "Contain" button that shelled out to `iptables` would be both a
+  command-injection surface and an offensive capability aimed at whatever
+  address a detection happened to name. Where a controlled lab has a real
+  action, `NEMOS_TELEGRAM_CONTAIN_HOOK` runs the operator's own executable in
+  argv form with a validated incident id, no shell and a timeout. Absent that
+  setting the button does not exist.
+- **No per-user bot tokens.** Letting each operator supply one would multiply
+  the number of credentials in play and put a secret in a web form. One
+  deployment, one bot, many paired chats.
 - **No list of known-malicious JA3 hashes.** They go stale, they collide with
   the stock Go and Python TLS stacks that legitimate software also uses, and
   shipping one would assert a detection quality that could not be validated

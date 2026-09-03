@@ -68,6 +68,10 @@ class MainLifecycleTests(unittest.TestCase):
         fake_api.create_app = lambda *a, **k: object()
         fake_capture = types.ModuleType("nemos.capture")
         fake_capture.PacketCapture = object
+        fake_capture.STATE_BLOCKED = "BLOCKED"
+        fake_capture.STATE_ERROR = "ERROR"
+        fake_capture.STATE_NO_INTERFACE = "NO INTERFACE"
+        fake_capture.STATE_OFF = "OFF"
         fake_config = types.ModuleType("nemos.config")
         fake_config.load_settings = lambda base=None: fake_settings
         fake_database = types.ModuleType("nemos.database")
@@ -102,6 +106,31 @@ class MainLifecycleTests(unittest.TestCase):
         fake_analyst = types.ModuleType("nemos.analyst")
         fake_analyst.Analyst = AnalystStub
         fake_analyst.AnalystConfig = types.SimpleNamespace(from_env=lambda: None)
+        class PairingStoreStub:
+            def __init__(self, db_path, ttl=300.0):
+                calls.append(("pairing_init", db_path))
+            def chat_ids(self): return []
+            def links(self): return []
+            def pending(self): return None
+
+        class BotStub:
+            def __init__(self, token, store, db_path, **kwargs):
+                self.active = bool(token)
+                calls.append(("bot_init", bool(token)))
+            def start(self): calls.append(("bot_start",))
+            def stop(self, timeout=5): calls.append(("bot_stop", timeout))
+            def metrics(self): return {"active": self.active, "running": False}
+
+        class BriefStub:
+            def __init__(self, bot, hour, **kwargs): calls.append(("brief_init", hour))
+            def start(self): calls.append(("brief_start",))
+            def stop(self, timeout=5): calls.append(("brief_stop", timeout))
+
+        fake_pairing = types.ModuleType("nemos.pairing")
+        fake_pairing.PairingStore = PairingStoreStub
+        fake_bot = types.ModuleType("nemos.bot")
+        fake_bot.TelegramBot = BotStub
+        fake_bot.DailyBrief = BriefStub
         fake_storage = types.ModuleType("nemos.storage")
         fake_storage.BatchWriter = Writer
         fake_waitress = types.ModuleType("waitress")
@@ -113,6 +142,7 @@ class MainLifecycleTests(unittest.TestCase):
             "nemos.detector": fake_detector, "nemos.models": fake_models,
             "nemos.storage": fake_storage, "waitress": fake_waitress,
             "nemos.analysis": fake_analysis, "nemos.analyst": fake_analyst,
+            "nemos.pairing": fake_pairing, "nemos.bot": fake_bot,
         }
         with patch.dict(sys.modules, modules):
             main_mod = importlib.reload(importlib.import_module("main"))
@@ -137,6 +167,14 @@ class MainLifecycleTests(unittest.TestCase):
         self.assertIn(("analysis_start",), calls)
         self.assertIn(("analysis_final_cycle", True), calls)
         self.assertIn(("analysis_stop", 5), calls)
+
+    def test_telegram_bot_stops_before_the_writer_it_reads_from(self):
+        """The command bot answers /status out of SQLite. If the writer closed
+        first, an in-flight command would query a database that is going away."""
+        _, calls, _ = self._load_main_with_stubs()
+        names = [c[0] for c in calls]
+        self.assertIn("bot_start", names)
+        self.assertLess(names.index("bot_stop"), names.index("writer_shutdown"))
 
     def test_shutdown_order_stops_producers_before_consumers(self):
         """Analysis must drain before the writer closes, or its final alerts

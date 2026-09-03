@@ -40,6 +40,10 @@ const state = {
   hostPage: 0,
   paletteIndex: 0,
   expanded: new Set(),  // campaign groups the operator has opened
+  pairing: null,        // /api/telegram/pair
+  // The plaintext pairing code exists only here, in this tab, until it expires.
+  // It is never written to storage: a code on disk outlives its own expiry.
+  pairCode: null,
 };
 
 const PAGE = 25;
@@ -78,10 +82,28 @@ const SEV_CLASS = { CRITICAL: "sev-crit", HIGH: "sev-high", MEDIUM: "sev-med", L
 const SEV_RANK = { CRITICAL: 3, HIGH: 2, MEDIUM: 1, LOW: 0 };
 
 /* Capture states arrive as machine tokens; a card needs a word, not a token. */
+/* The sensor reports its own operator-facing state (nemos/capture.py), which is
+ * the one the dashboard shows. This map covers the internal lifecycle names for
+ * an older sensor, or a state the backend has not classified.
+ *
+ * "Live" is never inferred here. The backend only says ONLINE once a packet has
+ * actually arrived, because a sensor bound to the wrong interface opens its
+ * socket perfectly and then sees nothing. */
 const CAPTURE_LABEL = {
   running: "Live", starting: "Starting", stopped: "Stopped", failed: "Failed",
   permission_denied: "Blocked", unavailable: "Unavailable",
   not_configured: "Off", error: "Failed",
+};
+
+/* Operator-facing capture states, as words rather than shouted constants. */
+const CAPTURE_STATE_LABEL = {
+  ONLINE: "Live", "NO TRAFFIC": "No traffic", BLOCKED: "Blocked",
+  "NO INTERFACE": "No interface", ERROR: "Failed", STARTING: "Starting",
+  OFF: "Off",
+};
+const CAPTURE_TONE = {
+  ONLINE: "ok", "NO TRAFFIC": "warn", BLOCKED: "bad", "NO INTERFACE": "bad",
+  ERROR: "bad", STARTING: "warn", OFF: "warn",
 };
 
 /* ML lifecycle states as nemos/bootstrap.py reports them. ACTIVE is only ever
@@ -177,8 +199,12 @@ const threatLabel = (v) => String(v ?? "").split("_").filter(Boolean).map((word,
   return i === 0 ? lower.charAt(0).toUpperCase() + lower.slice(1) : lower;
 }).join(" ");
 
-const captureLabel = (c) => (c?.running ? "Live"
-  : CAPTURE_LABEL[String(c?.state || "").toLowerCase()] || "Off");
+const captureLabel = (c) => (
+  CAPTURE_STATE_LABEL[String(c?.display_state || "")]
+  ?? (c?.running ? "Live" : CAPTURE_LABEL[String(c?.state || "").toLowerCase()] || "Off"));
+
+const captureTone = (c) => CAPTURE_TONE[String(c?.display_state || "")]
+  ?? (c?.running ? "ok" : c?.error ? "bad" : "warn");
 
 function evidenceOf(alert) {
   let evidence = alert?.evidence;
@@ -257,6 +283,20 @@ async function api(path) {
   if (response.status === 503) return { unavailable: true };
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
+}
+
+/* State-changing calls. Separate from api() because these carry a method and
+ * must surface the server's own error text: "no Telegram chat is paired" is
+ * something the operator can act on, and "HTTP 409" is not. */
+async function apiSend(path, method) {
+  const headers = {};
+  const token = getToken();
+  if (token) headers["X-NEMOS-Token"] = token;
+  const response = await fetch(path, { method, headers, cache: "no-store" });
+  let body = {};
+  try { body = await response.json(); } catch { body = {}; }
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  return body;
 }
 
 /* ══ Grouping ══════════════════════════════════════════════════════
@@ -1145,16 +1185,26 @@ function renderSensor(data, status) {
   const analysis = status.analysis || {};
   const flows = analysis.flows || {};
 
+  // A failure state that does not say what to do about it just relocates the
+  // problem to a search engine. The backend supplies one sentence per state.
+  const captureNotice = (capture.error || capture.remedy)
+    ? `<div class="notice ${captureTone(capture) === "bad" ? "bad" : "warn"}">
+         <b>${esc(captureLabel(capture))}</b>
+         <p>${esc(capture.error || "")}${capture.remedy
+           ? ` <br>${esc(capture.remedy)}` : ""}</p></div>`
+    : "";
+
   $("sensor-grid").innerHTML = `<div class="panels">
     <section>
       <h3>Capture</h3>
+      ${captureNotice}
       <dl class="facts">${facts([
         ["State", captureLabel(capture)],
         ["Running", capture.running ? "yes" : "no"],
-        ["Interface", capture.interface || "auto-selected"],
+        ["Interface", capture.interface || "all interfaces"],
+        ["Interfaces found", (capture.interfaces || []).join(", ") || "—"],
         ["Packets seen", num(capture.packets_seen)],
         ["Last packet", capture.last_packet ? ago(capture.last_packet) : "—"],
-        ["Error", capture.error || "none"],
       ])}</dl>
     </section>
     <section>
@@ -1214,6 +1264,82 @@ function renderSensor(data, status) {
 }
 
 /* ══ Settings ══════════════════════════════════════════════════════ */
+
+/* ══ Telegram pairing ══════════════════════════════════════════════
+ * The whole point of this panel is that the operator never handles a
+ * credential. It shows the public t.me link as a QR code, a countdown to when
+ * that code dies, and which chats are linked. The bot token is not in any
+ * response this page reads.
+ */
+function renderTelegram(pairing) {
+  const host = $("sensor-telegram");
+  if (!host) return;
+  state.pairing = pairing || null;
+  const p = pairing || {};
+  const parts = [];
+
+  if (!p.available) {
+    parts.push(`<div class="notice"><b>Telegram pairing is not configured</b>
+      <p>${esc(p.error || "This deployment has not set up a Telegram bot.")}
+         An administrator sets <code>TELEGRAM_BOT_TOKEN</code> and
+         <code>TELEGRAM_BOT_USERNAME</code> once, on the server. You are never
+         asked for either.</p></div>`);
+  }
+
+  const linked = p.linked || [];
+  if (linked.length) {
+    parts.push(`<div class="notice good"><b>Connected</b>
+      <p>${linked.length} chat${linked.length === 1 ? "" : "s"} will receive
+         security notifications: ${linked.map((l) =>
+           esc(l.label ? `${l.label} (${l.chat_id})` : l.chat_id)).join(", ")}.</p></div>`);
+  } else if (p.available) {
+    parts.push(`<div class="notice"><b>No chat is linked yet</b>
+      <p>Press “Generate code”, then scan the QR code with the Telegram app and
+         press Start. Nothing is sent to Telegram until a chat is linked.</p></div>`);
+  }
+
+  if (state.pairCode) {
+    parts.push(`<div class="qr-pair">
+      <div class="qr-image">${state.pairCode.qr_svg}</div>
+      <div class="qr-detail">
+        <p class="lead">Scan with Telegram to connect NEMOS</p>
+        <p class="mono">${esc(state.pairCode.link)}</p>
+        <p>Expires in <span id="tg-countdown">—</span>. The code works once.</p>
+      </div>
+    </div>`);
+  } else if (p.pending) {
+    parts.push(`<div class="notice"><b>A pairing code is outstanding</b>
+      <p>It was generated in another session, so it cannot be shown again.
+         Press “Generate code” to replace it with one you can scan.</p></div>`);
+  }
+
+  host.innerHTML = parts.join("");
+  updatePairCountdown();
+}
+
+function updatePairCountdown() {
+  const el = $("tg-countdown");
+  if (!el) return;
+  if (!state.pairCode) { el.textContent = "—"; return; }
+  const left = Math.max(0, Math.round(state.pairCode.expires_at * 1000 - Date.now()) / 1000);
+  if (left <= 0) {
+    // A dead code must stop looking scannable: the server will reject it.
+    state.pairCode = null;
+    renderTelegram(state.pairing);
+    return;
+  }
+  const m = Math.floor(left / 60);
+  const sec = Math.floor(left % 60);
+  el.textContent = `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+async function loadTelegram() {
+  try {
+    renderTelegram(await api("/api/telegram/pair"));
+  } catch {
+    renderTelegram({ available: false, error: "Could not read pairing state." });
+  }
+}
 
 function renderSettings(status) {
   const analysis = status.analysis || {};
@@ -1413,18 +1539,21 @@ function paint() {
 
   renderSensor(data, status);
   renderSettings(status);
+  loadTelegram();
 
   // Rail footer: sensor status, capture interface, system health, last update.
   const dot = $("conn-dot");
-  dot.className = `dot ${capture.running ? "ok" : capture.error ? "bad" : "warn"}`;
-  $("conn-text").textContent = capture.running ? "Capturing"
+  dot.className = `dot ${captureTone(capture)}`;
+  $("conn-text").textContent = captureLabel(capture) === "Live" ? "Capturing"
     : captureLabel(capture) === "Off" ? "Not capturing" : captureLabel(capture);
-  $("conn-sub").textContent = capture.interface || "no interface";
-  $("foot-iface").textContent = capture.interface || "—";
+  $("conn-sub").textContent = capture.interface || "all interfaces";
+  $("foot-iface").textContent = capture.interface || "all";
 
   const writer = status.writer || {};
   const unhealthy = [
     Boolean(capture.error),
+    ["BLOCKED", "NO INTERFACE", "ERROR", "NO TRAFFIC"].includes(
+      String(capture.display_state || "")),
     writer.thread_alive === false,
     Number(writer.write_errors) > 0,
     Number(writer.dropped_alerts) > 0,
@@ -1529,6 +1658,38 @@ function init() {
     if (state.live) refresh();
   });
   $("refresh-now").addEventListener("click", refresh);
+
+  $("tg-pair").addEventListener("click", async () => {
+    const button = $("tg-pair");
+    button.disabled = true;
+    try {
+      const result = await apiSend("/api/telegram/pair", "POST");
+      state.pairCode = result;
+      renderTelegram(state.pairing);
+      toast("Scan the code with Telegram");
+    } catch (err) {
+      toast(err.message || "Could not generate a pairing code");
+      await loadTelegram();
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $("tg-test").addEventListener("click", async () => {
+    const button = $("tg-test");
+    button.disabled = true;
+    try {
+      const result = await apiSend("/api/telegram/test", "POST");
+      toast(`Test notification sent to ${result.sent} chat(s)`);
+    } catch (err) {
+      toast(err.message || "Could not send a test notification");
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  // The countdown is the only thing on this page that has to tick on its own.
+  setInterval(updatePairCountdown, 1000);
 
   $("token-save").addEventListener("click", () => {
     setToken($("token-input").value.trim());

@@ -5,9 +5,11 @@ import os
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from nemos.notify import (
     AlertNotifier,
+    DeliveryError,
     NotifierConfig,
     TelegramChannel,
     format_alert_text,
@@ -165,6 +167,131 @@ class MessageFormatTests(unittest.TestCase):
         text = format_alert_text({"threat": "X", "source": "1.2.3.4", "severity": "HIGH"})
         self.assertNotIn("ATT&CK", text)
         self.assertNotIn("incident", text)
+
+
+class PairedAudienceTests(unittest.TestCase):
+    """Delivery to chats that paired themselves, not only to TELEGRAM_CHAT_ID."""
+
+    def test_a_paired_chat_receives_the_alert(self):
+        recorder = Recorder()
+        channel = TelegramChannel("t", "", chat_ids=lambda: ["111", "222"])
+        channel.send(alert(), recorder, 1.0)
+        chats = [call["body"]["chat_id"] for call in recorder.calls]
+        self.assertEqual(chats, ["111", "222"])
+
+    def test_the_configured_chat_id_and_paired_chats_are_merged(self):
+        recorder = Recorder()
+        channel = TelegramChannel("t", "999", chat_ids=lambda: ["111"])
+        channel.send(alert(), recorder, 1.0)
+        chats = [call["body"]["chat_id"] for call in recorder.calls]
+        self.assertEqual(chats, ["999", "111"])
+
+    def test_a_chat_listed_twice_is_sent_to_once(self):
+        recorder = Recorder()
+        channel = TelegramChannel("t", "999", chat_ids=lambda: ["999", "999"])
+        channel.send(alert(), recorder, 1.0)
+        self.assertEqual(len(recorder.calls), 1)
+
+    def test_the_audience_is_read_fresh_on_every_send(self):
+        """A chat paired a minute ago must not need a restart to be alerted."""
+        chats: list[str] = []
+        recorder = Recorder()
+        channel = TelegramChannel("t", "", chat_ids=lambda: list(chats))
+        chats.append("111")
+        channel.send(alert(), recorder, 1.0)
+        chats.append("222")
+        channel.send(alert(), recorder, 1.0)
+        self.assertEqual(len(recorder.calls), 3)
+
+    def test_no_audience_is_a_delivery_failure_not_a_silent_success(self):
+        channel = TelegramChannel("t", "", chat_ids=lambda: [])
+        with self.assertRaises(DeliveryError):
+            channel.send(alert(), Recorder(), 1.0)
+
+    def test_a_failing_pairing_store_does_not_silence_the_configured_chat(self):
+        def broken():
+            raise RuntimeError("database is gone")
+
+        recorder = Recorder()
+        TelegramChannel("t", "999", chat_ids=broken).send(alert(), recorder, 1.0)
+        self.assertEqual(len(recorder.calls), 1)
+
+    def test_one_failing_chat_does_not_cancel_the_others(self):
+        class PartialFailure(Recorder):
+            def __call__(self, method, url, headers, data, timeout):
+                payload = json.loads(data.decode("utf-8"))
+                self.calls.append({"body": payload})
+                if payload["chat_id"] == "111":
+                    return 403, '{"ok": false, "description": "blocked"}'
+                return 200, '{"ok": true}'
+
+        recorder = PartialFailure()
+        channel = TelegramChannel("t", "", chat_ids=lambda: ["111", "222"])
+        channel.send(alert(), recorder, 1.0)  # must not raise
+        self.assertEqual(len(recorder.calls), 2)
+
+    def test_a_delivery_that_reached_nobody_raises(self):
+        class AllFail(Recorder):
+            def __call__(self, method, url, headers, data, timeout):
+                self.calls.append({"body": json.loads(data.decode("utf-8"))})
+                return 500, "server error"
+
+        channel = TelegramChannel("t", "", chat_ids=lambda: ["111", "222"])
+        with self.assertRaises(DeliveryError):
+            channel.send(alert(), AllFail(), 1.0)
+
+    def test_inline_buttons_ride_along_with_the_message(self):
+        recorder = Recorder()
+        TelegramChannel("t", "999").send(alert(), recorder, 1.0)
+        payload = recorder.calls[0]["body"]
+        labels = [b["text"] for row in payload["reply_markup"]["inline_keyboard"]
+                  for b in row]
+        self.assertIn("Acknowledge", labels)
+
+    def test_a_notifier_with_a_token_and_a_pairing_source_builds_the_channel(self):
+        """Requiring TELEGRAM_CHAT_ID here left a freshly paired sensor mute."""
+        config = NotifierConfig(telegram_token="t")
+        notifier = AlertNotifier(config, chat_ids=lambda: ["111"])
+        self.assertEqual([c.name for c in notifier.channels], ["telegram"])
+
+    def test_a_notifier_with_no_token_builds_no_telegram_channel(self):
+        notifier = AlertNotifier(NotifierConfig(), chat_ids=lambda: ["111"])
+        self.assertEqual(notifier.channels, [])
+
+
+class BotUsernameTests(unittest.TestCase):
+    def test_common_paste_forms_normalise_to_the_bare_username(self):
+        for raw in ("nemos_bot", "@nemos_bot", "t.me/nemos_bot",
+                    "https://t.me/nemos_bot", "https://t.me/nemos_bot?start=x"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, {"TELEGRAM_BOT_USERNAME": raw}):
+                    self.assertEqual(
+                        NotifierConfig.from_env().telegram_bot_username, "nemos_bot")
+
+    def test_anything_that_is_not_a_username_is_rejected(self):
+        """This value is interpolated into the link a QR code encodes."""
+        for raw in ("nemos bot", "nemos/../evil", "nemos?x=1&y=2", "n" * 40,
+                    "<script>", "nemos-bot"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, {"TELEGRAM_BOT_USERNAME": raw}):
+                    self.assertEqual(
+                        NotifierConfig.from_env().telegram_bot_username, "")
+
+
+class DashboardUrlTests(unittest.TestCase):
+    def test_an_http_or_https_base_is_accepted(self):
+        for raw in ("https://nemos.example", "http://127.0.0.1:5000/"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, {"NEMOS_DASHBOARD_URL": raw}):
+                    self.assertEqual(NotifierConfig.from_env().dashboard_url,
+                                     raw.rstrip("/"))
+
+    def test_anything_else_is_ignored(self):
+        for raw in ("javascript:alert(1)", "file:///etc/passwd", "nemos.example",
+                    "ftp://x.test"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, {"NEMOS_DASHBOARD_URL": raw}):
+                    self.assertEqual(NotifierConfig.from_env().dashboard_url, "")
 
 
 class DeliveryTests(unittest.TestCase):

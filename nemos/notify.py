@@ -35,6 +35,7 @@ from typing import Any
 from collections.abc import Callable, Mapping
 from urllib.parse import urlsplit
 
+from .telegram import TELEGRAM_MAX_MESSAGE, alert_keyboard, render_alert  # noqa: F401
 from .version import VERSION
 
 log = logging.getLogger(__name__)
@@ -43,7 +44,6 @@ SEVERITY_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 DEFAULT_MIN_SEVERITY = "HIGH"
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
-TELEGRAM_MAX_MESSAGE = 3500
 
 # Bound the cooldown map: the key contains an attacker-influenceable source
 # address, so it must not grow without limit.
@@ -120,9 +120,25 @@ class NotifierConfig:
     syslog_port: int = 514
     syslog_protocol: str = "udp"
     syslog_facility: int = 13
+    # Deployment-level Telegram settings. The token is the only credential and
+    # it never leaves the server; the username is public (it is in the t.me
+    # link) and the dashboard URL is what an alert links back to.
+    telegram_bot_username: str = ""
+    dashboard_url: str = ""
+
+    @property
+    def telegram_token_configured(self) -> bool:
+        """A deployment token is present. Pairing can proceed on this alone."""
+        return bool(self.telegram_token)
 
     @property
     def telegram_configured(self) -> bool:
+        """A token *and* a statically configured chat id.
+
+        Kept as-is for the API response shape that predates QR pairing. It
+        answers "is TELEGRAM_CHAT_ID set", not "can NEMOS deliver" -- with
+        pairing, a sensor with no chat id can still have an audience.
+        """
         return bool(self.telegram_token and self.telegram_chat_id)
 
     @property
@@ -171,7 +187,46 @@ class NotifierConfig:
                 else "udp"
             ),
             syslog_facility=_int_env("NEMOS_SYSLOG_FACILITY", 13, 0, 23),
+            telegram_bot_username=_bot_username(os.getenv("TELEGRAM_BOT_USERNAME", "")),
+            dashboard_url=_dashboard_url(os.getenv("NEMOS_DASHBOARD_URL", "")),
         )
+
+
+def _bot_username(value: str) -> str:
+    """Normalise TELEGRAM_BOT_USERNAME into the bare username.
+
+    Operators paste it with a leading @ or as a whole t.me URL. Everything that
+    is not a Telegram username character is rejected rather than escaped,
+    because this value is interpolated into the pairing link a QR code encodes.
+    """
+    text = str(value or "").strip()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if text.lower().startswith(prefix):
+            # A pasted link legitimately carries a path or query after the
+            # username; a bare value does not, and truncating one instead of
+            # rejecting it would silently accept "nemos/../evil" as "nemos".
+            text = text[len(prefix):].split("?", 1)[0].split("/", 1)[0]
+            break
+    else:
+        text = text[1:] if text.startswith("@") else text
+    if not text or len(text) > 32:
+        return ""
+    return text if all(ch.isalnum() or ch == "_" for ch in text) else ""
+
+
+def _dashboard_url(value: str) -> str:
+    """Accept an http(s) base URL for deep links, or nothing at all."""
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return ""
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        log.error("ignoring NEMOS_DASHBOARD_URL: an http:// or https:// URL is required")
+        return ""
+    return text
 
 
 def redact(text: str, *secrets: str) -> str:
@@ -257,35 +312,20 @@ def telegram_api(token: str, method: str, params: Mapping[str, Any] | None = Non
     return payload.get("result")
 
 
-def format_alert_text(alert: Mapping[str, Any]) -> str:
-    """Render a plain-text alert summary.
+def format_alert_text(alert: Mapping[str, Any], *, detail: str = "",
+                      dashboard_url: str = "") -> str:
+    """Render an alert for Telegram.
+
+    The rendering itself lives in nemos/telegram.py, which has no I/O and no
+    delivery state, so the exact text an operator receives is unit-testable.
+    This wrapper is the delivery path's entry point and keeps the name that
+    callers outside this module already import.
 
     No Markdown/HTML parse mode is used. Alert fields describe observed network
     activity, and asking a chat client to parse that as markup invites both
     rendering failures and formatting injection.
     """
-    severity = str(alert.get("severity") or "UNKNOWN").upper()
-    lines = [
-        f"NEMOS {severity}: {alert.get('threat') or 'DETECTION'}",
-        f"source: {alert.get('source') or 'unknown'}",
-        f"risk: {alert.get('risk_score', 0)}/100  confidence: {alert.get('confidence', 0)}%",
-    ]
-    reason = str(alert.get("reason") or "").strip()
-    if reason:
-        lines.append(f"reason: {reason}")
-    technique = str(alert.get("technique") or "").strip()
-    if technique:
-        lines.append(f"ATT&CK: {technique}")
-    incident = str(alert.get("incident_id") or "").strip()
-    if incident:
-        lines.append(f"incident: {incident}")
-    timestamp = str(alert.get("timestamp") or "").strip()
-    if timestamp:
-        lines.append(f"time: {timestamp}")
-    text = "\n".join(lines)
-    if len(text) > TELEGRAM_MAX_MESSAGE:
-        text = text[: TELEGRAM_MAX_MESSAGE - 3] + "..."
-    return text
+    return render_alert(alert, detail=detail, dashboard_url=dashboard_url)
 
 
 @dataclass
@@ -305,23 +345,57 @@ class _Channel:
 
 
 class TelegramChannel(_Channel):
+    """Deliver a finding to every chat this sensor is paired with.
+
+    The audience comes from two places: the legacy ``TELEGRAM_CHAT_ID`` setting,
+    and whatever chats have paired themselves by QR code. ``chat_ids`` is a
+    callable rather than a list because pairing happens while the sensor runs --
+    a chat linked a minute ago must receive the next alert without a restart.
+
+    A send failure to one chat does not cancel the others. Only a delivery that
+    reached nobody is reported as a failure, because that is the only case where
+    the operator has genuinely not been told.
+    """
+
     name = "telegram"
 
-    def __init__(self, token: str, chat_id: str, api_base: str = TELEGRAM_API_BASE):
+    def __init__(self, token: str, chat_id: str = "", api_base: str = TELEGRAM_API_BASE,
+                 *, chat_ids: Callable[[], list[str]] | None = None,
+                 dashboard_url: str = "", allow_contain: bool = False):
         self.token = token
         self.chat_id = chat_id
         self.api_base = api_base.rstrip("/")
+        self._chat_ids = chat_ids
+        self.dashboard_url = dashboard_url
+        self.allow_contain = allow_contain
 
-    def send(self, alert: Mapping[str, Any], transport: Transport, timeout: float) -> None:
+    def audience(self) -> list[str]:
+        """Every chat that should receive this alert, de-duplicated, in order."""
+        targets: list[str] = []
+        if self.chat_id:
+            targets.append(str(self.chat_id))
+        if self._chat_ids is not None:
+            try:
+                targets.extend(str(chat) for chat in self._chat_ids())
+            except Exception:
+                # A failing pairing store must not silence a configured chat id.
+                log.warning("could not read paired Telegram chats", exc_info=True)
+        seen: set[str] = set()
+        return [chat for chat in targets if chat and not (chat in seen or seen.add(chat))]
+
+    def _send_one(self, chat_id: str, alert: Mapping[str, Any],
+                  transport: Transport, timeout: float) -> None:
         url = f"{self.api_base}/bot{self.token}/sendMessage"
-        body = json.dumps(
-            {
-                "chat_id": self.chat_id,
-                "text": format_alert_text(alert),
-                "disable_web_page_preview": True,
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": format_alert_text(alert, dashboard_url=self.dashboard_url),
+            "disable_web_page_preview": True,
+        }
+        keyboard = alert_keyboard(alert, dashboard_url=self.dashboard_url,
+                                  allow_contain=self.allow_contain)
+        if keyboard:
+            payload["reply_markup"] = keyboard
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         status, detail = transport(
             "POST", url, {"Content-Type": "application/json"}, body, timeout
         )
@@ -338,19 +412,37 @@ class TelegramChannel(_Channel):
         # a body that will not parse is also treated as a failure rather than
         # assumed good.
         try:
-            payload = json.loads(detail)
+            parsed = json.loads(detail)
         except (ValueError, TypeError) as exc:
             raise DeliveryError(
                 f"telegram returned {status} with an unparseable body: {safe}"
             ) from exc
-        if not isinstance(payload, dict) or payload.get("ok") is not True:
+        if not isinstance(parsed, dict) or parsed.get("ok") is not True:
             description = ""
-            if isinstance(payload, dict):
-                description = str(payload.get("description") or "")
+            if isinstance(parsed, dict):
+                description = str(parsed.get("description") or "")
             raise DeliveryError(
                 "telegram accepted the request but reported failure: "
                 f"{redact(description, self.token)[:200] or safe}"
             )
+
+    def send(self, alert: Mapping[str, Any], transport: Transport, timeout: float) -> None:
+        targets = self.audience()
+        if not targets:
+            raise DeliveryError("no Telegram chat is paired with this sensor")
+        errors: list[str] = []
+        delivered = 0
+        for chat_id in targets:
+            try:
+                self._send_one(chat_id, alert, transport, timeout)
+                delivered += 1
+            except DeliveryError as exc:
+                errors.append(str(exc))
+        if delivered == 0:
+            raise DeliveryError("; ".join(errors)[:200] or "telegram delivery failed")
+        if errors:
+            log.warning("telegram delivery reached %d of %d chats: %s",
+                        delivered, len(targets), errors[0][:160])
 
 
 class WebhookChannel(_Channel):
@@ -537,14 +629,25 @@ class AlertNotifier:
 
     def __init__(self, config: NotifierConfig | None = None, *,
                  transport: Transport | None = None,
-                 channels: list[_Channel] | None = None):
+                 channels: list[_Channel] | None = None,
+                 chat_ids: Callable[[], list[str]] | None = None,
+                 allow_contain: bool = False):
         self.config = config or NotifierConfig()
         self._transport = transport or http_post
         if channels is None:
             channels = []
-            if self.config.telegram_configured:
+            # With QR pairing a token alone is enough to have an audience: the
+            # chats come from the pairing store via ``chat_ids``. Requiring
+            # TELEGRAM_CHAT_ID here would have left a freshly paired sensor with
+            # no Telegram channel at all until it was restarted.
+            if self.config.telegram_configured or (
+                    self.config.telegram_token_configured and chat_ids is not None):
                 channels.append(
-                    TelegramChannel(self.config.telegram_token, self.config.telegram_chat_id)
+                    TelegramChannel(
+                        self.config.telegram_token, self.config.telegram_chat_id,
+                        chat_ids=chat_ids, dashboard_url=self.config.dashboard_url,
+                        allow_contain=allow_contain,
+                    )
                 )
             if self.config.webhook_configured:
                 channels.append(
