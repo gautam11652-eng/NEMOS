@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 969 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 979 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -821,10 +821,20 @@ once by whoever deploys it, and no operator should ever be asked to paste one
 into a web form. So they are not: they scan a QR code.
 
 ```bash
-# .env, beside main.py -- set once, by the deployment
+# .env, beside main.py -- one setting, set once, by the deployment
 TELEGRAM_BOT_TOKEN=the_token_from_@BotFather
-TELEGRAM_BOT_USERNAME=your_bot_username
 ```
+
+That is the whole configuration. `TELEGRAM_BOT_USERNAME` is optional: the token
+already determines the username, so NEMOS asks Telegram once and caches the
+answer rather than making you look it up and retype it — which was not just
+extra work but the one setting whose typo failed *silently*, rendering a
+perfectly valid QR code that pointed at a bot which did not exist.
+
+The bot token cannot be eliminated. Telegram has no anonymous send path — a
+token *is* the bot's identity. What NEMOS removes is everyone else having to
+handle one: it is set once by whoever deploys the sensor, stays server-side, and
+no operator is ever asked for a credential or a chat id.
 
 Then, on the **Sensor** page, press **Generate code**. NEMOS mints a single-use
 pairing code, renders `https://t.me/<bot>?start=<code>` as a QR code, and counts
@@ -947,12 +957,11 @@ environment or `.env`, never from arguments, and never printed.
 ### Telegram
 
 1. Open Telegram and start a chat with **@BotFather**.
-2. Create a bot with `/newbot`; copy the token and note the username it gives you.
+2. Create a bot with `/newbot` and copy the token. You do not need the username.
 3. Add both to `.env` — this is the only Telegram configuration a deployment needs:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_BOT_USERNAME=your_bot_username
 ```
 
 4. Open the **Sensor** page and press **Generate code**, then scan the QR code.
@@ -1014,7 +1023,7 @@ asserts a forged `CEF:0|Evil|...|All clear` inside a finding stays inside the
 | `NEMOS_NOTIFY_TIMEOUT` | `5.0` | Per-request timeout |
 | `NEMOS_NOTIFY_QUEUE` | `256` | Pending-delivery queue size |
 | `TELEGRAM_BOT_TOKEN` | — | Deployment bot credential; never leaves the server |
-| `TELEGRAM_BOT_USERNAME` | — | The public half, needed to build the pairing link |
+| `TELEGRAM_BOT_USERNAME` | *(derived)* | Optional; resolved from the token via getMe when unset |
 | `TELEGRAM_CHAT_ID` | — | Legacy fixed recipient; QR pairing replaces it |
 | `NEMOS_DASHBOARD_URL` | — | Base URL alerts link back to; `https://` for a button |
 | `NEMOS_TELEGRAM_BRIEF_HOUR` | — | UTC hour for the daily brief; unset is off |
@@ -1133,7 +1142,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 969 tests
+python -m pytest -q                              # 979 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit

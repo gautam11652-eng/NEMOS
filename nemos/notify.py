@@ -18,6 +18,7 @@ Design constraints, in priority order:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -310,6 +311,77 @@ def telegram_api(token: str, method: str, params: Mapping[str, Any] | None = Non
             f"{method} failed ({status}): {redact(description, token)[:200] or status}"
         )
     return payload.get("result")
+
+
+# Resolved bot usernames, keyed by a hash of the token rather than the token, so
+# a heap dump or a stray repr cannot yield the credential. Bounded because the
+# key is configuration rather than traffic, but bounded anyway on principle.
+_USERNAME_CACHE: OrderedDict[str, tuple[str, float]] = OrderedDict()
+_USERNAME_LOCK = threading.Lock()
+_USERNAME_CACHE_MAX = 8
+# A success is cached for the process's life; a failure only briefly, so a
+# transient outage does not pin "unavailable" until the next restart.
+_USERNAME_FAILURE_TTL = 60.0
+
+
+def resolve_bot_username(token: str, *, api: Callable[..., Any] | None = None,
+                         now: float | None = None) -> tuple[str, str]:
+    """Ask Telegram what this bot is called. Returns ``(username, error)``.
+
+    ``TELEGRAM_BOT_USERNAME`` exists so an operator *can* pin the value, but
+    requiring it was redundant: the token already determines it, and getMe will
+    say so. Worse, it was the one setting a typo in which fails silently --
+    NEMOS would render a perfectly valid QR code pointing at a bot that does
+    not exist, and the operator would find out by scanning it.
+
+    One network call per token per process. The token is never logged, never
+    returned, and never used as a cache key in plaintext.
+    """
+    token = str(token or "").strip()
+    if not token:
+        return "", "no bot token is configured"
+    now = time.time() if now is None else now
+    key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    with _USERNAME_LOCK:
+        cached = _USERNAME_CACHE.get(key)
+        if cached is not None:
+            username, expires = cached
+            if username or expires > now:
+                _USERNAME_CACHE.move_to_end(key)
+                return username, "" if username else "Telegram did not identify this bot"
+
+    call = api or telegram_api
+    try:
+        me = call(token, "getMe", timeout=10.0)
+    except Exception as exc:
+        # Deliberately not cached as a success: a network blip must not pin the
+        # dashboard to "unavailable" for the rest of the process's life.
+        message = redact(str(exc), token)[:200]
+        with _USERNAME_LOCK:
+            _USERNAME_CACHE[key] = ("", now + _USERNAME_FAILURE_TTL)
+            while len(_USERNAME_CACHE) > _USERNAME_CACHE_MAX:
+                _USERNAME_CACHE.popitem(last=False)
+        return "", f"could not ask Telegram for the bot username: {message}"
+
+    username = _bot_username(str((me or {}).get("username") or ""))
+    with _USERNAME_LOCK:
+        _USERNAME_CACHE[key] = (username, now + _USERNAME_FAILURE_TTL)
+        _USERNAME_CACHE.move_to_end(key)
+        while len(_USERNAME_CACHE) > _USERNAME_CACHE_MAX:
+            _USERNAME_CACHE.popitem(last=False)
+    if not username:
+        return "", "Telegram accepted the token but returned no usable bot username"
+    return username, ""
+
+
+def forget_bot_username(token: str = "") -> None:
+    """Drop cached usernames. Used by tests and after a credential change."""
+    with _USERNAME_LOCK:
+        if token:
+            _USERNAME_CACHE.pop(hashlib.sha256(token.encode("utf-8")).hexdigest(), None)
+        else:
+            _USERNAME_CACHE.clear()
 
 
 def format_alert_text(alert: Mapping[str, Any], *, detail: str = "",

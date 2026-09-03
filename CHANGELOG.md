@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed
+
+- **`TELEGRAM_BOT_USERNAME` is no longer required.** The token already
+  determines the username, so NEMOS asks Telegram once (`getMe`) and caches the
+  answer instead of making an operator look it up and retype it. That was not
+  merely extra work: it was the one setting whose typo failed *silently*,
+  rendering a perfectly valid QR code that pointed at a bot which did not exist.
+  Setting it explicitly still wins, for a deployment that would rather not make
+  the call. A deployment's entire Telegram configuration is now one value.
+
+  The token itself cannot be removed — Telegram has no anonymous send path, so a
+  token *is* the bot's identity. What is removed is everyone else having to
+  handle one.
+
 ### Fixed
 
 - **Packet capture reported the wrong problem.** On Kali the sensor showed

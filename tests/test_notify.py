@@ -12,7 +12,9 @@ from nemos.notify import (
     DeliveryError,
     NotifierConfig,
     TelegramChannel,
+    forget_bot_username,
     format_alert_text,
+    resolve_bot_username,
     redact,
     valid_webhook_url,
 )
@@ -257,6 +259,89 @@ class PairedAudienceTests(unittest.TestCase):
     def test_a_notifier_with_no_token_builds_no_telegram_channel(self):
         notifier = AlertNotifier(NotifierConfig(), chat_ids=lambda: ["111"])
         self.assertEqual(notifier.channels, [])
+
+
+class ResolveUsernameTests(unittest.TestCase):
+    """TELEGRAM_BOT_USERNAME is derivable, so it is no longer required."""
+
+    def setUp(self):
+        forget_bot_username()
+        self.addCleanup(forget_bot_username)
+
+    def test_the_username_comes_back_from_getme(self):
+        calls = []
+
+        def api(token, method, params=None, timeout=15.0, api_base=""):
+            calls.append(method)
+            return {"username": "nemos_sentinel_bot", "first_name": "NEMOS"}
+
+        username, error = resolve_bot_username("t" * 20, api=api)
+        self.assertEqual(username, "nemos_sentinel_bot")
+        self.assertEqual(error, "")
+        self.assertEqual(calls, ["getMe"])
+
+    def test_the_answer_is_cached_so_it_costs_one_call_per_process(self):
+        calls = []
+
+        def api(token, method, params=None, timeout=15.0, api_base=""):
+            calls.append(method)
+            return {"username": "cached_bot"}
+
+        for _ in range(5):
+            resolve_bot_username("t" * 20, api=api)
+        self.assertEqual(len(calls), 1)
+
+    def test_no_token_means_no_call_at_all(self):
+        def api(*args, **kwargs):
+            raise AssertionError("getMe must not be called without a token")
+
+        username, error = resolve_bot_username("", api=api)
+        self.assertEqual(username, "")
+        self.assertIn("no bot token", error)
+
+    def test_a_failure_is_reported_and_not_cached_as_success(self):
+        attempts = []
+
+        def failing(token, method, params=None, timeout=15.0, api_base=""):
+            attempts.append(method)
+            raise DeliveryError("could not reach Telegram")
+
+        username, error = resolve_bot_username("t" * 20, api=failing, now=1000.0)
+        self.assertEqual(username, "")
+        self.assertIn("could not ask Telegram", error)
+        # Briefly cached so an outage is not hammered...
+        resolve_bot_username("t" * 20, api=failing, now=1001.0)
+        self.assertEqual(len(attempts), 1)
+        # ...but retried once the short failure window passes.
+        resolve_bot_username("t" * 20, api=failing, now=1200.0)
+        self.assertEqual(len(attempts), 2)
+
+    def test_the_token_never_appears_in_an_error(self):
+        token = "8640946561:AAsecret-part-of-the-token"  # noqa: S105
+
+        def failing(t, method, params=None, timeout=15.0, api_base=""):
+            raise DeliveryError(f"401 for bot{token}")
+
+        _, error = resolve_bot_username(token, api=failing)
+        self.assertNotIn(token, error)
+        self.assertNotIn("AAsecret", error)
+        self.assertIn("***", error)
+
+    def test_a_username_telegram_returns_is_still_validated(self):
+        """The value is interpolated into the link a QR code encodes."""
+        def api(token, method, params=None, timeout=15.0, api_base=""):
+            return {"username": "bad/../name"}
+
+        username, error = resolve_bot_username("t" * 20, api=api)
+        self.assertEqual(username, "")
+        self.assertIn("no usable bot username", error)
+
+    def test_different_tokens_do_not_share_a_cached_answer(self):
+        def api(token, method, params=None, timeout=15.0, api_base=""):
+            return {"username": f"bot_{token[-1]}"}
+
+        self.assertEqual(resolve_bot_username("token_a", api=api)[0], "bot_a")
+        self.assertEqual(resolve_bot_username("token_b", api=api)[0], "bot_b")
 
 
 class BotUsernameTests(unittest.TestCase):
