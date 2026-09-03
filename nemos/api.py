@@ -20,7 +20,12 @@ from .models import TrafficEvent
 from .intelligence import summarize_incident, valid_incident_id
 from .analyst import collect_evidence
 from .attack import catalog as attack_catalog, enrich_alert
-from .notify import NotifierConfig, TELEGRAM_API_BASE, telegram_api
+from .notify import (
+    NotifierConfig,
+    TELEGRAM_API_BASE,
+    resolve_bot_username,
+    telegram_api,
+)
 from .pairing import PairingStore
 from .qr import QRError, svg as qr_svg
 from .telegram import TEST_NOTIFICATION
@@ -992,13 +997,24 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
     # a response body, a log line, or the page. What the browser receives is the
     # public t.me link and a QR rendering of it.
 
-    def _telegram_settings() -> tuple[str, str]:
-        """(token, bot_username) from the environment, read fresh each call."""
+    def _telegram_settings() -> tuple[str, str, str]:
+        """(token, bot_username, error), read fresh from the environment.
+
+        TELEGRAM_BOT_USERNAME is optional: the token already determines the
+        username, so when it is unset NEMOS asks Telegram once rather than
+        making an operator look it up and retype it. Setting it explicitly
+        still wins, for a deployment that would rather not make the call.
+        """
         config = NotifierConfig.from_env()
-        return config.telegram_token, config.telegram_bot_username
+        if not config.telegram_token:
+            return "", "", "TELEGRAM_BOT_TOKEN is not set on this deployment"
+        if config.telegram_bot_username:
+            return config.telegram_token, config.telegram_bot_username, ""
+        username, error = resolve_bot_username(config.telegram_token)
+        return config.telegram_token, username, error
 
     def _pairing_state() -> dict[str, Any]:
-        token, username = _telegram_settings()
+        token, username, resolve_error = _telegram_settings()
         state: dict[str, Any] = {
             "available": bool(token and username and pairing is not None),
             "bot_username": username,
@@ -1006,10 +1022,8 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
             "linked": [],
             "pending": None,
         }
-        if not token:
-            state["error"] = "TELEGRAM_BOT_TOKEN is not set on this deployment"
-        elif not username:
-            state["error"] = "TELEGRAM_BOT_USERNAME is not set on this deployment"
+        if resolve_error:
+            state["error"] = resolve_error
         elif pairing is None:
             state["error"] = "pairing storage is unavailable"
         if pairing is not None:
@@ -1040,7 +1054,7 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
         The plaintext code exists in exactly one response, to the authenticated
         operator who asked for it. NEMOS keeps only its hash.
         """
-        token, username = _telegram_settings()
+        token, username, _ = _telegram_settings()
         if pairing is None or not token or not username:
             state = _pairing_state()
             return jsonify(ok=False, error=state.get("error") or "pairing unavailable"), 503
@@ -1081,7 +1095,7 @@ def create_app(settings: Settings, writer, capture=None, notifier=None, analysis
     @app.post("/api/telegram/test")
     def telegram_test():
         """Send the confirmation message to every paired chat."""
-        token, _ = _telegram_settings()
+        token, _, _ = _telegram_settings()
         chat_ids = list(pairing.chat_ids()) if pairing is not None else []
         legacy = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         if legacy and legacy not in chat_ids:

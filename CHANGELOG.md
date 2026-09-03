@@ -2,6 +2,73 @@
 
 ## Unreleased
 
+### Added
+
+- **`tools/benchmark_detection.py` — detection quality, measured.** NEMOS could
+  say how many packets per second it processed and nothing at all about whether
+  it detects. This replays every labelled scenario through the real detector and
+  reports precision, recall, F1, false-positive rate and detection latency, per
+  detection type, with `--json` output.
+
+  Ground truth lives in `Scenario.expected` and is decided from the traffic
+  shape, independently of what the detector emits — labelling scenarios with
+  whatever NEMOS already finds would make recall 1.0 by construction and measure
+  nothing. It is a *set* of acceptable answers, because 199 destinations on port
+  445 is honestly either a fan-out or lateral movement, and an unfired
+  alternative is not charged as a miss.
+
+  False positives are split into two populations. Firings on benign traffic are
+  the unambiguous kind and are what precision is computed from; firings on
+  malicious traffic labelled as something else are tracked in their own column
+  and kept out of precision, since the traffic really was suspicious.
+
+- **Three hard benign scenarios**: `nat_gateway`, `monitoring_host`,
+  `backup_window`. `normal_traffic` is paced below the detector's thresholds by
+  construction, so a false-positive rate measured against it alone was close to
+  circular — it reported 100% precision and zero false positives. Against
+  legitimate traffic *shaped like an attack*, precision is 58.2% and the rate is
+  1.44 per replay. Those false positives are documented in the README with the
+  reason each occurs, and are deliberately not tuned away: the difference
+  between a NAT gateway and a scanner is authorisation, which packet metadata
+  does not carry.
+
+  Measured on the committed defaults: recall 100%, precision 58.2%, F1 73.6%,
+  median detection latency 1.20s of scenario time.
+
+- **A delivery path that needs no credential at all.**
+  `NEMOS_WEBHOOK_FORMAT=text` posts the same rendered report Telegram receives
+  as `text/plain`, which push services such as ntfy turn straight into a phone
+  notification — severity also becomes the notification's priority and tag.
+  Two settings, no token, no chat id, no account.
+
+  This exists because a Telegram bot token genuinely cannot be removed: a token
+  *is* the bot's identity, and the API has no unauthenticated send path. Rather
+  than pretend otherwise, NEMOS now offers a route that reaches a phone with
+  nothing to hold. The cost is stated rather than glossed: the URL is the only
+  thing protecting the feed, and there are no inline actions or commands.
+
+  Header values derived from findings are flattened and latin-1 coerced, since a
+  threat name comes from observed traffic and a newline in one would otherwise
+  inject a header.
+
+### Changed
+
+- The pairing action is named **Connect Telegram**, matching what it does
+  rather than how it does it, and the console no longer names
+  `TELEGRAM_BOT_USERNAME` as something an administrator must set -- deriving it
+  made that copy wrong the moment it landed.
+- **`TELEGRAM_BOT_USERNAME` is no longer required.** The token already
+  determines the username, so NEMOS asks Telegram once (`getMe`) and caches the
+  answer instead of making an operator look it up and retype it. That was not
+  merely extra work: it was the one setting whose typo failed *silently*,
+  rendering a perfectly valid QR code that pointed at a bot which did not exist.
+  Setting it explicitly still wins, for a deployment that would rather not make
+  the call. A deployment's entire Telegram configuration is now one value.
+
+  The token itself cannot be removed — Telegram has no anonymous send path, so a
+  token *is* the bot's identity. What is removed is everyone else having to
+  handle one.
+
 ### Fixed
 
 - **Packet capture reported the wrong problem.** On Kali the sensor showed

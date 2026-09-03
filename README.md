@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 967 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 1,015 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -808,6 +808,81 @@ abnormal scenario is detected:
 | rate_deviation | 1239 | 2 | 84 | 100 | POSSIBLE_RECONNAISSANCE |
 | icmp_sweep | 119 | 3 | 100 | 100 | POSSIBLE_RECONNAISSANCE |
 
+## Detection benchmark
+
+Throughput is not detection quality. `tools/benchmark.py` answers "how many
+packets per second"; this answers the question that decides whether a detector
+is worth deploying:
+
+```bash
+python tools/benchmark_detection.py
+python tools/benchmark_detection.py --repeats 20 --json results.json
+```
+
+Every scenario in `tools/scenarios.py` carries machine-readable ground truth
+(`Scenario.expected`) decided from the **traffic shape**, independently of what
+NEMOS emits. That independence is the point — labelling scenarios with whatever
+the detector already finds would make recall 1.0 by construction.
+
+### Results
+
+20 replays per scenario, each with a different seed, on the committed defaults
+(10s window, confidence floor 55). Reproduce with the command above.
+
+| Detection | Precision | Recall | F1 | FP on benign |
+| --- | ---: | ---: | ---: | ---: |
+| PORT_SCAN | 100% | 100% | 100% | 0 |
+| TCP_SYN_SCAN | 100% | 100% | 100% | 0 |
+| UDP_PORT_SCAN | 100% | 100% | 100% | 0 |
+| ICMP_SWEEP | 100% | 100% | 100% | 0 |
+| ICMP_FLOOD_PATTERN | 100% | 100% | 100% | 0 |
+| DNS_BURST | 100% | 100% | 100% | 0 |
+| SYN_FLOOD_PATTERN | 100% | 100% | 100% | 0 |
+| SERVICE_CONNECTION_BURST | 100% | 100% | 100% | 0 |
+| BEHAVIORAL_TRAFFIC_ANOMALY | 100% | 100% | 100% | 0 |
+| SERVICE_DENIAL_OF_SERVICE | 66.7% | 100% | 80% | 20 |
+| NETWORK_FANOUT | 33.3% | 100% | 50% | 40 |
+
+**Overall: recall 100%, precision 58.2%, F1 73.6%** — 160 true positives, 0
+false negatives, 115 false positives across 80 benign replays (1.44 per
+replay). Median detection latency **1.20s** of scenario time.
+
+### The false positives are real, and not tuned away
+
+Recall is 100% because the attack scenarios are unambiguous. Precision is 58%
+because the benign corpus is deliberately hard: three of the four benign
+scenarios are *legitimate traffic shaped like an attack*, which is where real
+false positives come from.
+
+| Benign scenario | What NEMOS says | Why |
+| --- | --- | --- |
+| `nat_gateway` | NETWORK_FANOUT, PASSWORD_SPRAYING | One address speaking for a whole office contacts many destinations on many ports. Indistinguishable from a scan without knowing it is a gateway |
+| `monitoring_host` | NETWORK_FANOUT | A metrics poller contacting 39 hosts on a schedule is shaped exactly like discovery |
+| `backup_window` | C2_BEACONING, CREDENTIAL_BRUTE_FORCE, SERVICE_DENIAL_OF_SERVICE | A nightly bulk transfer to an SMB server looks like exfiltration, brute force and a flood at once |
+
+These are **not** bugs to be fixed by raising thresholds. Each is a case where
+packet metadata genuinely does not carry the distinguishing information — the
+difference is authorisation and role, which no amount of header inspection
+reveals. The honest fix is context (an asset inventory that knows which address
+is the gateway, the poller and the backup target), not a threshold that makes
+the number look better while blinding the detector to the real version of the
+same shape.
+
+An earlier version of this benchmark measured only against `normal_traffic`,
+which is *paced below the detector's thresholds by construction*, and reported
+100% precision with zero false positives. That figure was close to circular and
+has been removed rather than quoted.
+
+### What it does not measure
+
+- **The ML model.** These figures are the deterministic rules only. Nothing
+  here evaluates the Isolation Forest; see the note under Training.
+- **Real network traffic.** The corpus is synthetic. It exercises the shapes the
+  rules target, not the messiness of a production network.
+- **Evasion.** Nothing here is paced to slip under a window deliberately; see
+  `nemos/slowscan.py` for the tier that addresses that, which this does not
+  score.
+
 ## Alert delivery
 
 NEMOS records findings locally by default. It can also push them to Telegram or
@@ -821,12 +896,22 @@ once by whoever deploys it, and no operator should ever be asked to paste one
 into a web form. So they are not: they scan a QR code.
 
 ```bash
-# .env, beside main.py -- set once, by the deployment
+# .env, beside main.py -- one setting, set once, by the deployment
 TELEGRAM_BOT_TOKEN=the_token_from_@BotFather
-TELEGRAM_BOT_USERNAME=your_bot_username
 ```
 
-Then, on the **Sensor** page, press **Generate code**. NEMOS mints a single-use
+That is the whole configuration. `TELEGRAM_BOT_USERNAME` is optional: the token
+already determines the username, so NEMOS asks Telegram once and caches the
+answer rather than making you look it up and retype it — which was not just
+extra work but the one setting whose typo failed *silently*, rendering a
+perfectly valid QR code that pointed at a bot which did not exist.
+
+The bot token cannot be eliminated. Telegram has no anonymous send path — a
+token *is* the bot's identity. What NEMOS removes is everyone else having to
+handle one: it is set once by whoever deploys the sensor, stays server-side, and
+no operator is ever asked for a credential or a chat id.
+
+Then, on the **Sensor** page, press **Connect Telegram**. NEMOS mints a single-use
 pairing code, renders `https://t.me/<bot>?start=<code>` as a QR code, and counts
 down its five-minute life. Scan it, press **Start**, and that chat is linked.
 Alerts begin arriving immediately — no restart, no chat id to look up.
@@ -947,24 +1032,55 @@ environment or `.env`, never from arguments, and never printed.
 ### Telegram
 
 1. Open Telegram and start a chat with **@BotFather**.
-2. Create a bot with `/newbot`; copy the token and note the username it gives you.
+2. Create a bot with `/newbot` and copy the token. You do not need the username.
 3. Add both to `.env` — this is the only Telegram configuration a deployment needs:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_BOT_USERNAME=your_bot_username
 ```
 
-4. Open the **Sensor** page and press **Generate code**, then scan the QR code.
+4. Open the **Sensor** page and press **Connect Telegram**, then scan the QR code.
 
 `TELEGRAM_CHAT_ID` remains supported for a single fixed recipient, but is no
 longer required: paired chats are the delivery audience.
+
+### Phone alerts with no credentials at all
+
+A Telegram bot token cannot be avoided — a token *is* the bot's identity, and
+Telegram has no unauthenticated send path. If you want alerts on a phone and are
+not willing to hold any credential, use a push service instead:
+
+```env
+NEMOS_WEBHOOK_URL=https://ntfy.sh/pick-something-long-and-unguessable
+NEMOS_WEBHOOK_FORMAT=text
+```
+
+That is the entire configuration. No token, no chat id, no account, no signup.
+Install the ntfy app, subscribe to that topic, and findings arrive as push
+notifications carrying the same rendered report Telegram gets — severity,
+evidence, ATT&CK technique, incident id — with the severity also set as the
+notification's priority and tag.
+
+What you give up, stated plainly:
+
+| | Telegram | `text` webhook |
+| --- | --- | --- |
+| Credential to hold | one bot token, set once | **none** |
+| Report format | full structured report | the same report |
+| Inline actions (Investigate / Acknowledge) | yes | no |
+| Commands (`/status`, `/incidents`, …) | yes | no |
+| Who can read your alerts | only paired chats | **anyone who guesses the URL** |
+
+That last row is the real cost. The topic name is the only thing protecting the
+feed, so treat it as a password: long, random, never committed. A short or
+guessable topic publishes your network's security findings to whoever tries it.
 
 ### Webhook
 
 ```env
 NEMOS_WEBHOOK_URL=https://your-collector.example/hook
 NEMOS_WEBHOOK_TOKEN=optional_bearer_token
+NEMOS_WEBHOOK_FORMAT=json
 ```
 
 The URL must be HTTPS unless it points at loopback: alert bodies describe your
@@ -1013,8 +1129,9 @@ asserts a forged `CEF:0|Evil|...|All clear` inside a finding stays inside the
 | `NEMOS_NOTIFY_RATE` | `12` | Maximum messages per minute |
 | `NEMOS_NOTIFY_TIMEOUT` | `5.0` | Per-request timeout |
 | `NEMOS_NOTIFY_QUEUE` | `256` | Pending-delivery queue size |
+| `NEMOS_WEBHOOK_FORMAT` | `json` | `text` posts the rendered report for push services |
 | `TELEGRAM_BOT_TOKEN` | — | Deployment bot credential; never leaves the server |
-| `TELEGRAM_BOT_USERNAME` | — | The public half, needed to build the pairing link |
+| `TELEGRAM_BOT_USERNAME` | *(derived)* | Optional; resolved from the token via getMe when unset |
 | `TELEGRAM_CHAT_ID` | — | Legacy fixed recipient; QR pairing replaces it |
 | `NEMOS_DASHBOARD_URL` | — | Base URL alerts link back to; `https://` for a button |
 | `NEMOS_TELEGRAM_BRIEF_HOUR` | — | UTC hour for the daily brief; unset is off |
@@ -1133,7 +1250,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 967 tests
+python -m pytest -q                              # 1,015 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
