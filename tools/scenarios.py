@@ -43,6 +43,24 @@ class Scenario:
     description: str
     expectation: str
     events: list[tuple[float, TrafficEvent]] = field(default_factory=list)
+    #: Machine-readable ground truth: the deterministic findings this traffic
+    #: shape ought to produce. ``expectation`` above says the same thing in
+    #: prose, for a human reading demo output; this is what the benchmark
+    #: scores against.
+    #:
+    #: A *set* rather than a single name, because more than one finding can be
+    #: a correct reading of the same shape -- 199 destinations on port 445 is
+    #: honestly either a fan-out or lateral movement, and a benchmark that
+    #: insisted on one would penalise the detector for being right in the other
+    #: way. Anything outside the set is counted as a misattribution and
+    #: reported separately rather than quietly accepted.
+    #:
+    #: Empty means "nothing should fire". That is the false-positive corpus.
+    expected: tuple[str, ...] = ()
+
+    @property
+    def benign(self) -> bool:
+        return not self.expected
 
     @property
     def duration(self) -> float:
@@ -110,6 +128,7 @@ def normal_traffic(seed: int = 1, hosts: int = 6, seconds: float = 60.0) -> Scen
         "Six workstations using a small set of internal servers on common ports.",
         "No detection. This is the baseline the model is trained on.",
         events,
+        (),
     )
 
 
@@ -128,6 +147,8 @@ def connection_burst(seed: int = 2) -> Scenario:
         "400 connection attempts to a single service in ten seconds.",
         "Elevated packet rate and SYN ratio against the host baseline.",
         events,
+        ("SERVICE_CONNECTION_BURST", "SERVICE_DENIAL_OF_SERVICE",
+         "SYN_FLOOD_PATTERN"),
     )
 
 
@@ -146,6 +167,7 @@ def destination_fanout(seed: int = 3) -> Scenario:
         "One host probing 199 destinations on port 445.",
         "NETWORK_FANOUT; high destination entropy, low port entropy.",
         events,
+        ("NETWORK_FANOUT", "LATERAL_MOVEMENT"),
     )
 
 
@@ -163,6 +185,7 @@ def port_sweep(seed: int = 4) -> Scenario:
         "259 distinct destination ports on a single host.",
         "PORT_SCAN / TCP_SYN_SCAN; high port entropy, SYN ratio near 1.0.",
         events,
+        ("PORT_SCAN", "TCP_SYN_SCAN"),
     )
 
 
@@ -184,6 +207,7 @@ def abnormal_tcp(seed: int = 5) -> Scenario:
         "A SYN flood pattern with resets and no established sessions.",
         "SYN_FLOOD_PATTERN; SYN ratio high, ACK ratio near zero.",
         events,
+        ("SYN_FLOOD_PATTERN", "SERVICE_DENIAL_OF_SERVICE"),
     )
 
 
@@ -201,6 +225,7 @@ def unusual_udp(seed: int = 6) -> Scenario:
         "119 distinct UDP destination ports on one host.",
         "UDP_PORT_SCAN; udp_ratio 1.0 with high port entropy.",
         events,
+        ("UDP_PORT_SCAN",),
     )
 
 
@@ -219,6 +244,7 @@ def dns_deviation(seed: int = 7) -> Scenario:
         "300 DNS queries from a single host in ten seconds.",
         "DNS_BURST; dns_ratio 1.0 well above the host baseline.",
         events,
+        ("DNS_BURST", "DNS_TUNNELING_PATTERN"),
     )
 
 
@@ -243,6 +269,7 @@ def rate_deviation(seed: int = 8) -> Scenario:
         "A host with a settled profile that abruptly transfers at high volume.",
         "Behavioural deviation once the baseline has warmed up.",
         events,
+        ("BEHAVIORAL_TRAFFIC_ANOMALY",),
     )
 
 
@@ -260,11 +287,91 @@ def icmp_sweep(seed: int = 9) -> Scenario:
         "ICMP echo to 119 destinations.",
         "ICMP_SWEEP; icmp_ratio 1.0 with high destination entropy.",
         events,
+        ("ICMP_SWEEP", "ICMP_FLOOD_PATTERN"),
+    )
+
+
+def nat_gateway(seed: int = 11) -> Scenario:
+    """One address speaking for a whole office behind NAT.
+
+    The classic false positive. Every workstation's traffic leaves through a
+    single source address, so one IP legitimately contacts many destinations on
+    many ports -- statistically indistinguishable from a scan without knowing
+    that the address is a gateway.
+    """
+    rng = random.Random(seed)
+    gateway = f"{INTERNAL}.1"
+    ports = [443, 443, 443, 80, 443, 993, 587, 22, 3306]
+    events = [
+        _event(rng.uniform(0, 60), gateway, f"{EXTERNAL}.{rng.randint(1, 90)}", "TCP",
+               rng.randint(30000, 60000), rng.choice(ports),
+               rng.randint(400, 1400), rng.choice(["S", "PA", "FA", "A"]))
+        for _ in range(220)
+    ]
+    events.sort(key=lambda item: item[0])
+    return Scenario(
+        "nat_gateway",
+        "220 connections from one NAT address to 90 destinations over a minute.",
+        "No detection. One address speaking for many users is not a scan.",
+        events,
+        (),
+    )
+
+
+def monitoring_host(seed: int = 12) -> Scenario:
+    """A monitoring server polling its fleet on a fixed interval.
+
+    Contacts many hosts, on a schedule, forever. Shaped like a sweep and like
+    beaconing at the same time, and entirely legitimate.
+    """
+    rng = random.Random(seed)
+    poller = f"{INTERNAL}.9"
+    events = []
+    for cycle in range(4):
+        base = cycle * 15.0
+        for host in range(1, 40):
+            events.append(_event(base + host * 0.05 + rng.uniform(0, 0.02),
+                                 poller, f"{SERVERS}.{host}", "TCP",
+                                 rng.randint(30000, 60000), 9100, 120, "S"))
+    events.sort(key=lambda item: item[0])
+    return Scenario(
+        "monitoring_host",
+        "A metrics poller contacting 39 hosts every 15 seconds, four times.",
+        "No detection. Scheduled polling of a known fleet is not discovery.",
+        events,
+        (),
+    )
+
+
+def backup_window(seed: int = 13) -> Scenario:
+    """A nightly backup: one host, one destination, sustained high volume.
+
+    Shaped exactly like bulk exfiltration. The difference is authorisation,
+    which no amount of packet metadata can reveal.
+    """
+    rng = random.Random(seed)
+    source = f"{INTERNAL}.40"
+    events = []
+    t = 0.0
+    while t < 50.0:
+        events.append(_event(t, source, f"{SERVERS}.20", "TCP",
+                             rng.randint(30000, 60000), 445,
+                             rng.randint(1300, 1500), "PA"))
+        t += rng.uniform(0.01, 0.03)
+    return Scenario(
+        "backup_window",
+        "A sustained 50-second bulk transfer to one internal backup server.",
+        "No detection. Volume alone is not evidence of exfiltration.",
+        events,
+        (),
     )
 
 
 #: Scenario A is the baseline; B-I are the abnormal shapes from the detection
-#: requirements. Order is stable so demo output is comparable across runs.
+#: requirements. The three that follow are *hard* benign traffic: legitimate
+#: activity shaped like an attack, which is where real false positives come
+#: from. `normal` is paced below the thresholds by construction, so measuring a
+#: false-positive rate against it alone would be close to circular.
 SCENARIOS = {
     "normal": normal_traffic,
     "connection_burst": connection_burst,
@@ -275,9 +382,20 @@ SCENARIOS = {
     "dns_deviation": dns_deviation,
     "rate_deviation": rate_deviation,
     "icmp_sweep": icmp_sweep,
+    "nat_gateway": nat_gateway,
+    "monitoring_host": monitoring_host,
+    "backup_window": backup_window,
 }
 
-ATTACK_SCENARIOS = tuple(name for name in SCENARIOS if name != "normal")
+#: Traffic that must produce no finding. `normal` is ordinary and quiet; the
+#: other three are busy, and are the ones that actually test restraint.
+BENIGN_SCENARIOS = ("normal", "nat_gateway", "monitoring_host", "backup_window")
+
+
+#: Every scenario whose ground truth says something ought to fire.
+ATTACK_SCENARIOS = tuple(
+    name for name in SCENARIOS if name not in BENIGN_SCENARIOS
+)
 
 
 def build(name: str, **kwargs) -> Scenario:
