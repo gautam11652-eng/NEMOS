@@ -525,17 +525,10 @@ class PacketCapture:
                     self._packets_seen += 1
                     self._last_packet = now
                     self._state = "running"
-                if p.haslayer(ARP):
-                    a = p[ARP]
-                    if a.psrc and a.hwsrc:
-                        self.on_event(
-                            TrafficEvent(
-                                utc_now(), str(a.psrc), str(a.pdst), "ARP",
-                                packet_size=len(p), interface=self.interface or "",
-                                metadata={"mac": str(a.hwsrc)},
-                            ),
-                            "ARP",
-                        )
+                arp_event, arp_type = self._parse_arp(
+                    p, ARP, self.interface or "")
+                if arp_event is not None:
+                    self.on_event(arp_event, arp_type)
                 event, ptype = self._parse(
                     p, IP, TCP, UDP, ICMP, DNS, self.interface or "", IPv6,
                 )
@@ -618,7 +611,31 @@ class PacketCapture:
             raise
 
     @staticmethod
-    def _parse(packet, IP, TCP, UDP, ICMP, DNS, interface="", IPv6=None):
+    def _parse_arp(packet, ARP, interface="", when=None):
+        """Translate one ARP packet into a TrafficEvent.
+
+        This lived inline in the sniff callback, which made it the one parse
+        path a capture-file replay could not reach without copying it -- the
+        exact duplication that had already let the IP parser drift. See
+        ``_parse`` for ``when``.
+
+        Returns ``(None, "")`` for anything that is not an ARP claim.
+        """
+        if not packet.haslayer(ARP):
+            return None, ""
+        a = packet[ARP]
+        if not (a.psrc and a.hwsrc):
+            return None, ""
+        return TrafficEvent(
+            utc_now() if when is None else when,
+            str(a.psrc), str(a.pdst), "ARP",
+            packet_size=len(packet), interface=interface,
+            metadata={"mac": str(a.hwsrc)},
+        ), "ARP"
+
+    @staticmethod
+    def _parse(packet, IP, TCP, UDP, ICMP, DNS, interface="", IPv6=None,
+               when=None):
         """Translate one dissected packet into a TrafficEvent.
 
         This is the only parse implementation, and the capture thread calls it
@@ -626,6 +643,11 @@ class PacketCapture:
         previously a second copy inlined in the sniff callback; the two had
         already drifted, which is precisely how a parse path acquires a bug
         that no test can see.
+
+        ``when`` supplies the timestamp. Live capture leaves it unset and the
+        packet is stamped on arrival; replaying a capture file passes the
+        packet's own recorded time, because stamping a two-year-old PCAP with
+        "now" would put every packet inside one analysis window.
 
         Returns ``(None, "")`` for anything that is not IPv4 or IPv6.
         """
@@ -674,6 +696,7 @@ class PacketCapture:
             metadata["mac"] = ndp_mac
         metadata.update(tls)
         return TrafficEvent(
-            utc_now(), str(ip.src), str(ip.dst), proto, sp, dp, len(packet),
+            utc_now() if when is None else when,
+            str(ip.src), str(ip.dst), proto, sp, dp, len(packet),
             flags, interface, metadata=metadata,
         ), ptype

@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Capture-file replay** (`tools/replay_pcap.py`). Runs a `.pcap`/`.pcapng`
+  through the live parser and the live detection rules, offline. The detector's
+  clock is driven by each packet's recorded timestamp rather than by read
+  speed: on a real capture of a sweep paced under the rule, the packet clock
+  correctly raises nothing while a wall clock fabricates a `PORT_SCAN` from the
+  same bytes. Both directions are pinned by tests. Reports parse robustness
+  (malformed packets by exception type, non-IP frames, out-of-order packets)
+  and, given an attack schedule, scores findings against ground truth with
+  precision and recall kept on separate denominators. See
+  `docs/PCAP_REPLAY.md`.
+- `PacketCapture._parse` and the new `_parse_arp` accept an optional `when`, so
+  replay stamps events with the packet's own time. The ARP branch moved out of
+  the sniff callback for this: it was the one parse path a replay could not
+  reach without copying it, which is the duplication that had already let the
+  IP parser drift once.
+
 - **`tools/benchmark_detection.py` — detection quality, measured.** NEMOS could
   say how many packets per second it processed and nothing at all about whether
   it detects. This replays every labelled scenario through the real detector and

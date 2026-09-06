@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 1,015 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 1,038 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -883,6 +883,40 @@ has been removed rather than quoted.
   `nemos/slowscan.py` for the tier that addresses that, which this does not
   score.
 
+## Replaying capture files
+
+The benchmark above measures a **synthetic** corpus. `tools/replay_pcap.py`
+runs a real `.pcap`/`.pcapng` through the same parser and the same rules a live
+sensor uses, offline:
+
+```bash
+python tools/replay_pcap.py capture.pcap
+python tools/replay_pcap.py capture.pcap --labels schedule.json --json out.json
+```
+
+It answers two things synthetic traffic cannot: whether the parsing layer
+survives real packets (truncated headers, VLAN tags, tunnels, unusual link
+types — counted by exception type, never silently skipped), and what NEMOS
+detects on labelled traffic when given an attack schedule.
+
+**The detector's clock comes from the packet timestamps**, not from how fast
+the file is read. This is the difference between a measurement and an artifact,
+and it is measured rather than asserted — on a real capture of a sweep paced
+under the rule (27 ports over 104s, ~3 per window against `port_scan` of 8):
+
+| Clock | Findings |
+| --- | --- |
+| Packet timestamps | **none** — correctly, the sweep is under the rule |
+| Wall clock | **PORT_SCAN** — an artifact of replaying 104s in 0.57s |
+
+Precision and recall are reported with **separate denominators** and not folded
+together: precision is per finding (and requires the source to match the
+labelled attacker), recall is per labelled window.
+
+See [`docs/PCAP_REPLAY.md`](docs/PCAP_REPLAY.md) for the schedule format and
+notes on the public datasets — including why CIC-IDS's bundled CSVs are the
+wrong *input* for a unidirectional engine but a perfectly good *label* source.
+
 ## Alert delivery
 
 NEMOS records findings locally by default. It can also push them to Telegram or
@@ -1250,7 +1284,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 1,015 tests
+python -m pytest -q                              # 1,038 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
