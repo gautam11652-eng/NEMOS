@@ -80,3 +80,50 @@ sudo NEMOS_API_TOKEN='your-token' NEMOS_REQUIRE_CAPTURE=true ./scripts/smoke-tes
 The smoke test uses RFC 5737 documentation IP addresses and submits one harmless
 synthetic TCP telemetry event. It checks health, dashboard access, SQLite telemetry
 persistence, status/metrics, capture state (when requested), and the dashboard JS asset.
+
+---
+
+# Installing with the packaged installer
+
+Run capture with the minimum capability rather than as root. From the project
+root on a Debian-based host:
+
+```bash
+sudo ./install.sh
+```
+
+This creates the `nemos` service account, installs pinned dependencies into
+`/opt/nemos/.venv`, creates `/var/lib/nemos` for the database, installs the
+systemd unit and starts it. Configuration lives at `/etc/nemos/nemos.env`, and
+the dashboard stays local-only at `http://127.0.0.1:5000` by default.
+
+```bash
+sudo systemctl status nemos
+sudo journalctl -u nemos -f
+```
+
+The unit grants `CAP_NET_RAW` only and keeps the application process
+unprivileged, while permitting the `AF_PACKET` and `AF_NETLINK` socket families
+Scapy needs. See [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for the manual
+layout and for the post-install smoke test.
+
+The unit also sets `WatchdogSec=90`. NEMOS pings systemd itself
+(`nemos/watchdog.py`) whenever packet capture is healthy and stops the moment
+it is not, so a capture thread that dies without the process exiting still
+gets the process restarted — `Restart=on-failure` alone only helps a process
+that actually exits. This was found as a real gap: on a live deployment the
+dashboard kept answering while capture underneath it had already died.
+
+## Remote access
+
+Do not bind to `0.0.0.0` casually. If you need a remote listener:
+
+```bash
+export NEMOS_HOST=0.0.0.0
+export NEMOS_API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export NEMOS_TRUSTED_HOSTS=192.168.1.50   # hostnames/IPs clients will actually use
+python main.py
+```
+
+NEMOS refuses to start on a wildcard bind without both. Put HTTPS and a reverse
+proxy in front of any deployment outside a trusted local network.

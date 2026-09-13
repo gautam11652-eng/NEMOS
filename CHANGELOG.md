@@ -26,6 +26,35 @@
 
 ### Changed
 
+- **The documentation was reorganised for readers.** The README had reached
+  1,502 lines, which is not a document anyone reads: it carried the full
+  configuration reference, every detection rule, the whole Telegram manual and
+  the ML training guide. It is now 351 lines covering what a new reader needs --
+  what NEMOS is and is not, how to run it, what the capture states mean, whether
+  it actually detects anything, and where to go for the rest. Nothing was
+  deleted; the depth moved verbatim into `docs/DETECTION.md`,
+  `docs/CONFIGURATION.md`, `docs/ALERTING.md`, `docs/TRAINING.md`,
+  `docs/API.md` and `docs/BENCHMARK.md`, each linked from a table on the front
+  page.
+- Root-level clutter consolidated: `AUDIT_REPORT.md` moved to
+  `docs/SECURITY_AUDIT.md`, `RELEASE_CHECKLIST.md` merged into
+  `docs/RELEASE.md`, and three overlapping one-page demo files became
+  `docs/DEMO.md`. The README's deployment section merged into the deployment
+  doc rather than existing twice, and its testing section moved to
+  `CONTRIBUTING.md`, where a contributor looks for it.
+- The documentation guard now scans `docs/` and `CONTRIBUTING.md`, not just the
+  README. Moving the test-count line out of the README during this split put it
+  somewhere nothing checked and it went stale within one commit -- so the
+  check follows the prose instead of the file.
+
+### Added
+
+- `tests/test_doc_links.py`: every relative link and every heading anchor across
+  the documentation must resolve, and every page must be reachable from the
+  README. A reorganisation is exactly when links rot, and a dead anchor is
+  invisible in a diff. It found five broken anchors in the split itself.
+
+
 - Capture now holds **one socket for the life of the capture** instead of
   opening and closing one per second. The kernel's drop counters live on the
   socket, so a fresh socket each second discarded exactly the number this

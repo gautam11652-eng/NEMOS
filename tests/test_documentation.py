@@ -16,6 +16,17 @@ ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text()
 CHANGELOG = (ROOT / "CHANGELOG.md").read_text()
 
+# The README was 1,502 lines and nobody read it, so the depth moved into docs/.
+# These checks follow it: a number is a claim wherever it is written, and prose
+# in docs/ was never covered before. Assertions that are genuinely about the
+# README -- what a reader meets first -- still name README directly.
+DOCS = "\n".join(p.read_text() for p in sorted((ROOT / "docs").glob("*.md")))
+# CONTRIBUTING.md quotes the test count too. Moving that line out of the README
+# during the docs split put it somewhere nothing checked, and it went stale
+# within one commit -- which is the drift this whole module exists to stop.
+CONTRIBUTING = (ROOT / "CONTRIBUTING.md").read_text()
+ALL_DOCS = README + "\n" + DOCS + "\n" + CONTRIBUTING
+
 
 def _detector_source() -> str:
     return (ROOT / "nemos" / "detector.py").read_text()
@@ -48,14 +59,14 @@ class CountTests(unittest.TestCase):
         # "015". A claim this check cannot read is worse than no check.
         def claimed(pattern: str) -> list[int]:
             return [int(match.replace(",", ""))
-                    for match in re.findall(pattern, README)]
+                    for match in re.findall(pattern, ALL_DOCS)]
 
         for claim in claimed(r"([\d,]{3,6}) automated tests"):
             self.assertEqual(claim, actual,
-                             f"README claims {claim} tests; {actual} are collected")
+                             f"the docs claim {claim} tests; {actual} are collected")
         for claim in claimed(r"# ([\d,]{3,6}) tests"):
             self.assertEqual(claim, actual,
-                             f"README claims {claim} tests; {actual} are collected")
+                             f"the docs claim {claim} tests; {actual} are collected")
 
     def test_documented_technique_count_is_real(self):
         from nemos.attack import TECHNIQUES
@@ -121,18 +132,22 @@ class PerformanceClaimTests(unittest.TestCase):
         default = re.search(r'"--packets".*?default=([\d_]+)', script, re.S)
         self.assertIsNotNone(default, "benchmark.py no longer declares a --packets default")
         actual = int(default.group(1).replace("_", ""))
-        for claim in re.findall(r"([\d,]+) packets per profile", README):
+        for claim in re.findall(r"([\d,]+) packets per profile", ALL_DOCS):
             self.assertEqual(
                 int(claim.replace(",", "")), actual,
-                f"README claims {claim} packets per profile; the tool defaults to {actual}")
+                f"the docs claim {claim} packets per profile; "
+                f"the tool defaults to {actual}")
 
-    def test_readme_points_at_the_benchmark_for_its_numbers(self):
-        self.assertIn("tools/benchmark.py", README)
-        self.assertIn("## Performance", README)
+    def test_the_docs_point_at_the_benchmark_for_their_numbers(self):
+        """A throughput figure a reader cannot reproduce is an assertion."""
+        self.assertIn("tools/benchmark.py", ALL_DOCS)
+        self.assertIn("## Performance", DOCS)
+        self.assertIn("docs/BENCHMARK.md", README,
+                      "the README must send the reader to the measurements")
 
     def test_the_superseded_figure_is_not_presented_as_current(self):
         """It may appear only as an explicit correction."""
-        for line in (README + CHANGELOG).splitlines():
+        for line in (ALL_DOCS + CHANGELOG).splitlines():
             if "189,356" in line or "189,000" in line:
                 self.assertRegex(
                     line.lower(), r"correct|superseded|originally",
@@ -140,7 +155,7 @@ class PerformanceClaimTests(unittest.TestCase):
 
     def test_linear_cost_is_disclosed(self):
         """A known limitation the reader can hit must be stated, not implied."""
-        self.assertIn("linear in window size", README)
+        self.assertIn("linear in window size", ALL_DOCS)
 
 
 class HonestyTests(unittest.TestCase):

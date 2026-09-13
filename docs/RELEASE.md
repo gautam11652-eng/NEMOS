@@ -30,7 +30,7 @@ exists because these had previously drifted apart.
    readers want to know what changed for them. Detection-threshold changes must
    be called out explicitly, because they alter what a deployment alerts on.
 
-4. **Work through [`RELEASE_CHECKLIST.md`](../RELEASE_CHECKLIST.md).** It covers
+4. **Work through [the checklist below](#pre-release-checklist).** It covers
    the verification that automation cannot do for you — capture on a real
    interface, graceful shutdown, authentication.
 
@@ -78,3 +78,22 @@ python tools/validate_detection.py             # offline detection check
 
 The API and delivery tests require the runtime dependencies from
 `requirements.txt`; `requirements-dev.txt` includes those plus the tooling.
+
+---
+
+## Pre-release checklist
+
+Before publishing a release:
+
+- [ ] `python -m pytest -q` passes
+- [ ] `python -m compileall -q main.py nemos tests` passes
+- [ ] `python -m pip_audit -r requirements.txt` passes
+- [ ] `python -m build` succeeds
+- [ ] No `.env`, database, logs, virtualenv, caches, or credentials are packaged
+- [ ] Local-only binding remains the documented default
+- [ ] Remote binding requires an API token and trusted hosts
+- [ ] Packet capture has been tested on a controlled interface
+- [ ] Graceful shutdown has been tested
+- [ ] Dashboard/API authentication has been tested
+- [ ] CHANGELOG.md is updated
+- [ ] Security-sensitive changes are reviewed before release
