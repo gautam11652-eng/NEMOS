@@ -2,6 +2,165 @@
 
 ## Unreleased
 
+### Added
+
+- **A soak harness** (`tools/soak.py`) and the first sustained-run measurements.
+  Every hot-path structure in NEMOS is bounded by design, but nothing had ever
+  run long enough to show it held. Over 60 minutes and 29,809 packets:
+  **threads flat at 19**, file descriptors bounded (15→16, peak 17), zero
+  dropped alerts, zero write errors, queue high-water 160 of 50,000. Memory is
+  **decelerating rather than flat** — +15.2 MB/hour in the first half after
+  warm-up against +9.1 MB/hour in the second, a curve approaching a bound —
+  which is not the same as proven flat, and `docs/SOAK.md` says so. Database
+  growth of ~7 MB/hour is retention that has not engaged: the run ended at
+  29,819 traffic rows against a 100,000-row cap, so nothing had been pruned yet.
+  39 of 120 samples read `DEGRADED`, which is the new drop accounting correctly
+  reporting that the sensor could not always keep up with loopback at that rate.
+  Growth is fitted only after a warm-up window, because extrapolating a
+  starting process's slope reports a leak that is not there.
+
+
+- **Kernel packet-drop accounting.** NEMOS tracked only its own queue drops, so
+  a capture socket whose ring buffer overflowed kept delivering packets, kept
+  incrementing the packet counter, and kept displaying `ONLINE` and `all clear`
+  while an arbitrary share of the network went unexamined. The socket's own
+  counter (`PACKET_STATISTICS`) is now read and accumulated -- the kernel
+  resets it on every read -- and a new `DEGRADED` state replaces `ONLINE` above
+  1% sustained loss (`drop_alarm`), with the count, the total and the
+  percentage on the Sensor page, in `/api/status`, and in Telegram `/status`.
+  The state is judged on **recent** loss over a rolling window, not the whole
+  run: a burst while the process was starting would otherwise hold the sensor
+  at `DEGRADED` forever, and an alarm that cannot clear is one operators learn
+  to ignore. Both figures are reported -- recent loss drives the state, the
+  lifetime count is history. Verified on a live sensor: `ONLINE` → `DEGRADED`
+  under a flood (49.93% loss, 3.4M packets discarded) → back to `ONLINE` 65
+  seconds after it stopped.
+- Where drops cannot be measured -- anything that is not Linux AF_PACKET -- the
+  console says *not measurable on this platform* instead of showing a zero. A
+  fabricated "0 dropped" is the same false reassurance the whole change exists
+  to remove.
+
+### Changed
+
+- **The documentation was reorganised for readers.** The README had reached
+  1,502 lines, which is not a document anyone reads: it carried the full
+  configuration reference, every detection rule, the whole Telegram manual and
+  the ML training guide. It is now 351 lines covering what a new reader needs --
+  what NEMOS is and is not, how to run it, what the capture states mean, whether
+  it actually detects anything, and where to go for the rest. Nothing was
+  deleted; the depth moved verbatim into `docs/DETECTION.md`,
+  `docs/CONFIGURATION.md`, `docs/ALERTING.md`, `docs/TRAINING.md`,
+  `docs/API.md` and `docs/BENCHMARK.md`, each linked from a table on the front
+  page.
+- Root-level clutter consolidated: `AUDIT_REPORT.md` moved to
+  `docs/SECURITY_AUDIT.md`, `RELEASE_CHECKLIST.md` merged into
+  `docs/RELEASE.md`, and three overlapping one-page demo files became
+  `docs/DEMO.md`. The README's deployment section merged into the deployment
+  doc rather than existing twice, and its testing section moved to
+  `CONTRIBUTING.md`, where a contributor looks for it.
+- The documentation guard now scans `docs/` and `CONTRIBUTING.md`, not just the
+  README. Moving the test-count line out of the README during this split put it
+  somewhere nothing checked and it went stale within one commit -- so the
+  check follows the prose instead of the file.
+
+### Added
+
+- `tests/test_doc_links.py`: every relative link and every heading anchor across
+  the documentation must resolve, and every page must be reachable from the
+  README. A reorganisation is exactly when links rot, and a dead anchor is
+  invisible in a diff. It found five broken anchors in the split itself.
+
+
+- Capture now holds **one socket for the life of the capture** instead of
+  opening and closing one per second. The kernel's drop counters live on the
+  socket, so a fresh socket each second discarded exactly the number this
+  change needed -- and left a gap every second where nothing was listening.
+  A permission failure still reports `BLOCKED`; any other socket-creation
+  problem falls back to the previous per-call behaviour with drop visibility
+  reported as unavailable.
+
+
+- **Capture-file replay** (`tools/replay_pcap.py`). Runs a `.pcap`/`.pcapng`
+  through the live parser and the live detection rules, offline. The detector's
+  clock is driven by each packet's recorded timestamp rather than by read
+  speed: on a real capture of a sweep paced under the rule, the packet clock
+  correctly raises nothing while a wall clock fabricates a `PORT_SCAN` from the
+  same bytes. Both directions are pinned by tests. Reports parse robustness
+  (malformed packets by exception type, non-IP frames, out-of-order packets)
+  and, given an attack schedule, scores findings against ground truth with
+  precision and recall kept on separate denominators. See
+  `docs/PCAP_REPLAY.md`.
+- `PacketCapture._parse` and the new `_parse_arp` accept an optional `when`, so
+  replay stamps events with the packet's own time. The ARP branch moved out of
+  the sniff callback for this: it was the one parse path a replay could not
+  reach without copying it, which is the duplication that had already let the
+  IP parser drift once.
+
+- **`tools/benchmark_detection.py` — detection quality, measured.** NEMOS could
+  say how many packets per second it processed and nothing at all about whether
+  it detects. This replays every labelled scenario through the real detector and
+  reports precision, recall, F1, false-positive rate and detection latency, per
+  detection type, with `--json` output.
+
+  Ground truth lives in `Scenario.expected` and is decided from the traffic
+  shape, independently of what the detector emits — labelling scenarios with
+  whatever NEMOS already finds would make recall 1.0 by construction and measure
+  nothing. It is a *set* of acceptable answers, because 199 destinations on port
+  445 is honestly either a fan-out or lateral movement, and an unfired
+  alternative is not charged as a miss.
+
+  False positives are split into two populations. Firings on benign traffic are
+  the unambiguous kind and are what precision is computed from; firings on
+  malicious traffic labelled as something else are tracked in their own column
+  and kept out of precision, since the traffic really was suspicious.
+
+- **Three hard benign scenarios**: `nat_gateway`, `monitoring_host`,
+  `backup_window`. `normal_traffic` is paced below the detector's thresholds by
+  construction, so a false-positive rate measured against it alone was close to
+  circular — it reported 100% precision and zero false positives. Against
+  legitimate traffic *shaped like an attack*, precision is 58.2% and the rate is
+  1.44 per replay. Those false positives are documented in the README with the
+  reason each occurs, and are deliberately not tuned away: the difference
+  between a NAT gateway and a scanner is authorisation, which packet metadata
+  does not carry.
+
+  Measured on the committed defaults: recall 100%, precision 58.2%, F1 73.6%,
+  median detection latency 1.20s of scenario time.
+
+- **A delivery path that needs no credential at all.**
+  `NEMOS_WEBHOOK_FORMAT=text` posts the same rendered report Telegram receives
+  as `text/plain`, which push services such as ntfy turn straight into a phone
+  notification — severity also becomes the notification's priority and tag.
+  Two settings, no token, no chat id, no account.
+
+  This exists because a Telegram bot token genuinely cannot be removed: a token
+  *is* the bot's identity, and the API has no unauthenticated send path. Rather
+  than pretend otherwise, NEMOS now offers a route that reaches a phone with
+  nothing to hold. The cost is stated rather than glossed: the URL is the only
+  thing protecting the feed, and there are no inline actions or commands.
+
+  Header values derived from findings are flattened and latin-1 coerced, since a
+  threat name comes from observed traffic and a newline in one would otherwise
+  inject a header.
+
+### Changed
+
+- The pairing action is named **Connect Telegram**, matching what it does
+  rather than how it does it, and the console no longer names
+  `TELEGRAM_BOT_USERNAME` as something an administrator must set -- deriving it
+  made that copy wrong the moment it landed.
+- **`TELEGRAM_BOT_USERNAME` is no longer required.** The token already
+  determines the username, so NEMOS asks Telegram once (`getMe`) and caches the
+  answer instead of making an operator look it up and retype it. That was not
+  merely extra work: it was the one setting whose typo failed *silently*,
+  rendering a perfectly valid QR code that pointed at a bot which did not exist.
+  Setting it explicitly still wins, for a deployment that would rather not make
+  the call. A deployment's entire Telegram configuration is now one value.
+
+  The token itself cannot be removed — Telegram has no anonymous send path, so a
+  token *is* the bot's identity. What is removed is everyone else having to
+  handle one.
+
 ### Fixed
 
 - **Packet capture reported the wrong problem.** On Kali the sensor showed

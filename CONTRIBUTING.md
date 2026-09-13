@@ -91,3 +91,28 @@ Do not open a public issue for a vulnerability in NEMOS. See
 Virtual environments, `__pycache__/`, databases, packet captures, `.env` files,
 credentials, tokens, or generated artifacts. `.gitignore` covers the common
 cases, but check `git status` before committing rather than trusting it.
+
+## Running the checks
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q                              # 1,070 tests
+python -m compileall -q main.py nemos tests      # syntax
+ruff check .                                     # lint
+python -m pip_audit -r requirements.txt          # dependency audit
+```
+
+`make test`, `make compile`, `make audit` and `make demo` wrap the common ones.
+CI runs the suite on Python 3.10–3.13 plus lint, dependency audit and a package
+build on every push and pull request.
+
+For a full environment check on Kali or another Debian-based host:
+
+```bash
+./scripts/verify-kali.sh
+```
+
+## Releasing
+
+Maintainers: see [`docs/RELEASE.md`](docs/RELEASE.md) for the release process and
+the pre-release checklist.

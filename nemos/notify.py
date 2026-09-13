@@ -18,6 +18,7 @@ Design constraints, in priority order:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -125,6 +126,7 @@ class NotifierConfig:
     # link) and the dashboard URL is what an alert links back to.
     telegram_bot_username: str = ""
     dashboard_url: str = ""
+    webhook_format: str = "json"
 
     @property
     def telegram_token_configured(self) -> bool:
@@ -189,7 +191,22 @@ class NotifierConfig:
             syslog_facility=_int_env("NEMOS_SYSLOG_FACILITY", 13, 0, 23),
             telegram_bot_username=_bot_username(os.getenv("TELEGRAM_BOT_USERNAME", "")),
             dashboard_url=_dashboard_url(os.getenv("NEMOS_DASHBOARD_URL", "")),
+            webhook_format=(
+                "text" if os.getenv("NEMOS_WEBHOOK_FORMAT", "json").strip().lower() == "text"
+                else "json"
+            ),
         )
+
+
+def _header_safe(value: str) -> str:
+    """Flatten a value so it is legal in an HTTP header.
+
+    Threat names are derived from observed traffic, so this is a boundary, not
+    cosmetics: a newline here would let a finding inject a header of its own,
+    and a non-latin-1 byte makes the request unsendable rather than merely ugly.
+    """
+    text = " ".join(str(value).replace("\r", " ").replace("\n", " ").split())
+    return text.encode("latin-1", "replace").decode("latin-1")[:120]
 
 
 def _bot_username(value: str) -> str:
@@ -310,6 +327,77 @@ def telegram_api(token: str, method: str, params: Mapping[str, Any] | None = Non
             f"{method} failed ({status}): {redact(description, token)[:200] or status}"
         )
     return payload.get("result")
+
+
+# Resolved bot usernames, keyed by a hash of the token rather than the token, so
+# a heap dump or a stray repr cannot yield the credential. Bounded because the
+# key is configuration rather than traffic, but bounded anyway on principle.
+_USERNAME_CACHE: OrderedDict[str, tuple[str, float]] = OrderedDict()
+_USERNAME_LOCK = threading.Lock()
+_USERNAME_CACHE_MAX = 8
+# A success is cached for the process's life; a failure only briefly, so a
+# transient outage does not pin "unavailable" until the next restart.
+_USERNAME_FAILURE_TTL = 60.0
+
+
+def resolve_bot_username(token: str, *, api: Callable[..., Any] | None = None,
+                         now: float | None = None) -> tuple[str, str]:
+    """Ask Telegram what this bot is called. Returns ``(username, error)``.
+
+    ``TELEGRAM_BOT_USERNAME`` exists so an operator *can* pin the value, but
+    requiring it was redundant: the token already determines it, and getMe will
+    say so. Worse, it was the one setting a typo in which fails silently --
+    NEMOS would render a perfectly valid QR code pointing at a bot that does
+    not exist, and the operator would find out by scanning it.
+
+    One network call per token per process. The token is never logged, never
+    returned, and never used as a cache key in plaintext.
+    """
+    token = str(token or "").strip()
+    if not token:
+        return "", "no bot token is configured"
+    now = time.time() if now is None else now
+    key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    with _USERNAME_LOCK:
+        cached = _USERNAME_CACHE.get(key)
+        if cached is not None:
+            username, expires = cached
+            if username or expires > now:
+                _USERNAME_CACHE.move_to_end(key)
+                return username, "" if username else "Telegram did not identify this bot"
+
+    call = api or telegram_api
+    try:
+        me = call(token, "getMe", timeout=10.0)
+    except Exception as exc:
+        # Deliberately not cached as a success: a network blip must not pin the
+        # dashboard to "unavailable" for the rest of the process's life.
+        message = redact(str(exc), token)[:200]
+        with _USERNAME_LOCK:
+            _USERNAME_CACHE[key] = ("", now + _USERNAME_FAILURE_TTL)
+            while len(_USERNAME_CACHE) > _USERNAME_CACHE_MAX:
+                _USERNAME_CACHE.popitem(last=False)
+        return "", f"could not ask Telegram for the bot username: {message}"
+
+    username = _bot_username(str((me or {}).get("username") or ""))
+    with _USERNAME_LOCK:
+        _USERNAME_CACHE[key] = (username, now + _USERNAME_FAILURE_TTL)
+        _USERNAME_CACHE.move_to_end(key)
+        while len(_USERNAME_CACHE) > _USERNAME_CACHE_MAX:
+            _USERNAME_CACHE.popitem(last=False)
+    if not username:
+        return "", "Telegram accepted the token but returned no usable bot username"
+    return username, ""
+
+
+def forget_bot_username(token: str = "") -> None:
+    """Drop cached usernames. Used by tests and after a credential change."""
+    with _USERNAME_LOCK:
+        if token:
+            _USERNAME_CACHE.pop(hashlib.sha256(token.encode("utf-8")).hexdigest(), None)
+        else:
+            _USERNAME_CACHE.clear()
 
 
 def format_alert_text(alert: Mapping[str, Any], *, detail: str = "",
@@ -445,20 +533,68 @@ class TelegramChannel(_Channel):
                         delivered, len(targets), errors[0][:160])
 
 
+# Push services that turn a plain POST body into a phone notification -- ntfy
+# being the common one -- read these headers if they are present and ignore
+# them otherwise, so sending them costs nothing on a collector that does not.
+# Priority is ntfy's 1-5 scale.
+PUSH_PRIORITY = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2}
+PUSH_TAGS = {
+    "CRITICAL": "rotating_light",
+    "HIGH": "warning",
+    "MEDIUM": "yellow_circle",
+    "LOW": "blue_circle",
+}
+
+
 class WebhookChannel(_Channel):
+    """Deliver a finding to an arbitrary HTTP collector.
+
+    Two body formats, because two very different things are on the other end.
+
+    ``json`` (the default) posts a machine-readable envelope, for a SIEM, a
+    Lambda, or anything that parses.
+
+    ``text`` posts the same rendered report Telegram receives, as ``text/plain``.
+    That exists for the push services that treat the body as the notification --
+    and it is the one path in NEMOS that reaches a phone with **no credential of
+    any kind**: no bot token, no chat id, no account. The URL is the whole
+    configuration, which is also its weakness, so the topic in it has to be long
+    and unguessable.
+    """
+
     name = "webhook"
 
-    def __init__(self, url: str, token: str = ""):
+    def __init__(self, url: str, token: str = "", body_format: str = "json",
+                 dashboard_url: str = ""):
         self.url = url
         self.token = token
+        self.body_format = "text" if str(body_format).lower() == "text" else "json"
+        self.dashboard_url = dashboard_url
 
-    def send(self, alert: Mapping[str, Any], transport: Transport, timeout: float) -> None:
-        headers = {"Content-Type": "application/json", "User-Agent": "NEMOS"}
+    def _payload(self, alert: Mapping[str, Any]) -> tuple[dict[str, str], bytes]:
+        headers = {"User-Agent": "NEMOS"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        if self.body_format == "text":
+            severity = str(alert.get("severity") or "LOW").upper()
+            headers["Content-Type"] = "text/plain; charset=utf-8"
+            # X- prefixed so a collector that does not know them treats them as
+            # ordinary unknown headers rather than as its own metadata.
+            headers["X-Title"] = _header_safe(
+                f"NEMOS {severity}: {alert.get('threat') or 'DETECTION'}")
+            headers["X-Priority"] = str(PUSH_PRIORITY.get(severity, 3))
+            headers["X-Tags"] = PUSH_TAGS.get(severity, "blue_circle")
+            body = format_alert_text(
+                alert, dashboard_url=self.dashboard_url).encode("utf-8")
+            return headers, body
+        headers["Content-Type"] = "application/json"
         body = json.dumps(
             {"source": "NEMOS", "alert": dict(alert)}, separators=(",", ":"), default=str
         ).encode("utf-8")
+        return headers, body
+
+    def send(self, alert: Mapping[str, Any], transport: Transport, timeout: float) -> None:
+        headers, body = self._payload(alert)
         status, detail = transport("POST", self.url, headers, body, timeout)
         if not 200 <= status < 300:
             raise DeliveryError(
@@ -651,7 +787,11 @@ class AlertNotifier:
                 )
             if self.config.webhook_configured:
                 channels.append(
-                    WebhookChannel(self.config.webhook_url, self.config.webhook_token)
+                    WebhookChannel(
+                        self.config.webhook_url, self.config.webhook_token,
+                        body_format=self.config.webhook_format,
+                        dashboard_url=self.config.dashboard_url,
+                    )
                 )
             if self.config.syslog_configured:
                 channels.append(

@@ -67,6 +67,12 @@ ignore = [
 # anything security-sensitive.
 "tools/scenarios.py" = ["S311"]
 "tools/benchmark.py" = ["S311"]
+# S311: the soak generator shapes synthetic loopback traffic; randomness here
+# is load variety, never a secret. S310: it polls its own sensor over a
+# hardcoded 127.0.0.1 URL. S108: the default workdir is a scratch path the
+# operator can override with --workdir, and it holds only a throwaway database.
+# S603: it launches main.py from this repository in argv form, with no shell.
+"tools/soak.py" = ["S311", "S310", "S108", "S603"]
 "nemos/config.py" = ["S104"]
 "nemos/api.py" = ["S104", "S608"]
 # S608: same rule as nemos/api.py -- the only interpolated text is a run of

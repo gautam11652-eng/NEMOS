@@ -64,11 +64,40 @@ class StatusTests(TelegramApiTests):
         self.assertFalse(body["available"])
         self.assertIn("TELEGRAM_BOT_TOKEN", body["error"])
 
-    def test_a_missing_username_is_reported_separately(self):
-        with patch.dict(os.environ, {"TELEGRAM_BOT_USERNAME": ""}):
+    def test_the_username_is_derived_from_the_token_when_unset(self):
+        """The token already determines the username, so requiring an operator
+        to look it up and retype it was redundant -- and a typo produced a valid
+        QR code pointing at a bot that does not exist."""
+        with patch.dict(os.environ, {"TELEGRAM_BOT_USERNAME": ""}), \
+             patch("nemos.api.resolve_bot_username",
+                   return_value=("derived_bot", "")) as resolve:
+            body = self.client.get("/api/telegram/pair").get_json()
+        self.assertTrue(body["available"])
+        self.assertEqual(body["bot_username"], "derived_bot")
+        resolve.assert_called_once()
+
+    def test_an_explicit_username_is_used_without_asking_telegram(self):
+        with patch("nemos.api.resolve_bot_username") as resolve:
+            body = self.client.get("/api/telegram/pair").get_json()
+        self.assertEqual(body["bot_username"], USERNAME)
+        resolve.assert_not_called()
+
+    def test_a_failed_lookup_is_reported_rather_than_guessed(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_USERNAME": ""}), \
+             patch("nemos.api.resolve_bot_username",
+                   return_value=("", "could not reach Telegram")):
             body = self.client.get("/api/telegram/pair").get_json()
         self.assertFalse(body["available"])
-        self.assertIn("TELEGRAM_BOT_USERNAME", body["error"])
+        self.assertEqual(body["error"], "could not reach Telegram")
+        self.assertEqual(body["bot_username"], "")
+
+    def test_pairing_derives_the_username_for_the_link(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_USERNAME": ""}), \
+             patch("nemos.api.resolve_bot_username",
+                   return_value=("derived_bot", "")):
+            body = self.client.post("/api/telegram/pair").get_json()
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["link"].startswith("https://t.me/derived_bot?start="))
 
     def test_linked_chats_are_listed_with_the_id_masked(self):
         self.link()
