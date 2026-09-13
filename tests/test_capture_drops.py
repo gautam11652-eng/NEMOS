@@ -185,9 +185,26 @@ class LiveOverflowTests(unittest.TestCase):
         cap = sensor()
         try:
             cap.start()
-            deadline = time.monotonic() + 8
-            while time.monotonic() < deadline and not cap.status()["running"]:
-                time.sleep(0.1)
+
+            # Decide before flooding, not after. A runner without CAP_NET_RAW
+            # can never satisfy this test, and ten seconds of UDP to reach a
+            # foregone skip is load nobody benefits from -- on CI that is every
+            # job on every push. Visibility is only established by the first
+            # poll, which lands one sniff() timeout after the socket opens, so
+            # this waits for that rather than reading it immediately.
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                early = cap.status()
+                if early["drop_visibility"]:
+                    break
+                if not early["running"] and early["error"]:
+                    self.skipTest(f"capture did not start here: "
+                                  f"{early['display_state']} -- {early['error']}")
+                time.sleep(0.25)
+            else:
+                self.skipTest("no drop statistics appeared; this kernel or "
+                              "socket does not expose PACKET_STATISTICS")
+
             stop = threading.Event()
 
             def blast():
