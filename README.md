@@ -221,7 +221,7 @@ python tools/benchmark_detection.py      # reproduce it
 python tools/replay_pcap.py capture.pcap # or run your own capture through it
 ```
 
-Backed by **1,060 automated tests** across Python 3.10–3.13, with lint and a
+Backed by **1,070 automated tests** across Python 3.10–3.13, with lint and a
 dependency audit on every push.
 
 Full method, the per-detection table, and what it does **not** measure:
@@ -331,6 +331,7 @@ Only monitor networks you own or are explicitly authorized to monitor.
 | [Alerting](docs/ALERTING.md) | Telegram, webhook, syslog, tuning |
 | [Benchmark](docs/BENCHMARK.md) | Detection quality and throughput, measured |
 | [Capture replay](docs/PCAP_REPLAY.md) | Running real `.pcap` files through the detector |
+| [Soak test](docs/SOAK.md) | Memory, threads and database over a sustained run |
 | [Training](docs/TRAINING.md) | The anomaly model, bootstrap and drift |
 | [API](docs/API.md) | The JSON API and the dashboard |
 | [Deployment](docs/DEPLOYMENT.md) | systemd, remote access, the installer |

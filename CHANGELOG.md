@@ -4,6 +4,22 @@
 
 ### Added
 
+- **A soak harness** (`tools/soak.py`) and the first sustained-run measurements.
+  Every hot-path structure in NEMOS is bounded by design, but nothing had ever
+  run long enough to show it held. Over 60 minutes and 29,809 packets:
+  **threads flat at 19**, file descriptors bounded (15→16, peak 17), zero
+  dropped alerts, zero write errors, queue high-water 160 of 50,000. Memory is
+  **decelerating rather than flat** — +15.2 MB/hour in the first half after
+  warm-up against +9.1 MB/hour in the second, a curve approaching a bound —
+  which is not the same as proven flat, and `docs/SOAK.md` says so. Database
+  growth of ~7 MB/hour is retention that has not engaged: the run ended at
+  29,819 traffic rows against a 100,000-row cap, so nothing had been pruned yet.
+  39 of 120 samples read `DEGRADED`, which is the new drop accounting correctly
+  reporting that the sensor could not always keep up with loopback at that rate.
+  Growth is fitted only after a warm-up window, because extrapolating a
+  starting process's slope reports a leak that is not there.
+
+
 - **Kernel packet-drop accounting.** NEMOS tracked only its own queue drops, so
   a capture socket whose ring buffer overflowed kept delivering packets, kept
   incrementing the packet counter, and kept displaying `ONLINE` and `all clear`

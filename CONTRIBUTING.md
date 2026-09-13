@@ -96,7 +96,7 @@ cases, but check `git status` before committing rather than trusting it.
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 1,060 tests
+python -m pytest -q                              # 1,070 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit
