@@ -97,13 +97,13 @@ const CAPTURE_LABEL = {
 
 /* Operator-facing capture states, as words rather than shouted constants. */
 const CAPTURE_STATE_LABEL = {
-  ONLINE: "Live", "NO TRAFFIC": "No traffic", BLOCKED: "Blocked",
-  "NO INTERFACE": "No interface", ERROR: "Failed", STARTING: "Starting",
-  OFF: "Off",
+  ONLINE: "Live", DEGRADED: "Losing packets", "NO TRAFFIC": "No traffic",
+  BLOCKED: "Blocked", "NO INTERFACE": "No interface", ERROR: "Failed",
+  STARTING: "Starting", OFF: "Off",
 };
 const CAPTURE_TONE = {
-  ONLINE: "ok", "NO TRAFFIC": "warn", BLOCKED: "bad", "NO INTERFACE": "bad",
-  ERROR: "bad", STARTING: "warn", OFF: "warn",
+  ONLINE: "ok", DEGRADED: "bad", "NO TRAFFIC": "warn", BLOCKED: "bad",
+  "NO INTERFACE": "bad", ERROR: "bad", STARTING: "warn", OFF: "warn",
 };
 
 /* ML lifecycle states as nemos/bootstrap.py reports them. ACTIVE is only ever
@@ -1205,6 +1205,20 @@ function renderSensor(data, status) {
         ["Interfaces found", (capture.interfaces || []).join(", ") || "—"],
         ["Packets seen", num(capture.packets_seen)],
         ["Last packet", capture.last_packet ? ago(capture.last_packet) : "—"],
+        // Unknown and zero are different answers and only one is reassuring,
+        // so a platform that cannot count drops says that rather than "0".
+        // Two different questions. "Recent loss" is what decides whether this
+        // sensor is trustworthy right now and drives the DEGRADED state; the
+        // lifetime count is history and does not clear.
+        ["Recent packet loss", capture.drop_visibility
+          ? `${((capture.drop_rate || 0) * 100).toFixed(2)}%`
+          : "not measurable on this platform"],
+        ["Dropped by the kernel", capture.drop_visibility
+          ? `${num(capture.kernel_dropped)} of ${num(capture.kernel_packets)}`
+            + (capture.lifetime_drop_rate != null
+               ? ` (${(capture.lifetime_drop_rate * 100).toFixed(2)}% of this run)`
+               : "")
+          : "—"],
       ])}</dl>
     </section>
     <section>
@@ -1555,7 +1569,7 @@ function paint() {
   const writer = status.writer || {};
   const unhealthy = [
     Boolean(capture.error),
-    ["BLOCKED", "NO INTERFACE", "ERROR", "NO TRAFFIC"].includes(
+    ["BLOCKED", "NO INTERFACE", "ERROR", "NO TRAFFIC", "DEGRADED"].includes(
       String(capture.display_state || "")),
     writer.thread_alive === false,
     Number(writer.write_errors) > 0,

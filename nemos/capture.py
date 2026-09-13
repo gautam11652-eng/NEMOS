@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import socket
+import struct
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from .models import TrafficEvent, utc_now
@@ -17,7 +19,8 @@ log = logging.getLogger(__name__)
 # of _run are we in" but "is traffic reaching the detector, and if not, whose
 # problem is it".
 #
-#   ONLINE        the socket is bound and packets have actually arrived
+#   ONLINE        the socket is bound, packets arrive, and none are being lost
+#   DEGRADED      packets arrive, but the kernel is discarding some of them
 #   NO TRAFFIC    the socket is bound but nothing has arrived yet
 #   BLOCKED       the OS refused the capture socket -- a privilege problem
 #   NO INTERFACE  the configured interface does not exist, or none is usable
@@ -25,17 +28,47 @@ log = logging.getLogger(__name__)
 #   STARTING      the thread is up but has not bound yet
 #   OFF           capture is disabled by configuration
 #
-# ONLINE is the important one. It is never set on a successful bind alone: a
-# sensor that opened a socket on the wrong interface binds perfectly and sees
-# nothing, and reporting that as ONLINE is precisely the failure that lets a
-# deployment sit blind for a week. ONLINE requires a packet.
+# ONLINE is the important one, and it has two conditions rather than one.
+#
+# It is never set on a successful bind alone: a sensor that opened a socket on
+# the wrong interface binds perfectly and sees nothing, and reporting that as
+# ONLINE is precisely the failure that lets a deployment sit blind for a week.
+# ONLINE requires a packet.
+#
+# It is also never set while the kernel is discarding traffic. A capture socket
+# whose ring buffer overflows keeps delivering packets -- just not all of them
+# -- so every other signal continues to look healthy while an arbitrary share
+# of the network goes unexamined. Measured on this machine: a socket left
+# undrained during a flood reported 48,000 packets and 47,980 drops. Seeing
+# 0.04% of the traffic while displaying ONLINE and "all clear" is a worse
+# failure than not starting at all, because nothing invites investigation.
 STATE_ONLINE = "ONLINE"
+STATE_DEGRADED = "DEGRADED"
 STATE_NO_TRAFFIC = "NO TRAFFIC"
 STATE_BLOCKED = "BLOCKED"
 STATE_NO_INTERFACE = "NO INTERFACE"
 STATE_ERROR = "ERROR"
 STATE_STARTING = "STARTING"
 STATE_OFF = "OFF"
+
+# getsockopt(SOL_PACKET, PACKET_STATISTICS) on Linux. Python's socket module
+# does not export these, and they are stable kernel ABI.
+SOL_PACKET = 263
+PACKET_STATISTICS = 6
+
+# The share of traffic that may be lost before the sensor stops calling itself
+# ONLINE. Not zero: a single drop during a microburst at startup is normal and
+# an alarm nobody can clear is an alarm everybody learns to ignore. One percent
+# sustained is not a healthy sensor.
+DEFAULT_DROP_ALARM = 0.01
+
+# How many one-second polls the *state* is judged over. Lifetime totals are
+# still reported, but they are the wrong thing to drive a health state with: a
+# burst of drops while the process was still starting would otherwise hold the
+# sensor at DEGRADED forever, however cleanly it ran afterwards. This was not
+# hypothetical -- the first version of this accounting did exactly that, and a
+# freshly started sensor sat at 36% lifetime loss on an otherwise idle link.
+DROP_WINDOW_POLLS = 60
 
 # Linux capability bit for opening a packet socket. Checked so the sensor can
 # say *why* it was refused rather than only that it was.
@@ -179,6 +212,36 @@ def backend_available() -> tuple[bool, str]:
     return True, ""
 
 
+def drop_stats_supported() -> bool:
+    """Whether this platform can report capture-socket drops at all."""
+    return sys.platform.startswith("linux")
+
+
+def read_drop_stats(raw) -> tuple[int, int] | None:
+    """``(received, dropped)`` since the previous call, or ``None``.
+
+    Linux AF_PACKET only. ``None`` means "this cannot be measured here" and is
+    deliberately not ``(0, 0)``: reporting zero drops on a platform that cannot
+    count them is the same false reassurance this function exists to remove,
+    and it would be indistinguishable from a healthy sensor.
+
+    The kernel **resets both counters on read**, so each call returns the delta
+    since the last one and callers must accumulate.
+    """
+    if raw is None or not drop_stats_supported():
+        return None
+    try:
+        blob = raw.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8)
+    except (OSError, AttributeError, ValueError):
+        # Not an AF_PACKET socket, or the option is unavailable. Unknown, not
+        # zero.
+        return None
+    if len(blob) < 8:
+        return None
+    received, dropped = struct.unpack("II", blob[:8])
+    return int(received), int(dropped)
+
+
 def remedy(state: str) -> str:
     """A single actionable sentence for a capture problem, by platform.
 
@@ -218,6 +281,16 @@ def remedy(state: str) -> str:
         return ("The socket is open but nothing has arrived. Check that "
                 "NEMOS_INTERFACE names the interface carrying traffic, and that "
                 "the link is up.")
+    if state == STATE_DEGRADED:
+        # Ordered by what actually helps most often. Raising the buffer is the
+        # only one that costs nothing; the rest trade coverage for keeping up,
+        # and a narrower view NEMOS knows about beats a wide one it silently
+        # loses.
+        return ("The kernel is discarding capture traffic because NEMOS cannot "
+                "read it fast enough, so some of the network is going "
+                "unexamined. Raise the capture buffer, narrow what is captured "
+                "by pinning NEMOS_INTERFACE to the one link that matters, or "
+                "move the sensor to a host with more CPU headroom.")
     return ""
 
 
@@ -340,10 +413,12 @@ class PacketCapture:
     three problems with three completely different fixes.
     """
 
-    def __init__(self, interface, on_event, traffic_grace: float = DEFAULT_TRAFFIC_GRACE):
+    def __init__(self, interface, on_event, traffic_grace: float = DEFAULT_TRAFFIC_GRACE,
+                 drop_alarm: float = DEFAULT_DROP_ALARM):
         self.interface = interface
         self.on_event = on_event
         self.traffic_grace = max(0.0, float(traffic_grace))
+        self.drop_alarm = max(0.0, float(drop_alarm))
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
         self.thread = None
@@ -354,6 +429,16 @@ class PacketCapture:
         self._remedy = ""
         self._bound_at = None
         self._interfaces: list[str] = []
+        # Kernel-side counters, accumulated because getsockopt resets them.
+        # `None` for visibility means "not yet determined"; False means this
+        # platform or socket cannot report drops, and the sensor says so rather
+        # than showing a comforting zero.
+        self._kernel_received = 0
+        self._kernel_dropped = 0
+        self._drop_visibility: bool | None = None
+        # Recent per-poll deltas. The state is judged on these; the totals
+        # above are for reporting.
+        self._drop_window: deque[tuple[int, int]] = deque(maxlen=DROP_WINDOW_POLLS)
 
     def preflight(self) -> tuple[str, str, str]:
         """Check what capture needs before starting. ``(state, error, remedy)``.
@@ -425,14 +510,66 @@ class PacketCapture:
             self.thread = threading.Thread(target=self._run, name="packet-capture", daemon=True)
             self.thread.start()
 
+    def _poll_drops(self, raw) -> None:
+        """Fold one getsockopt delta into the running totals."""
+        delta = read_drop_stats(raw)
+        with self._lock:
+            if delta is None:
+                if self._drop_visibility is None:
+                    self._drop_visibility = False
+                return
+            received, dropped = delta
+            self._drop_visibility = True
+            self._kernel_received += received
+            self._kernel_dropped += dropped
+            self._drop_window.append((received, dropped))
+
+    def drop_rate(self) -> float | None:
+        """Share of *recent* traffic the kernel discarded, or None.
+
+        Deliberately not the lifetime ratio. A sensor that lost packets while
+        it was starting up has not been unhealthy ever since, and a state that
+        can never recover is one operators learn to ignore.
+        """
+        with self._lock:
+            if not self._drop_visibility:
+                return None
+            received = sum(r for r, _ in self._drop_window)
+            dropped = sum(d for _, d in self._drop_window)
+            total = received + dropped
+            if total <= 0:
+                return 0.0
+            return dropped / total
+
+    def lifetime_drop_rate(self) -> float | None:
+        """Share of all traffic lost since capture started, or None."""
+        with self._lock:
+            if not self._drop_visibility:
+                return None
+            total = self._kernel_received + self._kernel_dropped
+            return (self._kernel_dropped / total) if total > 0 else 0.0
+
     def display_state(self, state: str, alive: bool, packets: int,
-                      bound_at: float | None, now: float | None = None) -> str:
+                      bound_at: float | None, now: float | None = None,
+                      drop_rate: float | None = None) -> str:
         """Map the internal lifecycle onto what an operator is shown.
 
-        The one rule worth stating: ONLINE requires a packet, not a successful
-        bind. A sensor watching the wrong interface binds perfectly and sees
-        nothing forever, and calling that ONLINE is how a deployment sits blind
-        without anyone noticing.
+        Two rules are worth stating, and both are about ONLINE.
+
+        It requires a packet, not a successful bind. A sensor watching the
+        wrong interface binds perfectly and sees nothing forever, and calling
+        that ONLINE is how a deployment sits blind without anyone noticing.
+
+        It also requires that the kernel is not throwing traffic away. A socket
+        whose ring buffer overflows still delivers packets, so packet counts
+        keep rising and every other signal still looks healthy while an
+        arbitrary share of the network goes unexamined. That is DEGRADED, not
+        ONLINE.
+
+        ``drop_rate`` of None means the platform cannot measure drops. That is
+        not treated as zero -- it leaves the state at ONLINE, because the
+        alternative is alarming every non-Linux deployment forever -- but
+        ``status()`` reports the blindness explicitly.
         """
         if state in ("permission_denied", STATE_BLOCKED):
             return STATE_BLOCKED
@@ -444,6 +581,8 @@ class PacketCapture:
             return STATE_OFF
         if state == "running" and alive:
             if packets > 0:
+                if drop_rate is not None and drop_rate >= self.drop_alarm:
+                    return STATE_DEGRADED
                 return STATE_ONLINE
             now = time.monotonic() if now is None else now
             if bound_at is not None and now - bound_at >= self.traffic_grace:
@@ -471,13 +610,17 @@ class PacketCapture:
             packets = self._packets_seen
             bound_at = self._bound_at
             interfaces = list(self._interfaces)
+            kernel_received = self._kernel_received
+            kernel_dropped = self._kernel_dropped
+            visibility = self._drop_visibility
             if not alive and state in {"starting", "running"}:
                 state = "failed"
                 error = error or (
                     "capture thread exited without reporting a reason; check "
                     "privileges (CAP_NET_RAW) and the interface name"
                 )
-        shown = self.display_state(state, alive, packets, bound_at)
+        rate = self.drop_rate()
+        shown = self.display_state(state, alive, packets, bound_at, drop_rate=rate)
         if not fix:
             fix = remedy(shown)
         return {
@@ -488,6 +631,16 @@ class PacketCapture:
             "interfaces": interfaces,
             "packets_seen": packets,
             "last_packet": self._last_packet,
+            # What the kernel handed this socket, and what it threw away
+            # because NEMOS could not keep up. `drop_visibility` false means
+            # the figures below are unknown rather than zero.
+            "drop_visibility": bool(visibility),
+            "kernel_packets": kernel_received + kernel_dropped,
+            "kernel_dropped": kernel_dropped,
+            # `drop_rate` is recent and is what the state is judged on;
+            # `lifetime_drop_rate` covers the whole run.
+            "drop_rate": rate,
+            "lifetime_drop_rate": self.lifetime_drop_rate(),
             "error": error,
             # Never a bare "it failed": every failure state carries the one
             # sentence that fixes it on this platform.
@@ -558,14 +711,50 @@ class PacketCapture:
         try:
             with self._lock:
                 self._state = "starting"
-            while not self.stop_event.is_set():
-                # A finite timeout makes stop() deterministic even when the
-                # interface is completely idle; stop_filter alone can block
-                # forever waiting for the next packet.
-                sniff(
-                    iface=self.interface, prn=handle, store=False, timeout=1,
-                    started_callback=started,
-                )
+            # One socket for the whole capture rather than one per second.
+            # sniff(iface=...) opens and closes a socket on every call, and the
+            # kernel's drop counters live on the socket -- so a fresh one each
+            # second would discard exactly the number this sensor needs, quite
+            # apart from leaving a gap between iterations where nothing is
+            # listening. A permission failure still belongs to the BLOCKED
+            # handler below; anything else falls back to the per-call form so a
+            # scapy or platform difference degrades instead of failing.
+            listener = None
+            try:
+                from scapy.all import conf
+                listener = (conf.L2listen(iface=self.interface)
+                            if self.interface else conf.L2listen())
+            except PermissionError:
+                raise
+            except Exception as exc:
+                log.info("per-socket drop accounting unavailable (%s); "
+                         "falling back to a socket per poll",
+                         type(exc).__name__)
+                with self._lock:
+                    self._drop_visibility = False
+
+            try:
+                while not self.stop_event.is_set():
+                    # A finite timeout makes stop() deterministic even when the
+                    # interface is completely idle; stop_filter alone can block
+                    # forever waiting for the next packet.
+                    if listener is not None:
+                        sniff(
+                            opened_socket=listener, prn=handle, store=False,
+                            timeout=1, started_callback=started,
+                        )
+                        self._poll_drops(getattr(listener, "ins", None))
+                    else:
+                        sniff(
+                            iface=self.interface, prn=handle, store=False,
+                            timeout=1, started_callback=started,
+                        )
+            finally:
+                if listener is not None:
+                    try:
+                        listener.close()
+                    except Exception:
+                        log.debug("capture socket close failed", exc_info=True)
             with self._lock:
                 self._state = "stopped"
         except PermissionError:

@@ -4,6 +4,37 @@
 
 ### Added
 
+- **Kernel packet-drop accounting.** NEMOS tracked only its own queue drops, so
+  a capture socket whose ring buffer overflowed kept delivering packets, kept
+  incrementing the packet counter, and kept displaying `ONLINE` and `all clear`
+  while an arbitrary share of the network went unexamined. The socket's own
+  counter (`PACKET_STATISTICS`) is now read and accumulated -- the kernel
+  resets it on every read -- and a new `DEGRADED` state replaces `ONLINE` above
+  1% sustained loss (`drop_alarm`), with the count, the total and the
+  percentage on the Sensor page, in `/api/status`, and in Telegram `/status`.
+  The state is judged on **recent** loss over a rolling window, not the whole
+  run: a burst while the process was starting would otherwise hold the sensor
+  at `DEGRADED` forever, and an alarm that cannot clear is one operators learn
+  to ignore. Both figures are reported -- recent loss drives the state, the
+  lifetime count is history. Verified on a live sensor: `ONLINE` → `DEGRADED`
+  under a flood (49.93% loss, 3.4M packets discarded) → back to `ONLINE` 65
+  seconds after it stopped.
+- Where drops cannot be measured -- anything that is not Linux AF_PACKET -- the
+  console says *not measurable on this platform* instead of showing a zero. A
+  fabricated "0 dropped" is the same false reassurance the whole change exists
+  to remove.
+
+### Changed
+
+- Capture now holds **one socket for the life of the capture** instead of
+  opening and closing one per second. The kernel's drop counters live on the
+  socket, so a fresh socket each second discarded exactly the number this
+  change needed -- and left a gap every second where nothing was listening.
+  A permission failure still reports `BLOCKED`; any other socket-creation
+  problem falls back to the previous per-call behaviour with drop visibility
+  reported as unavailable.
+
+
 - **Capture-file replay** (`tools/replay_pcap.py`). Runs a `.pcap`/`.pcapng`
   through the live parser and the live detection rules, offline. The detector's
   clock is driven by each packet's recorded timestamp rather than by read

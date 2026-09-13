@@ -81,7 +81,7 @@ This section exists because these distinctions matter more than marketing does.
 - Optional, evidence-constrained LLM analyst that explains findings and is
   never required for detection
 - Loopback-only by default; remote binds require a token
-- 1,038 automated tests, CI across Python 3.10–3.13, lint and dependency audit
+- 1,056 automated tests, CI across Python 3.10–3.13, lint and dependency audit
 
 ## Architecture
 
@@ -168,16 +168,47 @@ exactly that, with the list of ones that do.
 
 | State | Meaning |
 | --- | --- |
-| `ONLINE` | The socket is bound **and packets have arrived** |
+| `ONLINE` | The socket is bound, packets have arrived, **and none are being lost** |
+| `DEGRADED` | Packets are arriving, but the kernel is discarding some of them |
 | `NO TRAFFIC` | The socket is bound; nothing has arrived yet |
 | `BLOCKED` | The OS refused the capture socket — a privilege problem |
 | `NO INTERFACE` | The configured interface does not exist, or none is usable |
 | `ERROR` | Anything else, including a missing capture backend |
 
-`ONLINE` is the one that matters. It is never set on a successful bind alone: a
-sensor pointed at the wrong interface opens its socket perfectly and then sees
-nothing, and reporting that as online is exactly how a deployment sits blind for
-a week. A packet has to arrive first.
+`ONLINE` is the one that matters, and it has to be earned twice.
+
+It is never set on a successful bind alone: a sensor pointed at the wrong
+interface opens its socket perfectly and then sees nothing, and reporting that
+as online is exactly how a deployment sits blind for a week. A packet has to
+arrive first.
+
+It is also never set while the kernel is throwing traffic away. A capture
+socket whose ring buffer overflows keeps delivering packets — just not all of
+them — so the packet counter keeps rising and every other signal stays green
+while an arbitrary share of the network goes unexamined. NEMOS reads the
+socket's own drop counter (`PACKET_STATISTICS` on Linux) and reports
+`DEGRADED` above 1% sustained loss, with the count and the percentage on the
+Sensor page.
+
+Measured on a real socket: a flood that NEMOS could not drain fast enough
+produced **314,238 packets handed to the socket and 145,638 dropped — 46% of
+the traffic**. Before this accounting existed, that sensor displayed `ONLINE`
+and `all clear`. That is worse than a sensor that fails to start, because
+nothing about it invites investigation.
+
+The state is judged on **recent** loss, not the whole run. A sensor that lost
+packets while it was still starting has not been unhealthy ever since, and an
+alarm that can never clear is one operators learn to ignore — the first version
+of this accounting had exactly that bug, pinning a freshly started sensor at
+36% on an idle link. The Sensor page shows both: *recent packet loss*, which
+drives the state, and the lifetime count, which is history. Verified on a live
+sensor: `ONLINE` → `DEGRADED` under a flood → back to `ONLINE` 65 seconds after
+it stopped, with 3,618,323 lifetime drops still on record.
+
+Where drops cannot be measured at all — anything that is not Linux AF_PACKET —
+the Sensor page says *not measurable on this platform* rather than showing a
+reassuring zero, and the state stays `ONLINE` rather than alarming every
+non-Linux deployment forever.
 
 Every failure state carries one actionable sentence for the platform you are on,
 in the log and on the Sensor page — not a bare "failed" that sends you to a
@@ -1284,7 +1315,7 @@ forbids overstated wording such as "AI detected attack".
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q                              # 1,038 tests
+python -m pytest -q                              # 1,056 tests
 python -m compileall -q main.py nemos tests      # syntax
 ruff check .                                     # lint
 python -m pip_audit -r requirements.txt          # dependency audit

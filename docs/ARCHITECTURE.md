@@ -87,9 +87,26 @@ The internal lifecycle and what an operator is shown are deliberately separate
 questions. The lifecycle answers "which branch of `_run` are we in"; the
 operator needs "is traffic reaching the detector, and if not, whose problem is
 it". `PacketCapture.display_state` maps one onto the other, and the mapping has
-one rule worth stating: `ONLINE` requires a packet, never a successful bind. A
-sensor pointed at the wrong interface opens its socket perfectly and sees
-nothing forever, and calling that online is how a deployment sits blind.
+two rules worth stating, both about `ONLINE`.
+
+It requires a packet, never a successful bind. A sensor pointed at the wrong
+interface opens its socket perfectly and sees nothing forever, and calling that
+online is how a deployment sits blind.
+
+It also requires that the kernel is not discarding traffic. A capture socket
+whose ring buffer overflows keeps delivering packets, so the packet counter
+keeps rising and every other signal stays green while an arbitrary share of the
+network goes unexamined — a failure with no symptom. Capture therefore holds
+**one socket for its whole life** rather than one per `sniff()` call: the
+kernel's counters live on the socket, and `PACKET_STATISTICS` resets on every
+read, so a socket per second would discard the very number being collected and
+leave a listening gap besides. Sustained loss above `drop_alarm` (1% by
+default) reports `DEGRADED` instead of `ONLINE`.
+
+Where the counter cannot be read at all — anything that is not Linux
+`AF_PACKET` — the answer is *unknown*, propagated as `drop_visibility: false`,
+and never rendered as zero. A fabricated "0 dropped" is indistinguishable from
+a healthy sensor, which is the failure this accounting exists to remove.
 
 `preflight()` runs before the thread starts, so a hopeless configuration is
 reported as itself rather than as a thread that dies a moment later for reasons

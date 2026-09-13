@@ -95,6 +95,14 @@ def collect_status(db_path: Path, *, capture: Any = None, notifier: Any = None,
                                    or status.get("state") or "UNKNOWN").upper()
             state["interface"] = status.get("interface") or ""
             state["packets_captured"] = int(status.get("packets_seen") or 0)
+            # A sensor losing traffic is answering /status with a partial view
+            # of the network, and the reader is entitled to know that before
+            # they read "no critical findings" as an all-clear.
+            if status.get("drop_visibility") and status.get("kernel_dropped"):
+                rate = status.get("drop_rate")
+                state["packets_dropped"] = (
+                    f"{int(status['kernel_dropped']):,}"
+                    + (f" ({rate * 100:.2f}% of traffic)" if rate else ""))
         except Exception:  # pragma: no cover - defensive
             log.debug("could not read capture status for /status", exc_info=True)
             state["capture"] = "ERROR"
